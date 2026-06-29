@@ -1,26 +1,11 @@
-TEST_PROG_LIBS =
 TEST_TARGET_LDFLAGS =
 TEST_LIBRARY_LDFLAGS = -shared -fPIC
 
-ifeq ($(OS),Windows_NT)
-  SRC_DIR = ../src/windows
-  SO_EXT = dll
-  EXE_EXT = .exe
-  INJECTOR_STATIC_LIB = injector-static.lib
-  TEST_PROG_LIBS += -ldbghelp
-else
-  UNAME_S := $(shell uname -s)
-  ifeq ($(UNAME_S),Darwin)
-    SRC_DIR = ../src/macos
-    SO_EXT = dylib
-  else
-    SRC_DIR = ../src/linux
-    SO_EXT = so
-  endif
-  EXE_EXT =
-  INJECTOR_STATIC_LIB = libinjector.a
-  TEST_TARGET_LDFLAGS += -rdynamic
-endif
+SRC_DIR = ../src/linux
+SO_EXT = so
+EXE_EXT =
+INJECTOR_STATIC_LIB = libinjector.a
+TEST_TARGET_LDFLAGS += -rdynamic
 
 BUILD_TARGETS =
 
@@ -80,14 +65,6 @@ endif
 
 ifneq ($(wildcard /usr/bin/riscv64-linux-gnu-gcc),)
   BUILD_TARGETS += riscv64
-endif
-
-ifneq ($(wildcard /usr/bin/x86_64-w64-mingw32-gcc),)
-  BUILD_TARGETS += mingw-x64
-endif
-
-ifneq ($(wildcard /usr/bin/i686-w64-mingw32-gcc),)
-  BUILD_TARGETS += mingw-32
 endif
 
 CHECK_TARGETS = \
@@ -172,14 +149,6 @@ mipsisa64r6el:
 riscv64:
 	@echo "=============== build: riscv64 ==============="; \
 	CC=riscv64-linux-gnu-gcc SUFFIX=-riscv64 $(MAKE) build
-
-mingw-x64:
-	@echo "=============== build: mingw-x64 ==============="; \
-	CC=x86_64-w64-mingw32-gcc SUFFIX=-mingw-x64 OS=Windows_NT $(MAKE) build
-
-mingw-32:
-	@echo "=============== build: mingw-32 ==============="; \
-	CC=i686-w64-mingw32-gcc SUFFIX=-mingw-32 OS=Windows_NT $(MAKE) build
 
 build: test-prog$(SUFFIX)$(EXE_EXT) test-target$(SUFFIX)$(EXE_EXT) test-library$(SUFFIX).$(SO_EXT)
 

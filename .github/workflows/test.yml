@@ -15,9 +15,8 @@ jobs:
       run: |
         sudo dpkg --add-architecture i386
         sudo apt-get update
-        sudo apt-get install -y gcc-multilib gcc-mingw-w64-x86-64 gcc-mingw-w64-i686 libgcc-s1:i386 libstdc++6:i386 wine32 wine64 wine-binfmt
+        sudo apt-get install -y gcc-multilib libgcc-s1:i386 libstdc++6:i386
         sudo apt-get remove mono-runtime
-        echo WINEPATH=$(ls -d /usr/lib/gcc/*-mingw*/*-win32 | tr '\n' ';') >> $GITHUB_ENV
     - name: build
       run: |
         cd tests && make cross
@@ -33,56 +32,6 @@ jobs:
     - name: x86_64 -> x86_64 (cloned thread)
       run: |
         cd tests && ./test-prog-x86_64 x86_64 --cloned-thread
-    - name: mingw-x64 mingw-x64
-      run: |
-        cd tests && ./test-prog-mingw-x64.exe mingw-x64
-    - name: mingw-32 mingw-32
-      run: |
-        cd tests && ./test-prog-mingw-32.exe mingw-32
-
-  tests_on_mac:
-    name: Tests on MacOS (x86_64)
-    runs-on: macos-latest
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        submodules: true
-    - name: run tests
-      run: |
-        sudo make check
-
-  tests_on_windows:
-    name: Tests on Windows (x64 and x86)
-    runs-on: windows-latest
-    steps:
-    - uses: actions/checkout@v3
-      with:
-        submodules: true
-    - uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
-    - name: x64 -> x64 tests on Windows
-      shell: cmd
-      run: |
-        nmake -nologo -f Makefile.win32 check
-        if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
-        copy tests\test-prog.exe tests\test-prog-x64.exe 
-        nmake -nologo -f Makefile.win32 clean
-    - uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x86
-    - name: x86 -> x86 tests on Windows
-      shell: cmd
-      run: |
-        nmake -nologo -f Makefile.win32 check
-    - name: x64 -> x86 tests on Windows
-      shell: cmd
-      run: |
-        cd tests && .\test-prog-x64.exe
-    - name: mingw32-w64 (x86_64)
-      shell: bash
-      run: |
-        CC=x86_64-w64-mingw32-gcc make clean check
 
   tests_on_alpine_x86_64:
     name: Tests on Alpine (x86_64 only)

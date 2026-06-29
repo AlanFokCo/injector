@@ -2,7 +2,7 @@
 
 [![Static Badge](https://img.shields.io/badge/docs-API_reference-blue)](http://www.jiubao.org/injector/injector_8h.html)
 
-**Library for injecting a shared library into a Linux, Windows and MacOS process**
+**Library for injecting a shared library into a Linux process**
 
 > [!CAUTION]  
 > Due to a shift in my personal interests, this repository is no longer maintained and has been archived.
@@ -26,21 +26,6 @@ thoroughly different.
 
 [libc_main]: https://sourceware.org/git/?p=glibc.git;a=blob;f=csu/version.c;h=8c0ed79c01223e1f12b54d19f90b5e5b7dd78d27;hb=c804cd1c00adde061ca51711f63068c103e94eef#l67
 
-## Windows
-
-Windows version is also here. It uses well-known [`CreateRemoteThread+LoadLibrary`]
-technique to load a DLL into another process with some improvements.
-
-1. It gets Win32 error messages when `LoadLibrary` fails by copying assembly
-   code into the target process.
-2. It can inject a 32-bit dll into a 32-bit process from x64 processes
-   by checking the export entries in 32-bit kernel32.dll.
-
-**Note:** It may work on Windows on ARM though I have not tested it because
-I have no ARM machines. Let me know if it really works.
-
-## MacOS
-The injector connects to the target process using task_for_pid and creates a mach-thread. If dlopen is called in this thread, the target process will fail with an error, however, it is possible to create another thread using pthread_create_from_mach_thread function for Mac >= 10.12 or pthread_create otherwise. In the created thread, the code for loading the library is executed. The second thread is created when injector_inject is called and terminated when injector_detach is called.
 # Compilation
 
 ## Linux
@@ -58,74 +43,6 @@ The `make` command creates:
 |`src/linux/libinjector.a`  |a static library|
 |`src/linux/libinjector.so` |a shared library|
 |`cmd/injector`             |a command line program linked with the static library|
-
-## Windows (MSVC)
-
-Open a Visual Studio command prompt and run the following commands:
-
-```shell
-$ git clone https://github.com/kubo/injector.git # Or use any other tool
-$ cd injector
-$ nmake -f Makefile.win32
-```
-
-The `nmake` command creates:
-
-| filename | - |
-|---|---|
-|`src/windows/injector-static.lib`  |a static library (release build)
-|`src/windows/injector.dll`         |a shared library (release build)
-|`src/windows/injector.lib`         |an import library for `injector.dll`
-|`src/windows/injectord-static.lib` |a static library (debug build)
-|`src/windows/injectord.dll`        |a shared library (debug build)
-|`src/windows/injectord.lib`        |an import library for `injectord.dll`
-|`cmd/injector.exe`                 |a command line program linked the static library (release build)|
-
-## Windows (mingw-w64)
-
-On MSYS2:
-
-```shell
-$ git clone https://github.com/kubo/injector.git
-$ cd injector
-$ CC=gcc make
-```
-
-Cross-compilation on Linux:
-
-```shell
-$ git clone https://github.com/kubo/injector.git
-$ cd injector
-$ CC=x86_64-w64-mingw32-gcc OS=Windows_NT make
-```
-
-The environment variable `OS=Windows_NT` must be set on Linux.
-
-## MacOS
-
-```shell
-$ git clone https://github.com/TheOiseth/injector.git
-$ cd injector
-$ make
-```
-
-The `make` command creates:
-
-| filename | - |
-|---|---|
-|`src/macos/libinjector.a`  |a static library|
-|`src/macos/libinjector.dylib` |a shared library|
-|`cmd/injector`             |a command line program linked with the static library|
-
-**Important:** in order for the injector process to connect to another process using task_for_pid, it is necessary to [`disable SIP`][] or sign the injector with a self-signed certificate with debugging permission, for this:
-```shell
-$ cd cmd/macos-sign
-$ chmod +x genkey.sh
-$ ./genkey.sh
-$ chmod +x sign.sh
-$ ./sign.sh
-```
-If injector still does not work after signing, reboot the system.
 
 # Usage
 
@@ -218,46 +135,6 @@ RISC-V:
 
 * **riscv64** (tested on [Ubuntu 22.04.1 riscv64 on QEMU](https://wiki.ubuntu.com/RISC-V#Booting_with_QEMU))
 
-## Windows
-
-Windows x64:
-
-injector process \ target process | x64 | x86
----|---|---
-**x64**     | :smiley: success(*2) | :smiley: success(*2)
-**x86**     | :skull:  failure(*1) | :smiley: success(*2)
-
-*1: failure with `x64 target process isn't supported by x86 process`.  
-*2: tested on github actions  
-
-Windows 11 on Arm:
-
-injector process \ target process | arm64 | arm64ec | x64 | x86 | arm32
----|---|---|---|---|---
-**arm64**   | :smiley: success | :skull:  failure | :skull:  failure | :skull:  failure | :smiley: success
-**arm64ec** | :skull:  failure | :smiley: success | :smiley: success | :skull:  failure | :skull:  failure
-**x64**     | :skull:  failure | :smiley: success | :smiley: success | :skull:  failure | :skull:  failure
-**x86**     | :skull:  failure | :skull:  failure | :skull:  failure | :smiley: success | :skull:  failure
-**arm32**   | :skull:  failure | :skull:  failure | :skull:  failure | :skull:  failure | :smiley: success
-
-[Wine](https://www.winehq.org/) (on Linux x86_64):
-
-injector process \ target process | x64 | x86
----|---|---
-**x64**     | :smiley: success | :skull:  failure
-**x86**     | :skull:  failure | :smiley: success
-
-## MacOS
-
-injector process \ target process | x64 | arm64
----|---|---
-**x64**     | :smiley: success(*1) | :skull:  failure(*2)
-**arm64**   | :skull:  failure(*3) | :smiley: success
-
-*1: failure with `x86_64 target process isn't supported by x86_64 process on ARM64 machine`. Tested on github actions.  
-*2: failure with `arm64 target process isn't supported by x86_64 process.`  
-*3: failure with `x86_64 target process isn't supported by arm64 process.`
-
 # Caveats
 
 **The following restrictions are only on Linux.**
@@ -285,8 +162,7 @@ your own risk.
 # License
 
 Files under [`include`][] and [`src`][] are licensed under LGPL 2.1 or later.  
-Files under [`cmd`][] are licensed under GPL 2 or later.  
-Files under [`util`][] are licensed under 2-clause BSD.
+Files under [`cmd`][] are licensed under GPL 2 or later.
 
 [`linux-inject`]: https://github.com/gaffe23/linux-inject
 [Caveat about `ptrace()`]: https://github.com/gaffe23/linux-inject#caveat-about-ptrace
@@ -296,6 +172,3 @@ Files under [`util`][] are licensed under 2-clause BSD.
 [`include`]: include
 [`pthread_create()`]: https://man7.org/linux/man-pages/man3/pthread_create.3.html
 [`src`]: src
-[`util`]: util
-[`CreateRemoteThread+LoadLibrary`]: https://www.google.com/search?&q=CreateRemoteThread+LoadLIbrary
-[`disable SIP`]: https://developer.apple.com/documentation/security/disabling_and_enabling_system_integrity_protection

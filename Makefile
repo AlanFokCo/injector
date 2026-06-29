@@ -1,13 +1,4 @@
-ifeq ($(OS),Windows_NT)
-  SRC_DIR = src/windows
-else
-  UNAME_S := $(shell uname -s)
-  ifeq ($(UNAME_S),Darwin)
-    SRC_DIR = src/macos
-  else
-    SRC_DIR = src/linux
-  endif
-endif
+SRC_DIR = src/linux
 
 all:
 	cd $(SRC_DIR) && $(MAKE)

@@ -1,13 +1,7 @@
 *~
 *.a
-*.dll
-*.exe
-*.exp
-*.lib
 *.o
-*.obj
 *.so
-*.dylib
 /cmd/injector
 /tests/test-prog
 /tests/test-prog-*

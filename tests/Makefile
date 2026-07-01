@@ -177,14 +177,36 @@ check: all
 	 done
 
 UNIT_TESTS = unit/run
+UNIT_OBJS = unit/run.o unit/test_errmsg.o unit/test_opts.o unit/test_elf.o unit/test_proc.o unit/test_init.o
 
-unit: $(UNIT_TESTS)
+unit: $(UNIT_TESTS) $(UNIT_OBJS)
 	@for t in $(UNIT_TESTS); do echo "=== $$t ==="; ./$$t || exit 1; done
 
-unit/run: unit/run.c unit/minunit.h
-	$(CC) $(CFLAGS) -I. -o $@ unit/run.c
+../src/linux/libinjector.a:
+	@cd ../src/linux && $(MAKE)
+
+unit/run: $(UNIT_OBJS) ../src/linux/libinjector.a
+	$(CC) $(CFLAGS) -I. -I../include -o $@ $(UNIT_OBJS) ../src/linux/libinjector.a -ldl
+
+unit/run.o: unit/run.c unit/minunit.h
+	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/run.c
+
+unit/test_errmsg.o: unit/test_errmsg.c unit/minunit.h
+	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_errmsg.c
+
+unit/test_opts.o: unit/test_opts.c unit/minunit.h
+	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_opts.c
+
+unit/test_elf.o: unit/test_elf.c unit/minunit.h
+	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_elf.c
+
+unit/test_proc.o: unit/test_proc.c unit/minunit.h ../src/linux/proc.h
+	$(CC) $(CFLAGS) -I. -I../include -I../src/linux -c -o $@ unit/test_proc.c
+
+unit/test_init.o: unit/test_init.c unit/minunit.h
+	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_init.c
 
 clean:
-	$(RM) test-prog$(EXE_EXT) test-prog-* test-target$(EXE_EXT) test-target-* test-library.$(SO_EXT) test-library-*.$(SO_EXT) $(UNIT_TESTS)
+	$(RM) test-prog$(EXE_EXT) test-prog-* test-target$(EXE_EXT) test-target-* test-library.$(SO_EXT) test-library-*.$(SO_EXT) $(UNIT_TESTS) $(UNIT_OBJS)
 
 .PHONY: $(BUILD_TARGETS) build check clean unit

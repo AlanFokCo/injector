@@ -31,6 +31,7 @@
 #define INJECTOR_H
 
 #include <sys/types.h>
+#include <stddef.h>
 
 /*!
  * \brief Process id type (\c pid_t)
@@ -58,6 +59,42 @@ extern "C" {
 #define INJERR_INVALID_ELF_FORMAT -10  /* linux */
 #define INJERR_WAIT_TRACEE -11         /* linux */
 #define INJERR_FUNCTION_MISSING -12    /* linux */
+#define INJERR_TIMEOUT -13          /* linux: remote call timed out */
+
+#define INJECTOR_ABI_VERSION 1u
+
+typedef enum {
+    INJECTOR_DELIVERY_AUTO = 0,
+    INJECTOR_DELIVERY_NONSTOP = 1,
+    INJECTOR_DELIVERY_PTRACE = 2,
+} injector_delivery_t;
+
+typedef enum {
+    INJECTOR_TIMEOUT_LEAVE = 0,
+    INJECTOR_TIMEOUT_KILL_THREAD = 1,
+} injector_timeout_action_t;
+
+typedef struct {
+    size_t opts_size;
+    injector_delivery_t delivery;
+    unsigned call_timeout_ms;
+    injector_timeout_action_t timeout_action;
+    int enable_write_mem;
+} injector_opts_t;
+
+#define INJECTOR_OPTS_INIT ((injector_opts_t){ .opts_size = sizeof(injector_opts_t) })
+
+unsigned injector_abi_version(void);
+
+/*!
+ * \brief Library lifecycle hooks (idempotent).
+ * \remarks cgo bindings may call \c injector_library_init() at startup for
+ *          predictable initialization. Currently near-no-op; reserved for
+ *          future use (e.g. logging). Calling more than once is supported.
+ * \return zero on success.
+ */
+int injector_library_init(void);
+int injector_library_deinit(void);
 
 typedef struct injector injector_t;
 
@@ -68,6 +105,15 @@ typedef struct injector injector_t;
  * \return               zero on success. Otherwise, error code
  */
 int injector_attach(injector_t **injector, injector_pid_t pid);
+int injector_attach_with_opts(injector_t **out, pid_t pid, const injector_opts_t *opts);
+
+/*!
+ * \brief Thread safety
+ * An \c injector_t handle is not safe for concurrent use from multiple threads.
+ * Use a handle from a single thread or serialize access. The per-handle error
+ * buffer is read via \ref injector_last_error; the thread-local fallback (read
+ * via \ref injector_error) is intended only for the no-handle attach-failure case.
+ */
 
 /*!
  * \brief Detach from the attached process and destroy the specified handle.
@@ -75,6 +121,54 @@ int injector_attach(injector_t **injector, injector_pid_t pid);
  * \return               zero on success. Otherwise, error code
  */
 int injector_detach(injector_t *injector);
+
+#if defined(INJECTOR_DOC) || defined(__linux__)
+/*!
+ * \brief Non-intrusive target introspection (Linux only).
+ *
+ * Reads /proc/PID to fill `out`. Does NOT ptrace-attach to the target.
+ * Safe to call before deciding whether to inject.
+ *
+ * \param[in]  pid  the process id to inspect
+ * \param[out] out  destination struct (zeroed by the call)
+ * \return          zero on success, INJERR_NO_PROCESS if pid absent,
+ *                  INJERR_OTHER on read error. Unreadable fields are empty;
+ *                  arch/libc are "unknown" when no libc mapping is found.
+ */
+typedef struct {
+    pid_t pid;
+    int alive;            /* 1 if process exists */
+    int ptrace_allowed;   /* heuristic: 1 if attach would likely succeed */
+    const char *arch;     /* "x86_64"/"aarch64"/"i386"/"arm"/"mips"/"ppc64"/"ppc"/"riscv"/"unknown" */
+    const char *libc;     /* "glibc"/"musl"/"unknown" */
+    char exe[4096];       /* /proc/PID/exe */
+    char cwd[4096];       /* /proc/PID/cwd */
+    char root[4096];      /* /proc/PID/root */
+    char comm[16];        /* /proc/PID/comm */
+} injector_target_info_t;
+
+int injector_target_info(pid_t pid, injector_target_info_t *out);
+
+/*!
+ * \brief Heuristic pre-check whether injector_attach() would likely succeed (Linux only).
+ *
+ * BEST-EFFORT heuristic, NOT a guarantee. Inspects
+ * /proc/sys/kernel/yama/ptrace_scope and the caller euid; does not attach.
+ * 1 = probably attachable, 0 = probably not. The authoritative check is
+ * injector_attach() itself.
+ */
+int injector_can_attach(pid_t pid);
+
+/*!
+ * \brief Find a running process by executable basename (Linux only).
+ * \param[in] name  executable basename to match (e.g. "mysvc")
+ * \return          the pid on success, -1 if not found.
+ * \remarks Scans /proc, reading each /proc/PID/exe symlink and comparing the
+ *          basename. "Not found" (-1) is a normal result, not an error.
+ */
+pid_t injector_find_process(const char *name);
+#endif
+
 
 /*!
  * \brief Inject the specified shared library into the target process.
@@ -123,10 +217,23 @@ int injector_call(injector_t *injector, void *handle, const char* name);
 #endif
 
 /*!
- * \brief Get the message of the last error.
- * \remarks The message is updated only when \c injector functions return non-zero.
+ * \brief Get the message of the last error. (deprecated)
+ * \remarks Deprecated: use \ref injector_last_error. Returns the thread-local
+ *          fallback only; after handle operations (inject/remote_call/uninject/...)
+ *          it may be empty or stale -- use \c injector_last_error(inj) to read a
+ *          handle's last error.
  */
+__attribute__((deprecated("use injector_last_error")))
 const char *injector_error(void);
+
+/*!
+ * \brief Get the message of the last error for the specified handle (per-handle).
+ * \param[in]   injector the injector handle, or NULL to read the thread-local fallback
+ * \remarks The message is updated only when \c injector functions return non-zero.
+ *          Use this instead of the deprecated injector_error() when a handle is available
+ *          so that concurrent operations on different targets do not clobber each other.
+ */
+const char *injector_last_error(injector_t *injector);
 
 #if defined(INJECTOR_DOC) || defined(__linux__)
 #define INJECTOR_HAS_REMOTE_CALL_FUNCS 1
@@ -200,6 +307,127 @@ int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_add
  * \sa injector_remote_func_addr(), injector_remote_call()
  */
 int injector_remote_vcall(injector_t *injector, intptr_t *retval, size_t func_addr, va_list ap);
+
+/*!
+ * \brief Read a chunk of the target process memory (Linux only)
+ * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   addr     the remote address to read from
+ * \param[out]  buf      buffer in the caller process receiving the bytes
+ * \param[in]   len      number of bytes to read
+ * 
+eturn               zero on success. Otherwise, error code
+ * 
+emarks Uses process_vm_readv with a ptrace single-step fallback.
+ * \sa injector_write_mem(), injector_resolve_symbol()
+ */
+int injector_read_mem(injector_t *inj, uintptr_t addr, void *buf, size_t len);
+
+/*!
+ * \brief Write a chunk of memory into the target process (Linux only)
+ * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   addr     the remote address to write to
+ * \param[in]   buf      bytes to write
+ * \param[in]   len      number of bytes to write
+ * 
+eturn               zero on success. \c INJERR_PERMISSION when the handle
+ *                       was not attached with \c opts.enable_write_mem set.
+ * 
+emarks Gate: the handle must be attached via \c injector_attach_with_opts
+ *          with \c opts.enable_write_mem = 1. Uses process_vm_writev with a
+ *          ptrace single-step fallback.
+ * \sa injector_read_mem(), injector_resolve_symbol()
+ */
+int injector_write_mem(injector_t *inj, uintptr_t addr, const void *buf, size_t len);
+
+/*!
+ * \brief Resolve a symbol address in the target process (Linux only)
+ * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   libname  reserved for future use (M1 does not scope by library).
+ *                       Pass \c NULL.
+ * \param[in]   symbol   the symbol name
+ * \param[out]  addr     the address where the resolved remote address will be
+ *                       stored, or \c NULL to ignore
+ * \return               zero on success. \c INJERR_FUNCTION_MISSING when the
+ *                       symbol is not found.
+ * \remarks M1 searches ONLY the target executable's dynamic symbol table
+ *          (non-intrusive ELF parse of \c /proc/PID/exe). It does NOT perform
+ *          a remote \c dlsym and does NOT search other loaded shared libraries.
+ *          To resolve a symbol in an injected shared library, use
+ *          \ref injector_remote_func_addr with the handle from \ref injector_inject.
+ * \sa injector_read_mem(), injector_write_mem(), injector_remote_func_addr()
+ */
+int injector_resolve_symbol(injector_t *inj, const char *libname, const char *symbol, uintptr_t *addr);
+
+/*!
+ * \brief A loaded shared-library mapping in the target process (Linux only)
+ */
+typedef struct {
+    char name[256];        /* .so path (full path as it appears in /proc/PID/maps) */
+    uintptr_t base;        /* load base address (first mapping's start) */
+} injector_module_t;
+
+/*!
+ * \brief List loaded shared libraries in the target process (Linux only)
+ * \param[in]   injector the injector handle specifying the target process
+ * \param[out]  out      array of \p cap entries to fill, or \c NULL to only count
+ * \param[in]   cap      number of entries in \p out (0 to only count)
+ * \return              the number of loaded libraries (always the total count,
+ *                      even if greater than \p cap); -1 on error (and sets
+ *                      \ref injector_last_error).
+ * \remarks Non-intrusive: reads \c /proc/PID/maps and does NOT ptrace-attach
+ *          or execute code in the target. Safe to call on an attached handle.
+ *          A .so is listed once (adjacent mappings r-xp/r--p/rw-p collapsed);
+ *          a non-contiguously mapped library may appear more than once.
+ */
+long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap);
+
+/*!
+ * \brief Unload (dlclose) all libraries this handle injected via \c injector_inject (Linux only)
+ * \param[in]   injector the injector handle specifying the target process
+ * \return              zero if all succeeded, otherwise the first non-zero
+ *                      error code (remaining handles are still attempted).
+ * \remarks Refuses musl-libc targets (\c INJERR_UNSUPPORTED_TARGET), as
+ *          \ref injector_uninject does. Only handles whose out-param the
+ *          caller kept (non-NULL \c handle) at inject time are tracked.
+ */
+int injector_uninject_all(injector_t *inj);
+
+/*!
+ * \brief Result of a one-shot invoke/run call (Linux only)
+ * \remarks Caller-owned; no lifetime issues. \c errmsg is filled on failure
+ *          (empty on success). \c target_errno is best-effort (0 if not captured).
+ */
+typedef struct {
+    intptr_t retval;        /* entry method return value */
+    int target_errno;       /* target-side errno (best-effort; 0 if not captured) */
+    char errmsg[256];       /* failure message; caller-owned, no lifetime issue */
+} injector_result_t;
+
+/*!
+ * \brief Inject a library, resolve a no-arg symbol, call it, and capture the
+ *        return value, all in one call (Linux only; M1 ptrace path).
+ * \param[in]  inj     an attached injector handle
+ * \param[in]  path    the shared library path to inject
+ * \param[in]  symbol  a no-argument function returning an integer
+ * \param[out] out     destination result, or \c NULL to skip capturing it
+ * \return             zero on success. On failure, \c out->errmsg is filled
+ *                     (if \c out). M1 uses the bounded-ptrace path (brief stop);
+ *                     M2 will switch to the threaded/non-stop path.
+ * \note   The entry symbol must be a no-argument function returning an integer.
+ */
+int injector_invoke(injector_t *inj, const char *path, const char *symbol, injector_result_t *out);
+
+/*!
+ * \brief One-shot: attach with opts, invoke, and detach (Linux only).
+ * \param[in]  pid     the target process id
+ * \param[in]  lib     the shared library path to inject
+ * \param[in]  symbol  a no-argument function returning an integer
+ * \param[in]  opts    attach options, or \c NULL for defaults
+ * \param[out] out     destination result, or \c NULL to skip capturing it
+ * \return             zero on success.
+ */
+int injector_run(pid_t pid, const char *lib, const char *symbol,
+                 const injector_opts_t *opts, injector_result_t *out);
 #endif
 
 #if defined(INJECTOR_DOC) || (defined(__linux__) && defined(__x86_64__))

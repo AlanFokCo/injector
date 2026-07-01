@@ -1,27 +1,3 @@
-/* -*- indent-tabs-mode: nil -*-
- *
- * injector - Library for injecting a shared library into a Linux process
- *
- * URL: https://github.com/kubo/injector
- *
- * ------------------------------------------------------
- *
- * Copyright (C) 2018-2023 Kubo Takehiro <kubo@jiubao.org>
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
- */
 #ifndef INJECTOR_INTERNAL_H
 #define INJECTOR_INTERNAL_H 1
 #include <stdarg.h>
@@ -150,10 +126,28 @@ struct injector {
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     size_t shellcode;
 #endif
+    char errmsg[512];
+    char errmsg_set;
+    unsigned call_timeout_ms;
+    injector_delivery_t mode;
+    injector_timeout_action_t timeout_action;
+    int enable_write_mem;
+    void *injected_handles[32];   /* handles created by injector_inject, for uninject_all */
+    size_t injected_count;
 };
 
 /* elf.c */
 int injector__collect_libc_information(injector_t *injector);
+int injector__elf_find_symbols(const char *path, size_t libc_addr,
+                               const char *const names[], size_t addrs[], size_t n);
+
+/* elf.c: open `path` and return its ELF e_machine (non-intrusive arch probe). */
+int injector__read_elf_machine(const char *path, int *machine_out);
+
+/* elf.c: compute the runtime load bias for an ELF object given its lowest
+ * /proc/PID/maps mapping start. ET_EXEC -> 0 (symbol values are absolute);
+ * ET_DYN (PIE exe / shared object) -> map_start. */
+int injector__elf_load_bias(const char *path, size_t map_start, size_t *bias_out);
 
 /* ptrace.c */
 int injector__ptrace(int request, pid_t pid, long addr, long data, const char *request_name);
@@ -171,10 +165,14 @@ int injector__call_function(const injector_t *injector, intptr_t *retval, long f
 int injector__call_function_va_list(const injector_t *injector, intptr_t *retval, long function_addr, va_list ap);
 
 /* util.c */
-extern char injector__errmsg[];
-extern char injector__errmsg_is_set;
 void injector__set_errmsg(const char *format, ...) __attribute__((format (printf, 1, 2)));
 const char *injector__arch2name(arch_t arch);
+void injector__set_current(injector_t *inj);
+void injector__reset_tl_errmsg(void);
+const char *injector__tl_errmsg(void);
+void injector__opts_normalize(injector_opts_t *o);
+int injector__opts_copy(injector_opts_t *dst, const void *src, size_t src_size);
+int injector__attach_internal(injector_t **out, pid_t pid, const injector_opts_t *o);
 
 /* shellcode.S */
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD

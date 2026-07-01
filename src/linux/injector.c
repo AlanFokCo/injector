@@ -32,19 +32,24 @@
 #include <stddef.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <dirent.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 #include <limits.h>
+#include <signal.h>
+#include <elf.h>
+#include "proc.h"
 #include "injector_internal.h"
+
 
 static inline size_t remote_mem_size(injector_t *injector) {
     return 2 * injector->data_size + injector->stack_size;
 }
 
-int injector_attach(injector_t **injector_out, pid_t pid)
+int injector__attach_internal(injector_t **injector_out, pid_t pid, const injector_opts_t *o)
 {
     injector_t *injector;
     int status;
@@ -52,14 +57,22 @@ int injector_attach(injector_t **injector_out, pid_t pid)
     int prot;
     int rv = 0;
 
-    injector__errmsg_is_set = 0;
+    injector__set_current(NULL);
+    injector__reset_tl_errmsg();
 
     injector = calloc(1, sizeof(injector_t));
     if (injector == NULL) {
         injector__set_errmsg("malloc error: %s", strerror(errno));
         return INJERR_NO_MEMORY;
     }
+    /* current_inj stays NULL through the attach body so all attach-phase
+     * errors land in the thread-local fallback and survive even though the
+     * handle is freed by error_exit. Set to this handle only on success. */
     injector->pid = pid;
+    injector->call_timeout_ms = o->call_timeout_ms;
+    injector->mode = o->delivery;
+    injector->timeout_action = o->timeout_action;
+    injector->enable_write_mem = o->enable_write_mem;
     rv = injector__attach_process(injector);
     if (rv != 0) {
         goto error_exit;
@@ -125,11 +138,13 @@ int injector_attach(injector_t **injector_out, pid_t pid)
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     rv = injector__write(injector, injector->shellcode, &injector_shellcode, injector_shellcode_size);
     if (rv != 0) {
-        return rv;
+        /* goto error_exit: must clean up mmap + detach target, not leak (was: return rv) */
+        goto error_exit;
     }
 #endif
 
     *injector_out = injector;
+    injector__set_current(injector);
     return 0;
 error_exit:
     injector_detach(injector);
@@ -144,7 +159,8 @@ int injector_inject(injector_t *injector, const char *path, void **handle)
     int rv;
     intptr_t retval;
 
-    injector__errmsg_is_set = 0;
+    injector__set_current(injector);
+    injector->errmsg_set = 0;
 
     if (path[0] == '/') {
         len = strlen(path) + 1;
@@ -191,6 +207,15 @@ int injector_inject(injector_t *injector, const char *path, void **handle)
     }
     if (handle != NULL) {
         *handle = (void*)retval;
+        /* Track for injector_uninject_all. Only track when the caller kept the
+         * handle -- if the handle out-param was NULL there is nothing to
+         * dlclose later. A failed inject (retval==0 dlopen) returns above. */
+        if (injector->injected_count < sizeof(injector->injected_handles) / sizeof(injector->injected_handles[0])) {
+            injector->injected_handles[injector->injected_count++] = *handle;
+        } else {
+            injector__set_errmsg("too many injected libraries to track (max 32)");
+            /* still succeed: the library is loaded, we just can't auto-uninject it */
+        }
     }
     return 0;
 }
@@ -207,7 +232,8 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
     int rv;
     intptr_t retval;
 
-    injector__errmsg_is_set = 0;
+    injector__set_current(injector);
+    injector->errmsg_set = 0;
 
     if (injector->arch != ARCH_X86_64) {
         injector__set_errmsg("injector_inject_in_cloned_thread doesn't support %s.",
@@ -297,7 +323,8 @@ int injector_remote_func_addr(injector_t *injector, void *handle, const char* na
     intptr_t retval;
     size_t len = strlen(name) + 1;
 
-    injector__errmsg_is_set = 0;
+    injector__set_current(injector);
+    injector->errmsg_set = 0;
 
     if (len > injector->data_size) {
         injector__set_errmsg("too long function name: %s", name);
@@ -323,7 +350,8 @@ int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_add
 {
     va_list ap;
     int rv;
-    injector__errmsg_is_set = 0;
+    injector__set_current(injector);
+    injector->errmsg_set = 0;
     va_start(ap, func_addr);
     rv = injector__call_function_va_list(injector, retval, func_addr, ap);
     va_end(ap);
@@ -332,7 +360,8 @@ int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_add
 
 int injector_remote_vcall(injector_t *injector, intptr_t *retval, size_t func_addr, va_list ap)
 {
-    injector__errmsg_is_set = 0;
+    injector__set_current(injector);
+    injector->errmsg_set = 0;
     return injector__call_function_va_list(injector, retval, func_addr, ap);
 }
 
@@ -351,7 +380,8 @@ int injector_uninject(injector_t *injector, void *handle)
     int rv;
     intptr_t retval;
 
-    injector__errmsg_is_set = 0;
+    injector__set_current(injector);
+    injector->errmsg_set = 0;
     if (injector->libc_type == LIBC_TYPE_MUSL) {
         /* Assume that libc is musl. */
         injector__set_errmsg("Cannot uninject libraries under musl libc. See: https://wiki.musl-libc.org/functional-differences-from-glibc.html#Unloading_libraries");
@@ -371,7 +401,10 @@ int injector_uninject(injector_t *injector, void *handle)
 
 int injector_detach(injector_t *injector)
 {
-    injector__errmsg_is_set = 0;
+    /* current_inj = NULL so detach cleanup errors go to thread-local and
+     * do not dangle after free(injector) below. Leave errmsg_set intact so
+     * a caller reading injector_last_error() before detach sees the error. */
+    injector__set_current(NULL);
 
     if (injector->mmapped) {
         injector__call_syscall(injector, NULL, injector->sys_munmap, injector->data, remote_mem_size(injector));
@@ -383,7 +416,475 @@ int injector_detach(injector_t *injector)
     return 0;
 }
 
-const char *injector_error(void)
+unsigned injector_abi_version(void) { return INJECTOR_ABI_VERSION; }
+
+void injector__opts_normalize(injector_opts_t *o) {
+    if (o->call_timeout_ms == 0) o->call_timeout_ms = 5000;
+    /* delivery/timeout_action/enable_write_mem: 0 is the default enum/value, no change needed */
+}
+
+int injector__opts_copy(injector_opts_t *dst, const void *src, size_t src_size) {
+    *dst = INJECTOR_OPTS_INIT;                 /* start from all-default */
+    size_t n = src_size < sizeof(*dst) ? src_size : sizeof(*dst);
+    if (n < offsetof(injector_opts_t, delivery) + sizeof(injector_delivery_t))
+        return INJERR_OTHER;                   /* opts_size too small to even carry delivery */
+    memcpy(dst, src, n);
+    dst->opts_size = sizeof(*dst);
+    injector__opts_normalize(dst);
+    return 0;
+}
+
+int injector_attach_with_opts(injector_t **out, pid_t pid, const injector_opts_t *opts) {
+    injector_opts_t o;
+    injector__set_current(NULL);
+    injector__reset_tl_errmsg();
+    if (opts == NULL) {
+        o = INJECTOR_OPTS_INIT;
+        injector__opts_normalize(&o);
+    } else {
+        int rv = injector__opts_copy(&o, opts, opts->opts_size);
+        if (rv) {
+            injector__set_errmsg("invalid opts (opts_size too small)");
+            return rv;
+        }
+    }
+    return injector__attach_internal(out, pid, &o);
+}
+
+int injector_attach(injector_t **out, pid_t pid) {
+    return injector_attach_with_opts(out, pid, NULL);
+}
+
+/* ---- Non-intrusive target introspection ---- */
+
+static const char *machine_to_arch_str(int machine)
 {
-    return injector__errmsg;
+    switch (machine) {
+    case EM_X86_64: return "x86_64";
+    case EM_AARCH64: return "aarch64";
+    case EM_386: return "i386";
+    case EM_ARM: return "arm";
+    case EM_MIPS: return "mips";
+    case EM_PPC64: return "ppc64";
+    case EM_PPC: return "ppc";
+#ifdef EM_RISCV
+    case EM_RISCV: return "riscv";
+#endif
+    default: return "unknown";
+    }
+}
+
+/* Does `path` look like the C library? Returns 1 and sets *libc_str for a
+ * glibc/musl mapping, 0 otherwise. */
+static int libc_kind(const char *path, const char **libc_str)
+{
+    if (strstr(path, "/ld-musl-") != NULL) {
+        *libc_str = "musl";
+        return 1;
+    }
+    if (strstr(path, "/libc.so.6") != NULL || strstr(path, "/libc-2.") != NULL) {
+        *libc_str = "glibc";
+        return 1;
+    }
+    return 0;
+}
+
+int injector_target_info(pid_t pid, injector_target_info_t *out)
+{
+    char proc_path[64];
+    FILE *fp;
+    char line[1024];
+    char libc_path[512];
+    const char *libc_str = "unknown";
+    int found_libc = 0;
+
+    if (out == NULL) {
+        injector__set_current(NULL);
+        injector__reset_tl_errmsg();
+        injector__set_errmsg("out is NULL");
+        return INJERR_OTHER;
+    }
+    memset(out, 0, sizeof(*out));
+    out->pid = pid;
+    out->arch = "unknown";
+    out->libc = "unknown";
+    /* heuristic, same as injector_can_attach */
+
+    /* alive: kill(pid, 0) == 0 (exists & permitted) or EPERM (exists, no perm). */
+    if (kill(pid, 0) == 0) {
+        out->alive = 1;
+    } else if (errno == EPERM) {
+        out->alive = 1;
+    } else {
+        out->alive = 0;  /* ESRCH: no such process */
+        injector__set_current(NULL);
+        injector__reset_tl_errmsg();
+        injector__set_errmsg("no such process %d", (int)pid);
+        return INJERR_NO_PROCESS;
+    }
+
+    out->ptrace_allowed = injector_can_attach(pid);
+
+    /* exe / cwd / root / comm: empty string on failure (non-fatal). */
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/exe", (int)pid);
+    proc__read_link(proc_path, out->exe, sizeof(out->exe));
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/cwd", (int)pid);
+    proc__read_link(proc_path, out->cwd, sizeof(out->cwd));
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/root", (int)pid);
+    proc__read_link(proc_path, out->root, sizeof(out->root));
+    proc__read_comm(pid, out->comm, sizeof(out->comm));
+
+    /* Scan /proc/PID/maps for the libc mapping to derive arch + libc flavor.
+     * This reads only the on-disk libc file's ELF header; no ptrace attach. */
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d/maps", (int)pid);
+    fp = fopen(proc_path, "r");
+    if (fp == NULL) {
+        /* alive but no maps (e.g. zombie/permission): arch/libc stay unknown */
+        return 0;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        proc_map_t m;
+        const char *kind;
+        if (proc__parse_maps_line(line, &m) != 0) {
+            continue;
+        }
+        if (m.deleted) {
+            continue;
+        }
+        if (libc_kind(m.path, &kind)) {
+            libc_str = kind;
+            strncpy(libc_path, m.path, sizeof(libc_path) - 1);
+            libc_path[sizeof(libc_path) - 1] = '\0';
+            found_libc = 1;
+            break;
+        }
+    }
+    fclose(fp);
+
+    if (found_libc) {
+        int machine = 0;
+        out->libc = libc_str;
+        if (injector__read_elf_machine(libc_path, &machine) == 0) {
+            out->arch = machine_to_arch_str(machine);
+        }
+    }
+
+    return 0;
+}
+
+int injector_can_attach(pid_t pid)
+{
+    /* Heuristic only. See injector.h doc comment: not a guarantee. */
+    if (kill(pid, 0) != 0 && errno != EPERM) {
+        return 0;  /* not alive */
+    }
+    if (geteuid() == 0) {
+        return 1;  /* root can usually attach */
+    }
+    /* /proc/sys/kernel/yama/ptrace_scope:
+     *   0 = ptrace allowed for any process (cap_sys_ptrace not required)
+     *   1 = only parent may trace children (we are generally not the parent)
+     *   2 = admin-only; 3 = no ptrace at all
+     * Absent file (old kernel) => treat as 0 (permissive). */
+    FILE *fp = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
+    if (fp == NULL) {
+        return 1;  /* old/unconfigured kernel: permissive default */
+    }
+    int scope = 0;
+    if (fscanf(fp, "%d", &scope) != 1) {
+        scope = 0;
+    }
+    fclose(fp);
+    return scope == 0 ? 1 : 0;
+}
+
+int injector_read_mem(injector_t *inj, uintptr_t addr, void *buf, size_t len)
+{
+    injector__set_current(inj);
+    inj->errmsg_set = 0;
+    return injector__read(inj, (size_t)addr, buf, len);
+}
+
+int injector_write_mem(injector_t *inj, uintptr_t addr, const void *buf, size_t len)
+{
+    injector__set_current(inj);
+    inj->errmsg_set = 0;
+    if (!inj->enable_write_mem) {
+        injector__set_errmsg("write_mem disabled (opts.enable_write_mem=1 required)");
+        return INJERR_PERMISSION;
+    }
+    return injector__write(inj, (size_t)addr, buf, len);
+}
+
+int injector_resolve_symbol(injector_t *inj, const char *libname, const char *symbol, uintptr_t *addr)
+{
+    char proc[64];
+    char exe_path[PATH_MAX];
+    char line[PATH_MAX * 2];
+    proc_map_t m;
+    FILE *fp;
+    size_t map_start = 0;
+    int found = 0;
+    size_t bias = 0;
+    size_t a = 0;
+    int rv;
+
+    injector__set_current(inj);
+    inj->errmsg_set = 0;
+
+    /* M1: resolve a symbol in the TARGET EXECUTABLE by non-intrusive ELF
+     * parsing (read /proc/PID/maps + the exe's .dynsym). No target code is
+     * executed.
+     *
+     * The original plan was remote dlsym(RTLD_DEFAULT); it does NOT work with
+     * this injector's remote-call mechanism: glibc's dlsym(RTLD_DEFAULT) (and
+     * dlopen(NULL)) resolve the caller's link_map to pick the search
+     * namespace, but the injector calls from anonymous mmap memory that has
+     * no link_map, so the target SIGSEGVs. (Remote dlsym with a *real* handle
+     * works fine, as injector_remote_func_addr already does for injected
+     * libraries.) Parsing the exe's dynamic symbol table avoids the issue
+     * entirely and needs no injection.
+     *
+     * M1 scope: only the target executable is searched. libname is accepted
+     * but NOT used to scope the search (documented); searching all loaded
+     * libraries is future work. */
+    (void)libname;
+
+    if (symbol == NULL) {
+        injector__set_errmsg("symbol is NULL");
+        return INJERR_OTHER;
+    }
+
+    snprintf(proc, sizeof(proc), "/proc/%d/exe", inj->pid);
+    if (proc__read_link(proc, exe_path, sizeof(exe_path)) != 0) {
+        injector__set_errmsg("failed to read %s: %s", proc, strerror(errno));
+        return INJERR_NO_PROCESS;
+    }
+
+    snprintf(proc, sizeof(proc), "/proc/%d/maps", inj->pid);
+    fp = fopen(proc, "r");
+    if (fp == NULL) {
+        injector__set_errmsg("failed to open %s: %s", proc, strerror(errno));
+        return INJERR_NO_PROCESS;
+    }
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (proc__parse_maps_line(line, &m) != 0) {
+            continue;
+        }
+        if (strcmp(m.path, exe_path) == 0) {
+            if (!found || m.start < map_start) {
+                map_start = m.start;
+                found = 1;
+            }
+        }
+    }
+    fclose(fp);
+    if (!found) {
+        injector__set_errmsg("target executable %s not found in /proc/%d/maps",
+                             exe_path, inj->pid);
+        return INJERR_NO_LIBRARY;
+    }
+
+    /* Compute the runtime load bias. For ET_EXEC the symbol values are
+     * absolute virtual addresses and the mapping already sits at the ELF
+     * link base, so bias = 0. For ET_DYN (PIE exe / shared object) symbol
+     * values are relative to the first PT_LOAD (p_vaddr 0 in practice), so
+     * bias = the mapping start. injector__elf_load_bias reads e_type. */
+    rv = injector__elf_load_bias(exe_path, map_start, &bias);
+    if (rv != 0) {
+        return rv;
+    }
+
+    {
+        const char *const names[1] = { symbol };
+        size_t addrs[1] = { 0 };
+        rv = injector__elf_find_symbols(exe_path, bias, names, addrs, 1);
+        if (rv != 0) {
+            return rv;
+        }
+        a = addrs[0];
+    }
+    if (a == 0) {
+        injector__set_errmsg("symbol not found in target executable: %s", symbol);
+        return INJERR_FUNCTION_MISSING;
+    }
+    if (addr != NULL) {
+        *addr = (uintptr_t)a;
+    }
+    return 0;
+}
+
+/* ---- Module listing & bulk uninject ---- */
+
+long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap)
+{
+    char path[64];
+    FILE *fp;
+    char line[1024];
+    long count = 0;
+    /* Adjacent-dedupe: a .so appears as several contiguous mappings
+     * (r-xp, r--p, rw-p) in /proc/PID/maps. Comparing to the previous
+     * basename collapses the common case without a large seen[] table.
+     * A non-contiguously mapped .so (rare) may be listed twice, which is
+     * acceptable for a listing API. */
+    char prev[256];
+    prev[0] = '\0';
+
+    injector__set_current(inj);
+    inj->errmsg_set = 0;
+
+    snprintf(path, sizeof(path), "/proc/%d/maps", (int)inj->pid);
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        injector__set_errmsg("failed to open %s: %s", path, strerror(errno));
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        proc_map_t m;
+        const char *base;
+        if (proc__parse_maps_line(line, &m) != 0) {
+            continue;
+        }
+        /* only shared libraries: cheap ".so" filter on the path */
+        if (strstr(m.path, ".so") == NULL) {
+            continue;
+        }
+        base = strrchr(m.path, '/');
+        base = base ? base + 1 : m.path;
+        /* dedupe against the previous basename */
+        if (prev[0] != '\0' && strcmp(base, prev) == 0) {
+            continue;
+        }
+        strncpy(prev, base, sizeof(prev) - 1);
+        prev[sizeof(prev) - 1] = '\0';
+
+        if (out != NULL && (size_t)count < cap) {
+            strncpy(out[count].name, m.path, sizeof(out[count].name) - 1);
+            out[count].name[sizeof(out[count].name) - 1] = '\0';
+            out[count].base = (uintptr_t)m.start;
+        }
+        count++;
+    }
+    fclose(fp);
+    return count;
+}
+
+int injector_uninject_all(injector_t *inj)
+{
+    int rv = 0;
+    size_t i;
+    injector__set_current(inj);
+    inj->errmsg_set = 0;
+    /* Delegate per-handle uninject to injector_uninject, which refuses musl
+     * targets (INJERR_UNSUPPORTED_TARGET). The first non-zero error wins;
+     * we keep trying the rest so a single bad handle doesn't strand others. */
+    for (i = 0; i < inj->injected_count; i++) {
+        int r = injector_uninject(inj, inj->injected_handles[i]);
+        if (r != 0 && rv == 0) {
+            rv = r;
+        }
+    }
+    inj->injected_count = 0;
+    return rv;
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Library lifecycle + process lookup (public API)                    */
+/* ------------------------------------------------------------------ */
+
+static int lib_initialized;
+
+int injector_library_init(void) {
+    if (lib_initialized++ == 0) {
+        /* reserved for future init (e.g. log handler setup in M4) */
+    }
+    return 0;
+}
+
+int injector_library_deinit(void) {
+    if (lib_initialized > 0) {
+        lib_initialized--;
+    }
+    return 0;
+}
+
+pid_t injector_find_process(const char *name) {
+    DIR *dir = opendir("/proc");
+    struct dirent *dent;
+    pid_t pid = -1;
+
+    if (dir == NULL) {
+        /* best-effort: find_process has no handle to set an errmsg on. */
+        return -1;
+    }
+    while ((dent = readdir(dir)) != NULL) {
+        char path[sizeof(dent->d_name) + 11];
+        char exepath[PATH_MAX];
+        ssize_t len;
+        char *exe;
+
+        if (dent->d_name[0] < '1' || '9' < dent->d_name[0]) {
+            continue;
+        }
+        sprintf(path, "/proc/%s/exe", dent->d_name);
+        len = readlink(path, exepath, sizeof(exepath) - 1);
+        if (len == -1) {
+            continue;
+        }
+        exepath[len] = '\0';
+        exe = strrchr(exepath, '/');
+        if (exe != NULL && strcmp(exe + 1, name) == 0) {
+            pid = atoi(dent->d_name);
+            break;
+        }
+    }
+    closedir(dir);
+    return pid;
+}
+
+
+/* ---- One-shot invoke / run (M1 ptrace-based) ---- */
+
+int injector_invoke(injector_t *inj, const char *path, const char *symbol, injector_result_t *out) {
+    if (out) { memset(out, 0, sizeof(*out)); }
+    injector__set_current(inj);
+    inj->errmsg_set = 0;
+
+    void *handle = NULL;
+    int rv = injector_inject(inj, path, &handle);
+    if (rv != 0) {
+        if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
+        return rv;
+    }
+    size_t func_addr = 0;
+    rv = injector_remote_func_addr(inj, handle, symbol, &func_addr);
+    if (rv != 0) {
+        if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
+        return rv;
+    }
+    intptr_t ret = 0;
+    rv = injector__call_function(inj, &ret, (long)func_addr);
+    if (rv != 0) {
+        if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
+        return rv;
+    }
+    if (out) out->retval = ret;
+    return 0;
+}
+
+int injector_run(pid_t pid, const char *lib, const char *symbol,
+                 const injector_opts_t *opts, injector_result_t *out) {
+    if (out) { memset(out, 0, sizeof(*out)); }
+    injector_t *inj = NULL;
+    int rv = injector_attach_with_opts(&inj, pid, opts);
+    if (rv != 0) {
+        /* attach failed: no handle; error is in thread-local (injector_error). */
+        if (out) { const char *e = injector__tl_errmsg(); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
+        return rv;
+    }
+    rv = injector_invoke(inj, lib, symbol, out);
+    injector_detach(inj);
+    return rv;
 }

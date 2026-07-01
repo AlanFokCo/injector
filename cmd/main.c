@@ -25,12 +25,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "injector.h"
+
+#ifdef __linux
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <limits.h>
-#include "injector.h"
 
 #define INVALID_PID -1
 static pid_t find_process(const char *name)
@@ -67,7 +69,109 @@ static pid_t find_process(const char *name)
     closedir(dir);
     return pid;
 }
+#endif
 
+#ifdef _WIN32
+#include <windows.h>
+#include <tlhelp32.h>
+#include "../util/ya_getopt.h"
+
+#define INVALID_PID 0
+static DWORD find_process(const char *name)
+{
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    DWORD pid = 0;
+    size_t namelen = strlen(name);
+
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(pe);
+
+        if (Process32First(hSnapshot, &pe)) {
+            do {
+                if (_strnicmp(pe.szExeFile, name, namelen) == 0) {
+                    if (pe.szExeFile[namelen] == '\0' || stricmp(pe.szExeFile + namelen, ".exe") == 0) {
+                        pid = pe.th32ProcessID;
+                        break;
+                    }
+                }
+            } while (Process32Next(hSnapshot, &pe));
+        }
+        CloseHandle(hSnapshot);
+    }
+    return pid;
+}
+
+#endif
+#ifdef __APPLE__
+#define INVALID_PID -1
+#import <sys/sysctl.h>
+#include "../util/ya_getopt.h"
+static pid_t find_process(const char *name)
+{
+	pid_t pid = -1;
+    int max_arg_size = 0;
+	size_t size = sizeof(max_arg_size);
+	if (sysctl((int[]){ CTL_KERN, KERN_ARGMAX }, 2, &max_arg_size, &size, NULL, 0) != 0) {
+		max_arg_size = 4096; 
+	}
+	
+	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL};
+	struct kinfo_proc *processes = NULL;
+	char* buffer = NULL;
+	size_t length;
+	int count;
+
+	if (sysctl(mib, 3, NULL, &length, NULL, 0) < 0){
+		goto clean;
+	}
+	processes = malloc(length);
+	if (processes == NULL){
+		goto clean;
+	}
+	if (sysctl(mib, 3, processes, &length, NULL, 0) < 0) {
+		goto clean;
+	}
+	count = length / sizeof(struct kinfo_proc);
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROCARGS2;
+	
+	buffer = (char *)malloc(max_arg_size);
+	for (int i = 0; i < count; i++) {
+		pid_t p_pid = processes[i].kp_proc.p_pid;
+		if (pid == 0) {
+			continue;
+		}
+		mib[2] = p_pid;
+		size = max_arg_size;
+		
+		if (sysctl(mib, 3, buffer, &size, NULL, 0) == 0) {
+			char* exe_path = buffer + sizeof(int);
+			char* exe_name = exe_path;
+			char* next = 0;
+			do{
+				next = strchr(exe_name, '/');
+				if(next != NULL){
+					exe_name = next + 1;
+				}
+			} while (next != NULL);
+			if(strcmp(exe_name, name) == 0){
+				pid = p_pid;
+				goto clean;
+			}
+		}
+	}
+clean:
+	if(buffer != 0){
+		free(buffer);
+	}
+	if(processes != 0){
+		free(processes);
+	}
+	
+	return pid;
+}
+#endif
 int main(int argc, char **argv)
 {
     injector_pid_t pid = INVALID_PID;
@@ -125,7 +229,7 @@ int main(int argc, char **argv)
                 printf("clone thread to inject \"%s\" was created.\n", libname);
             } else {
                 fprintf(stderr, "could not create cloned thread \"%s\"\n", libname);
-                fprintf(stderr, "  %s\n", injector_error());
+                fprintf(stderr, "  %s\n", injector_last_error(injector));
                 rv = 1;
             }
             continue;
@@ -135,7 +239,7 @@ int main(int argc, char **argv)
             printf("\"%s\" successfully injected\n", libname);
         } else {
             fprintf(stderr, "could not inject \"%s\"\n", libname);
-            fprintf(stderr, "  %s\n", injector_error());
+            fprintf(stderr, "  %s\n", injector_last_error(injector));
             rv = 1;
         }
     }

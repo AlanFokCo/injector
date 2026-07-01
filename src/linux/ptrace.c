@@ -22,12 +22,16 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
+#define _GNU_SOURCE
 #include "injector_internal.h"
+
+#include <sys/uio.h>   /* process_vm_readv/writev, struct iovec */
+#include <unistd.h>    /* getpagesize */
+#include <errno.h>
 
 #if defined(__aarch64__) || defined(__riscv)
 #define USE_REGSET
 #include <elf.h> /* for NT_PRSTATUS */
-#include <sys/uio.h> /* for struct iovec */
 #endif
 
 static int set_ptrace_error(const char *request_name)
@@ -44,6 +48,71 @@ static int set_ptrace_error(const char *request_name)
     }
     return INJERR_OTHER;
 }
+
+#ifdef INJECTOR_NO_PROCESS_VM
+/* Force the ptrace fallback path for testing. */
+static int read_vm(pid_t pid, size_t addr, void *buf, size_t len)
+{
+    (void)pid; (void)addr; (void)buf; (void)len;
+    return -1;
+}
+static int write_vm(pid_t pid, size_t addr, const void *buf, size_t len)
+{
+    (void)pid; (void)addr; (void)buf; (void)len;
+    return -1;
+}
+#else
+/*
+ * Bulk memory I/O via process_vm_readv/process_vm_writev. A single
+ * process_vm_*v call fails (rather than doing a partial transfer) if the
+ * requested range crosses an unmapped page, so chunk by page boundary: each
+ * chunk stays within one page. The common injector case (paths, names,
+ * shellcode) is a single chunk.
+ *
+ * Returns 0 on full success, -1 on any failure (caller falls back to ptrace).
+ */
+static int read_vm(pid_t pid, size_t addr, void *buf, size_t len)
+{
+    size_t off = 0;
+    long page = getpagesize();
+    while (off < len) {
+        /* bytes from (addr+off) to the end of its current page; 0 if page-aligned */
+        size_t to_page_end = (size_t)(-(long)(addr + off) & (page - 1));
+        size_t chunk = len - off;
+        if (to_page_end != 0 && chunk > to_page_end) {
+            chunk = to_page_end;
+        }
+        struct iovec liov = { (char *)buf + off, chunk };
+        struct iovec riov = { (void *)(addr + off), chunk };
+        ssize_t r = process_vm_readv(pid, &liov, 1, &riov, 1, 0);
+        if (r != (ssize_t)chunk) {
+            return -1;
+        }
+        off += chunk;
+    }
+    return 0;
+}
+static int write_vm(pid_t pid, size_t addr, const void *buf, size_t len)
+{
+    size_t off = 0;
+    long page = getpagesize();
+    while (off < len) {
+        size_t to_page_end = (size_t)(-(long)(addr + off) & (page - 1));
+        size_t chunk = len - off;
+        if (to_page_end != 0 && chunk > to_page_end) {
+            chunk = to_page_end;
+        }
+        struct iovec liov = { (void *)((const char *)buf + off), chunk };
+        struct iovec riov = { (void *)(addr + off), chunk };
+        ssize_t r = process_vm_writev(pid, &liov, 1, &riov, 1, 0);
+        if (r != (ssize_t)chunk) {
+            return -1;
+        }
+        off += chunk;
+    }
+    return 0;
+}
+#endif /* INJECTOR_NO_PROCESS_VM */
 
 int injector__ptrace(int request, pid_t pid, long addr, long data, const char *request_name)
 {
@@ -93,6 +162,10 @@ int injector__read(const injector_t *injector, size_t addr, void *buf, size_t le
     long word;
     char *dest = (char *)buf;
 
+    if (len > 0 && read_vm(pid, addr, buf, len) == 0) {
+        return 0;
+    }
+    /* fall back to word-at-a-time PTRACE_PEEKTEXT */
     errno = 0;
     while (len >= sizeof(long)) {
         word = ptrace(PTRACE_PEEKTEXT, pid, addr, 0);
@@ -122,6 +195,10 @@ int injector__write(const injector_t *injector, size_t addr, const void *buf, si
     pid_t pid = injector->pid;
     const char *src = (const char *)buf;
 
+    if (len > 0 && write_vm(pid, addr, buf, len) == 0) {
+        return 0;
+    }
+    /* fall back to word-at-a-time PTRACE_POKETEXT */
     while (len >= sizeof(long)) {
         PTRACE_OR_RETURN(PTRACE_POKETEXT, injector, addr, *(long*)src);
         addr += sizeof(long);

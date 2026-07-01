@@ -35,6 +35,9 @@
 #include <sys/wait.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <time.h>
+#include <errno.h>
+#include <signal.h>
 #include "injector_internal.h"
 
 // #define INJECTOR_DEBUG_REMOTE_CALL 1
@@ -738,6 +741,18 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
     return 0;
 }
 
+/* Restore the target's original registers and backup code. Called on every
+ * exit path of kick_then_wait_sigtrap (success, failure, timeout, target death)
+ * so the target is never left with hijacked state. Returns the passed-in rv.
+ * The set_regs/write calls will fail with ESRCH once the target has died, but
+ * that is harmless: the first (sticky) error message is already set. */
+static int cleanup_remote_call(const injector_t *inj, size_t code_size, int rv)
+{
+    injector__set_regs(inj, &inj->regs);
+    injector__write(inj, inj->code_addr, &inj->backup_code, code_size);
+    return rv;
+}
+
 static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_struct *regs, code_t *code, size_t code_size)
 {
     int status;
@@ -749,73 +764,155 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
     }
     rv = injector__write(injector, injector->code_addr, code, code_size);
     if (rv != 0) {
-        injector__set_regs(injector, &injector->regs);
-        return rv;
+        return cleanup_remote_call(injector, code_size, rv);
     }
-
     rv = injector__continue(injector);
     if (rv != 0) {
-        goto cleanup;
+        return cleanup_remote_call(injector, code_size, rv);
     }
-    while (1) {
-        pid_t pid = waitpid(injector->pid, &status, 0);
+
+    /* deadline = now + call_timeout_ms.
+     * Use CLOCK_MONOTONIC + polling waitpid(WNOHANG). NO SIGALRM (the library
+     * must remain signal-free so it can be used from a Go runtime). */
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += injector->call_timeout_ms / 1000;
+    long add_ns = (long)(injector->call_timeout_ms % 1000) * 1000000L;
+    deadline.tv_nsec += add_ns;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    for (;;) {
+        pid_t pid = waitpid(injector->pid, &status, WNOHANG);
         if (pid == -1) {
             if (errno == EINTR) {
                 continue;
             }
             injector__set_errmsg("waitpid error: %s", strerror(errno));
-            rv = INJERR_WAIT_TRACEE;
-            goto cleanup;
+            return cleanup_remote_call(injector, code_size, INJERR_WAIT_TRACEE);
         }
-        if (WIFSTOPPED(status)) {
+        if (pid == injector->pid) {
+            if (WIFSTOPPED(status)) {
+                switch (WSTOPSIG(status)) {
+                case SIGTRAP:
+                    rv = injector__get_regs(injector, regs);
+                    return cleanup_remote_call(injector, code_size, rv);
+                case SIGSTOP:
+                    rv = injector__continue(injector);
+                    if (rv != 0) {
+                        return cleanup_remote_call(injector, code_size, rv);
+                    }
+                    break;  /* keep waiting */
+                default:
 #if defined(PT_GETSIGINFO)
-            siginfo_t si = {0,};
+                    {
+                        siginfo_t si = {0,};
+                        if (WSTOPSIG(status) == SIGSYS) {
+                            int grv = injector__ptrace(PT_GETSIGINFO, injector->pid, 0, (long)&si, "PT_GETSIGINFO");
+                            if (grv != 0) {
+                                return cleanup_remote_call(injector, code_size, grv);
+                            }
+                            if (si.si_signo == SIGSYS && si.si_code == 1) {
+                                injector__set_errmsg("Got SIGSYS. System call %d at address %p might be blocked by seccomp.",
+                                                     si.si_syscall, (void*)si.si_call_addr);
+                                return cleanup_remote_call(injector, code_size, INJERR_OTHER);
+                            }
+                        }
+                    }
 #endif
-            switch (WSTOPSIG(status)) {
-            case SIGTRAP:
-                goto got_sigtrap;
-            case SIGSTOP:
-                rv = injector__continue(injector);
-                if (rv != 0) {
-                    goto cleanup;
+                    injector__set_errmsg("The target process unexpectedly stopped by signal %d.", WSTOPSIG(status));
+                    return cleanup_remote_call(injector, code_size, INJERR_OTHER);
                 }
-                break;
-#if defined(PT_GETSIGINFO)
-            case SIGSYS:
-              PTRACE_OR_RETURN(PT_GETSIGINFO, injector, 0, (long)&si);
-              if (si.si_signo == SIGSYS && si.si_code == 1) {
-                  injector__set_errmsg("Got SIGSYS. System call %d at address %p might be blocked by seccomp.",
-                                       si.si_syscall, (void*)si.si_call_addr);
-                  rv = INJERR_OTHER;
-                  goto cleanup;
-              }
-              // FALL THROUGH */
-#endif
-            default:
-                injector__set_errmsg("The target process unexpectedly stopped by signal %d.", WSTOPSIG(status));
-                rv = INJERR_OTHER;
-                goto cleanup;
+            } else if (WIFEXITED(status)) {
+                injector__set_errmsg("The target process unexpectedly terminated with exit code %d.", WEXITSTATUS(status));
+                return cleanup_remote_call(injector, code_size, INJERR_OTHER);
+            } else if (WIFSIGNALED(status)) {
+                injector__set_errmsg("The target process unexpectedly terminated by signal %d.", WTERMSIG(status));
+                return cleanup_remote_call(injector, code_size, INJERR_OTHER);
+            } else {
+                injector__set_errmsg("Unexpected waitpid status: 0x%x", status);
+                return cleanup_remote_call(injector, code_size, INJERR_OTHER);
             }
-        } else if (WIFEXITED(status)) {
-            injector__set_errmsg("The target process unexpectedly terminated with exit code %d.", WEXITSTATUS(status));
-            rv = INJERR_OTHER;
-            goto cleanup;
-        } else if (WIFSIGNALED(status)) {
-            injector__set_errmsg("The target process unexpectedly terminated by signal %d.", WTERMSIG(status));
-            rv = INJERR_OTHER;
-            goto cleanup;
-        } else {
-            /* never reach here */
-            injector__set_errmsg("Unexpected waitpid status: 0x%x", status);
-            rv = INJERR_OTHER;
-            goto cleanup;
         }
+        /* pid == 0: child not yet changed state. Check the deadline. */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            /* Timeout. The tracee is RUNNING (we PTRACE_CONT'd it), so we
+            * cannot set its regs / write its code until it is STOPPED again.
+            *
+            * PTRACE_INTERRUPT is the textbook tool, but it is unusable here:
+            * the library attaches with PTRACE_ATTACH, not PTRACE_SEIZE, and
+            * PTRACE_INTERRUPT against an ATTACH-tracee returns EIO (it is a
+            * seize-only request). Send SIGSTOP to the target instead. This is
+            * a ptrace control signal delivered to the TARGET, not a signal
+            * handler installed in the library's own process, so the library
+            * stays signal-handler-free (Go-runtime friendly) -- ptrace itself
+            * is signal-mediated, and the main wait loop already handles SIGSTOP.
+            *
+            * Once re-stopped, restore the original regs+code and return
+            * INJERR_TIMEOUT while still ATTACHED + STOPPED. The caller's
+            * injector_detach() then munmaps + PTRACE_DETACHes normally: the
+            * pending SIGSTOP is discarded by the PTRACE_CONT that runs the
+            * munmap syscall (or by PTRACE_DETACH if no munmap), so no mmap
+            * leak, no stale flags, no hijacked code left behind, and the
+            * target resumes at its original rip. */
+            if (kill(injector->pid, SIGSTOP) == 0) {
+                struct timespec stop_dl;
+                clock_gettime(CLOCK_MONOTONIC, &stop_dl);
+                stop_dl.tv_sec += 2;  /* 2s grace to observe the stop */
+                int stopped = 0;
+                for (;;) {
+                    int st2;
+                    pid_t p2 = waitpid(injector->pid, &st2, WNOHANG);
+                    if (p2 == injector->pid) {
+                        if (WIFSTOPPED(st2)) {
+                            stopped = 1;
+                            break;
+                        } else if (WIFEXITED(st2)) {
+                            injector__set_errmsg("The target process unexpectedly terminated with exit code %d.", WEXITSTATUS(st2));
+                            return cleanup_remote_call(injector, code_size, INJERR_OTHER);
+                        } else if (WIFSIGNALED(st2)) {
+                            injector__set_errmsg("The target process unexpectedly terminated by signal %d.", WTERMSIG(st2));
+                            return cleanup_remote_call(injector, code_size, INJERR_OTHER);
+                        } else {
+                            break;  /* unexpected status: treat as not-stopped */
+                        }
+                    }
+                    if (p2 == -1 && errno != EINTR) {
+                        break;  /* target gone */
+                    }
+                    struct timespec now2;
+                    clock_gettime(CLOCK_MONOTONIC, &now2);
+                    if (now2.tv_sec > stop_dl.tv_sec ||
+                        (now2.tv_sec == stop_dl.tv_sec && now2.tv_nsec >= stop_dl.tv_nsec)) {
+                        break;
+                    }
+                    struct timespec bs2 = {0, 1000000};
+                    nanosleep(&bs2, NULL);
+                }
+                if (stopped) {
+                    injector__set_regs(injector, &injector->regs);
+                    injector__write(injector, injector->code_addr, &injector->backup_code, code_size);
+                } else {
+                    /* D-state / uninterruptible sleep, or target vanished:
+                     * could not re-stop to restore. Best-effort: leave attached
+                     * so injector_detach still attempts cleanup; code at
+                     * code_addr may remain unrestored. */
+                    injector__set_errmsg("remote call timed out after %u ms; could not stop target to restore state (target may have unrestored code at libc entry)", injector->call_timeout_ms);
+                    return INJERR_TIMEOUT;
+                }
+            } else {
+                injector__set_errmsg("remote call timed out after %u ms; kill(SIGSTOP) failed (%s); target may have unrestored code", injector->call_timeout_ms, strerror(errno));
+                return INJERR_TIMEOUT;
+            }
+            injector__set_errmsg("remote call timed out after %u ms", injector->call_timeout_ms);
+            return INJERR_TIMEOUT;  /* target stays ATTACHED + STOPPED with restored state */
+        }
+        struct timespec bs = {0, 1000000};  /* 1ms backoff */
+        nanosleep(&bs, NULL);
     }
-got_sigtrap:
-    /* success */
-    rv = injector__get_regs(injector, regs);
-cleanup:
-    injector__set_regs(injector, &injector->regs);
-    injector__write(injector, injector->code_addr, &injector->backup_code, code_size);
-    return rv;
 }

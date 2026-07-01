@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libinjector
+Description: Linux shared-library injector (ptrace-based)
+Version: 1.0.0
+URL: https://github.com/AlanFokCo/injector
+Libs: -L${libdir} -linjector
+Cflags: -I${includedir}

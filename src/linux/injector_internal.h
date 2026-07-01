@@ -186,14 +186,15 @@ typedef struct {
 } injector_shellcode_arg_t;
 
 typedef struct {
-    intptr_t retval;       /* 0:  function return value */
-    int64_t status;        /* 8:  0=running, 1=ok, 2=error */
+    intptr_t retval;       /*  0: function return value */
+    int64_t status;        /*  8: 0=running, 1=ok, 2=error */
     size_t dlopen_addr;    /* 16 */
     size_t dlsym_addr;     /* 24 */
     size_t dlerror_addr;   /* 32 */
     int32_t dlflags;       /* 40 */
     int32_t func_name_off; /* 44: byte offset from struct base to func_name */
-    char file_path[0];     /* 48: library path; func_name at base + func_name_off */
+    intptr_t func_args[6]; /* 48: up to 6 integer/pointer arguments */
+    char file_path[0];     /* 96: library path; func_name at base + func_name_off */
 } injector_shellcode_invoke_arg_t;
 
 void *injector_shellcode(injector_shellcode_arg_t *arg);

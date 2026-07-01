@@ -860,7 +860,9 @@ pid_t injector_find_process(const char *name) {
 
 /* ---- One-shot invoke / run ---- */
 
-static int injector_invoke_ptrace(injector_t *inj, const char *path, const char *symbol, injector_result_t *out) {
+static int injector_invoke_ptrace(injector_t *inj, const char *path, const char *symbol,
+                                  const intptr_t *args, int argc,
+                                  injector_result_t *out) {
     void *handle = NULL;
     int rv = injector_inject(inj, path, &handle);
     if (rv != 0) {
@@ -874,7 +876,13 @@ static int injector_invoke_ptrace(injector_t *inj, const char *path, const char 
         return rv;
     }
     intptr_t ret = 0;
-    rv = injector__call_function(inj, &ret, (long)func_addr);
+    rv = injector__call_function(inj, &ret, (long)func_addr,
+                                (long)(argc > 0 ? args[0] : 0),
+                                (long)(argc > 1 ? args[1] : 0),
+                                (long)(argc > 2 ? args[2] : 0),
+                                (long)(argc > 3 ? args[3] : 0),
+                                (long)(argc > 4 ? args[4] : 0),
+                                (long)(argc > 5 ? args[5] : 0));
     if (rv != 0) {
         if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
         return rv;
@@ -884,7 +892,9 @@ static int injector_invoke_ptrace(injector_t *inj, const char *path, const char 
 }
 
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
-static int injector_invoke_nonstop(injector_t *inj, const char *path, const char *symbol, injector_result_t *out)
+static int injector_invoke_nonstop(injector_t *inj, const char *path, const char *symbol,
+                                   const intptr_t *args, int argc,
+                                   injector_result_t *out)
 {
     char abspath[PATH_MAX];
     size_t pathlen, symlen;
@@ -929,6 +939,9 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
         arg->dlflags |= __RTLD_DLOPEN_2;
     }
     arg->func_name_off = (int32_t)func_name_off;
+    for (int i = 0; i < argc && i < 6; i++) {
+        arg->func_args[i] = args[i];
+    }
     memcpy(arg->file_path, abspath, pathlen);
     memcpy((char*)data + func_name_off, symbol, symlen);
 
@@ -993,15 +1006,28 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
 }
 #endif
 
-int injector_invoke(injector_t *inj, const char *path, const char *symbol, injector_result_t *out) {
+int injector_invoke(injector_t *inj, const char *path, const char *symbol,
+                    const intptr_t *args, int argc,
+                    injector_result_t *out) {
     if (out) { memset(out, 0, sizeof(*out)); }
     injector__set_current(inj);
     inj->errmsg_set = 0;
 
+    if (argc < 0 || argc > INJECTOR_MAX_INVOKE_ARGS) {
+        injector__set_errmsg("argc must be 0-%d (got %d)", INJECTOR_MAX_INVOKE_ARGS, argc);
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
+        return INJERR_OTHER;
+    }
+    if (argc > 0 && args == NULL) {
+        injector__set_errmsg("args is NULL but argc is %d", argc);
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
+        return INJERR_OTHER;
+    }
+
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     if (inj->mode == INJECTOR_DELIVERY_NONSTOP ||
         (inj->mode == INJECTOR_DELIVERY_AUTO && inj->arch == ARCH_X86_64)) {
-        return injector_invoke_nonstop(inj, path, symbol, out);
+        return injector_invoke_nonstop(inj, path, symbol, args, argc, out);
     }
 #endif
     if (inj->mode == INJECTOR_DELIVERY_NONSTOP) {
@@ -1009,20 +1035,20 @@ int injector_invoke(injector_t *inj, const char *path, const char *symbol, injec
         if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
         return INJERR_UNSUPPORTED_TARGET;
     }
-    return injector_invoke_ptrace(inj, path, symbol, out);
+    return injector_invoke_ptrace(inj, path, symbol, args, argc, out);
 }
 
 int injector_run(pid_t pid, const char *lib, const char *symbol,
+                 const intptr_t *args, int argc,
                  const injector_opts_t *opts, injector_result_t *out) {
     if (out) { memset(out, 0, sizeof(*out)); }
     injector_t *inj = NULL;
     int rv = injector_attach_with_opts(&inj, pid, opts);
     if (rv != 0) {
-        /* attach failed: no handle; error is in thread-local (injector_error). */
         if (out) { const char *e = injector__tl_errmsg(); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
         return rv;
     }
-    rv = injector_invoke(inj, lib, symbol, out);
+    rv = injector_invoke(inj, lib, symbol, args, argc, out);
     injector_detach(inj);
     return rv;
 }

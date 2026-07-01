@@ -65,6 +65,7 @@ extern "C" {
 
 #define INJECTOR_ABI_VERSION 1u
 #define INJECTOR_VERSION "1.0.0"
+#define INJECTOR_MAX_INVOKE_ARGS 6
 
 typedef enum {
     INJECTOR_DELIVERY_AUTO = 0,
@@ -412,29 +413,38 @@ typedef struct {
 } injector_result_t;
 
 /*!
- * \brief Inject a library, resolve a no-arg symbol, call it, and capture the
- *        return value, all in one call (Linux only; M1 ptrace path).
+ * \brief Inject a library, resolve a symbol, call it with up to 6 arguments,
+ *        and capture the return value (Linux only).
  * \param[in]  inj     an attached injector handle
  * \param[in]  path    the shared library path to inject
- * \param[in]  symbol  a no-argument function returning an integer
+ * \param[in]  symbol  function name to call (must return intptr_t)
+ * \param[in]  args    array of up to \c INJECTOR_MAX_INVOKE_ARGS intptr_t
+ *                     arguments, or \c NULL for a no-argument call
+ * \param[in]  argc    number of elements in \p args (0–6)
  * \param[out] out     destination result, or \c NULL to skip capturing it
  * \return             zero on success. On failure, \c out->errmsg is filled
- *                     (if \c out). M1 uses the bounded-ptrace path (brief stop);
- *                     M2 will switch to the threaded/non-stop path.
- * \note   The entry symbol must be a no-argument function returning an integer.
+ *                     (if \c out).
+ * \remarks Uses the nonstop (clone-based) path on x86_64 when delivery mode
+ *          is \c NONSTOP or \c AUTO; falls back to ptrace otherwise.
  */
-int injector_invoke(injector_t *inj, const char *path, const char *symbol, injector_result_t *out);
+int injector_invoke(injector_t *inj, const char *path, const char *symbol,
+                    const intptr_t *args, int argc,
+                    injector_result_t *out);
 
 /*!
- * \brief One-shot: attach with opts, invoke, and detach (Linux only).
+ * \brief One-shot: attach with opts, invoke with arguments, and detach (Linux only).
  * \param[in]  pid     the target process id
  * \param[in]  lib     the shared library path to inject
- * \param[in]  symbol  a no-argument function returning an integer
+ * \param[in]  symbol  function name to call (must return intptr_t)
+ * \param[in]  args    array of up to \c INJECTOR_MAX_INVOKE_ARGS intptr_t
+ *                     arguments, or \c NULL for a no-argument call
+ * \param[in]  argc    number of elements in \p args (0–6)
  * \param[in]  opts    attach options, or \c NULL for defaults
  * \param[out] out     destination result, or \c NULL to skip capturing it
  * \return             zero on success.
  */
 int injector_run(pid_t pid, const char *lib, const char *symbol,
+                 const intptr_t *args, int argc,
                  const injector_opts_t *opts, injector_result_t *out);
 #endif
 

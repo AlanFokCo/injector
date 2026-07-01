@@ -76,7 +76,8 @@ injector_shellcode_size:
 #define inv_dlerror_addr_offset 32
 #define inv_dlflags_offset 40
 #define inv_func_name_off_offset 44
-#define inv_file_path_offset 48
+#define inv_func_args_offset 48
+#define inv_file_path_offset 96
 
 	.balign 16
 	.global	injector_shellcode_invoke
@@ -104,8 +105,15 @@ injector_shellcode_invoke:
 	test	%rax, %rax
 	jz	.inv_error
 
-	// 3. retval = func()
-	call	*%rax
+	// 3. retval = func(args[0..5])
+	movq	%rax, %r12
+	movq	inv_func_args_offset +  0(%rbx), %rdi
+	movq	inv_func_args_offset +  8(%rbx), %rsi
+	movq	inv_func_args_offset + 16(%rbx), %rdx
+	movq	inv_func_args_offset + 24(%rbx), %rcx
+	movq	inv_func_args_offset + 32(%rbx), %r8
+	movq	inv_func_args_offset + 40(%rbx), %r9
+	call	*%r12
 	movq	%rax, inv_retval_offset(%rbx)
 	movq	$1, inv_status_offset(%rbx)
 	jmp	.inv_exit

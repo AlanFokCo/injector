@@ -353,16 +353,57 @@ static int run_invoke_test(process_t *proc, char *test_library)
         printf("invoke: attach error: %s\n", injector_last_error(injector));
         goto cleanup;
     }
+    /* 0 args */
     memset(&r, 0, sizeof(r));
-    if (injector_invoke(injector, test_library, "entry_noarg", &r) != 0) {
+    if (injector_invoke(injector, test_library, "entry_noarg", NULL, 0, &r) != 0) {
         printf("invoke: invoke error: %s\n", r.errmsg);
         goto cleanup;
     }
-    printf("invoke: injector_invoke retval = %" PRIdPTR " (expect 42)\n", r.retval);
+    printf("invoke: 0-arg retval = %" PRIdPTR " (expect 42)\n", r.retval);
     if (r.retval != 42) { printf("invoke: ERROR retval=%" PRIdPTR "\n", r.retval); goto cleanup; }
 
+    /* 1 arg */
     memset(&r, 0, sizeof(r));
-    int frc = injector_invoke(injector, "no-such-lib.so", "x", &r);
+    intptr_t args1[] = {21};
+    if (injector_invoke(injector, test_library, "entry_onearg", args1, 1, &r) != 0) {
+        printf("invoke: 1-arg error: %s\n", r.errmsg);
+        goto cleanup;
+    }
+    printf("invoke: 1-arg retval = %" PRIdPTR " (expect 42)\n", r.retval);
+    if (r.retval != 42) { printf("invoke: ERROR 1-arg retval=%" PRIdPTR "\n", r.retval); goto cleanup; }
+
+    /* 3 args */
+    memset(&r, 0, sizeof(r));
+    intptr_t args3[] = {10, 20, 30};
+    if (injector_invoke(injector, test_library, "entry_threeargs", args3, 3, &r) != 0) {
+        printf("invoke: 3-arg error: %s\n", r.errmsg);
+        goto cleanup;
+    }
+    printf("invoke: 3-arg retval = %" PRIdPTR " (expect 60)\n", r.retval);
+    if (r.retval != 60) { printf("invoke: ERROR 3-arg retval=%" PRIdPTR "\n", r.retval); goto cleanup; }
+
+    /* 6 args */
+    memset(&r, 0, sizeof(r));
+    intptr_t args6[] = {1, 2, 3, 4, 5, 6};
+    if (injector_invoke(injector, test_library, "sum_integers", args6, 6, &r) != 0) {
+        printf("invoke: 6-arg error: %s\n", r.errmsg);
+        goto cleanup;
+    }
+    printf("invoke: 6-arg retval = %" PRIdPTR " (expect 21)\n", r.retval);
+    if (r.retval != 21) { printf("invoke: ERROR 6-arg retval=%" PRIdPTR "\n", r.retval); goto cleanup; }
+
+    /* argc validation */
+    memset(&r, 0, sizeof(r));
+    int frc = injector_invoke(injector, test_library, "entry_noarg", NULL, 7, &r);
+    if (frc == 0) {
+        printf("invoke: ERROR argc=7 should fail\n");
+        goto cleanup;
+    }
+    printf("invoke: argc=7 rejected as expected\n");
+
+    /* bad lib error path */
+    memset(&r, 0, sizeof(r));
+    frc = injector_invoke(injector, "no-such-lib.so", "x", NULL, 0, &r);
     if (frc == 0 || r.errmsg[0] == '\0') {
         printf("invoke: ERROR bad-lib should fail with errmsg\n");
         goto cleanup;
@@ -371,14 +412,17 @@ static int run_invoke_test(process_t *proc, char *test_library)
     injector_detach(injector);
     injector = NULL;
 
+    /* injector_run with args */
     memset(&r, 0, sizeof(r));
-    if (injector_run(proc->pid, test_library, "entry_noarg", NULL, &r) != 0) {
-        printf("invoke: run error: %s\n", r.errmsg);
+    intptr_t rargs[] = {100};
+    if (injector_run(proc->pid, test_library, "entry_onearg", rargs, 1, NULL, &r) != 0) {
+        printf("invoke: run-with-args error: %s\n", r.errmsg);
         goto cleanup;
     }
-    printf("invoke: injector_run retval = %" PRIdPTR " (expect 42)\n", r.retval);
-    if (r.retval != 42) { printf("invoke: ERROR run retval\n"); goto cleanup; }
-    printf("SUCCESS: invoke/run OK; target exited 13 (expected 13).\n");
+    printf("invoke: run-with-args retval = %" PRIdPTR " (expect 200)\n", r.retval);
+    if (r.retval != 200) { printf("invoke: ERROR run-with-args retval\n"); goto cleanup; }
+
+    printf("SUCCESS: invoke/run with args OK.\n");
     rv = 0;
 cleanup:
     if (injector != NULL) injector_detach(injector);

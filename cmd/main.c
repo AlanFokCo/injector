@@ -41,6 +41,7 @@ static void print_usage(const char *prog)
         "Actions:\n"
         "  (default)               inject libraries listed after options\n"
         "  -r, --run LIB:SYMBOL    one-shot: inject LIB, call SYMBOL, detach\n"
+        "  -a, --arg VALUE         argument for --run (up to 6, integer or 0x hex)\n"
         "  -i, --info              print target info (non-intrusive) and exit\n"
         "\n"
         "Options:\n"
@@ -78,7 +79,8 @@ static int cmd_info(pid_t pid)
     return 0;
 }
 
-static int cmd_run(pid_t pid, const char *spec, unsigned timeout_ms)
+static int cmd_run(pid_t pid, const char *spec, unsigned timeout_ms,
+                   const intptr_t *run_args, int run_argc)
 {
     char buf[4096];
     const char *colon = strchr(spec, ':');
@@ -102,7 +104,9 @@ static int cmd_run(pid_t pid, const char *spec, unsigned timeout_ms)
     injector_opts_t opts = INJECTOR_OPTS_INIT;
     opts.call_timeout_ms = timeout_ms;
     injector_result_t r;
-    int rv = injector_run(pid, buf, symbol, &opts, &r);
+    int rv = injector_run(pid, buf, symbol,
+                          run_argc > 0 ? run_args : NULL, run_argc,
+                          &opts, &r);
     if (rv != 0) {
         fprintf(stderr, "injector_run failed (rc=%d): %s\n", rv, r.errmsg);
         return 1;
@@ -117,6 +121,8 @@ int main(int argc, char **argv)
     unsigned timeout_ms = 5000;
     int do_info = 0;
     const char *run_spec = NULL;
+    intptr_t run_args[INJECTOR_MAX_INVOKE_ARGS];
+    int run_argc = 0;
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     int cloned_thread = 0;
 #endif
@@ -125,6 +131,7 @@ int main(int argc, char **argv)
         {"pid",            required_argument, NULL, 'p'},
         {"name",           required_argument, NULL, 'n'},
         {"run",            required_argument, NULL, 'r'},
+        {"arg",            required_argument, NULL, 'a'},
         {"info",           no_argument,       NULL, 'i'},
         {"timeout",        required_argument, NULL, 't'},
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
@@ -136,9 +143,9 @@ int main(int argc, char **argv)
     };
 
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
-    const char *optstring = "p:n:r:it:TVh";
+    const char *optstring = "p:n:r:a:it:TVh";
 #else
-    const char *optstring = "p:n:r:it:Vh";
+    const char *optstring = "p:n:r:a:it:Vh";
 #endif
 
     int opt;
@@ -165,6 +172,19 @@ int main(int argc, char **argv)
         case 'r':
             run_spec = optarg;
             break;
+        case 'a': {
+            if (run_argc >= INJECTOR_MAX_INVOKE_ARGS) {
+                fprintf(stderr, "too many --arg values (max %d)\n", INJECTOR_MAX_INVOKE_ARGS);
+                return 1;
+            }
+            char *endptr;
+            run_args[run_argc++] = (intptr_t)strtoimax(optarg, &endptr, 0);
+            if (*endptr != '\0') {
+                fprintf(stderr, "invalid --arg value: %s\n", optarg);
+                return 1;
+            }
+            break;
+        }
         case 'i':
             do_info = 1;
             break;
@@ -206,7 +226,7 @@ int main(int argc, char **argv)
     }
 
     if (run_spec != NULL) {
-        return cmd_run(pid, run_spec, timeout_ms);
+        return cmd_run(pid, run_spec, timeout_ms, run_args, run_argc);
     }
 
     if (optind >= argc) {

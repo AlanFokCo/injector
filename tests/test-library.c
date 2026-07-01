@@ -27,3 +27,7 @@ __attribute__((used))
 intptr_t hang_forever(void) { while (1) { pause(); } return 0; }
 
 intptr_t entry_noarg(void) { return 42; }
+
+intptr_t entry_onearg(intptr_t a) { return a * 2; }
+
+intptr_t entry_threeargs(intptr_t a, intptr_t b, intptr_t c) { return a + b + c; }

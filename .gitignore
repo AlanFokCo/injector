@@ -7,3 +7,9 @@
 /tests/test-prog-*
 /tests/test-target
 /tests/test-target-*
+
+# design/progress docs not tracked
+docs/
+task_plan.md
+findings.md
+progress.md

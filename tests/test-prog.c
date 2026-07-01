@@ -171,7 +171,7 @@ static int test_remote_call(injector_t *injector, void *handle)
 
     size_t func_addr;
     if (injector_remote_func_addr(injector, handle, "sum_integers", &func_addr) != 0) {
-        printf("injector_remote_func_addr error:\n  %s\n", injector_error());
+        printf("injector_remote_func_addr error:\n  %s\n", injector_last_error(injector));
         return -1;
     }
     intptr_t retval;
@@ -181,7 +181,7 @@ static int test_remote_call(injector_t *injector, void *handle)
         args[i] += 10;
         intptr_t expected_retval = args[0] + args[1] + args[2] + args[3] + args[4] + args[5];
         if (injector_remote_call(injector, &retval, func_addr, args[0], args[1], args[2], args[3], args[4], args[5]) != 0) {
-            printf("injector_remote_call error:\n  %s\n", injector_error());
+            printf("injector_remote_call error:\n  %s\n", injector_last_error(injector));
             return -1;
         }
         if (retval != expected_retval) {
@@ -249,7 +249,7 @@ int main(int argc, char **argv)
         const char *errmsg;
 
         if (injector_attach(&injector, proc.pid) != 0) {
-            printf("inject error:\n  %s\n", injector_error());
+            printf("inject error:\n  %s\n", injector_last_error(injector));
             goto cleanup;
         }
         printf("attached.\n");
@@ -257,7 +257,7 @@ int main(int argc, char **argv)
 
         if (loop_cnt == 0) {
             if (inject_func(injector, test_library, &handle) != 0) {
-                printf("inject error:\n  %s\n", injector_error());
+                printf("inject error:\n  %s\n", injector_last_error(injector));
                 goto cleanup;
             }
             printf("injected. (handle=%p)\n", handle);
@@ -267,7 +267,7 @@ int main(int argc, char **argv)
                 printf("injection should fail but succeeded:\n");
                 goto cleanup;
             }
-            errmsg = injector_error();
+            errmsg = injector_last_error(injector);
             if (strncmp(errmsg, INJECT_ERRMSG, strlen(INJECT_ERRMSG)) != 0) {
                 printf("unexpected injection error message: %s\nexpected: %s\n", errmsg, INJECT_ERRMSG);
                 goto cleanup;
@@ -283,7 +283,7 @@ int main(int argc, char **argv)
             }
         } else {
             if (injector_uninject(injector, handle) != 0) {
-                printf("uninject error:\n  %s\n", injector_error());
+                printf("uninject error:\n  %s\n", injector_last_error(injector));
                 goto cleanup;
             }
             printf("uninjected.\n");
@@ -291,7 +291,7 @@ int main(int argc, char **argv)
         }
 
         if (injector_detach(injector) != 0) {
-            printf("inject error:\n  %s\n", injector_error());
+            printf("inject error:\n  %s\n", injector_last_error(injector));
             goto cleanup;
         }
         printf("detached.\n");

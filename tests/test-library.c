@@ -2,6 +2,7 @@
 #define INCR_ON_UNINJECTION 17
 
 #include <stdint.h>
+#include <unistd.h>
 
 extern int exit_value;
 
@@ -21,3 +22,8 @@ intptr_t sum_integers(intptr_t a1, intptr_t a2, intptr_t a3, intptr_t a4, intptr
 {
     return a1 + a2 + a3 + a4 + a5 + a6;
 }
+
+__attribute__((used))
+intptr_t hang_forever(void) { while (1) { pause(); } return 0; }
+
+intptr_t entry_noarg(void) { return 42; }

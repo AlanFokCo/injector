@@ -6,6 +6,7 @@
 #define SLEEP_SECS 6
 
 DLLEXPORT int exit_value = 0;
+DLLEXPORT volatile int probe_val = 7;
 
 int main()
 {

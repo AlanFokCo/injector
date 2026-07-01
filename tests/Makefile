@@ -176,7 +176,15 @@ check: all
 	   fi; \
 	 done
 
-clean:
-	$(RM) test-prog$(EXE_EXT) test-prog-* test-target$(EXE_EXT) test-target-* test-library.$(SO_EXT) test-library-*.$(SO_EXT)
+UNIT_TESTS = unit/run
 
-.PHONY: $(BUILD_TARGETS) build check clean
+unit: $(UNIT_TESTS)
+	@for t in $(UNIT_TESTS); do echo "=== $$t ==="; ./$$t || exit 1; done
+
+unit/run: unit/run.c unit/minunit.h
+	$(CC) $(CFLAGS) -I. -o $@ unit/run.c
+
+clean:
+	$(RM) test-prog$(EXE_EXT) test-prog-* test-target$(EXE_EXT) test-target-* test-library.$(SO_EXT) test-library-*.$(SO_EXT) $(UNIT_TESTS)
+
+.PHONY: $(BUILD_TARGETS) build check clean unit

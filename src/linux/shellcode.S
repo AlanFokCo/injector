@@ -67,4 +67,84 @@ injector_shellcode:
 injector_shellcode_size:
 	// distance from injector_shellcode to current.
 	.int	. - injector_shellcode
+
+// injector_shellcode_invoke_arg_t field offsets
+#define inv_retval_offset 0
+#define inv_status_offset 8
+#define inv_dlopen_addr_offset 16
+#define inv_dlsym_addr_offset 24
+#define inv_dlerror_addr_offset 32
+#define inv_dlflags_offset 40
+#define inv_func_name_off_offset 44
+#define inv_file_path_offset 48
+
+	.balign 16
+	.global	injector_shellcode_invoke
+	.hidden	injector_shellcode_invoke
+	.type	injector_shellcode_invoke, @function
+	// void *injector_shellcode_invoke(injector_shellcode_invoke_arg_t *arg) {
+injector_shellcode_invoke:
+	pushq	%rbx
+	pushq	%r12
+	movq	%rdi, %rbx
+
+	// 1. handle = dlopen(file_path, dlflags)
+	leaq	inv_file_path_offset(%rbx), %rdi
+	movl	inv_dlflags_offset(%rbx), %esi
+	call	*inv_dlopen_addr_offset(%rbx)
+	test	%rax, %rax
+	jz	.inv_error
+	movq	%rax, %r12
+
+	// 2. func = dlsym(handle, func_name)
+	movq	%r12, %rdi
+	movslq	inv_func_name_off_offset(%rbx), %rax
+	leaq	(%rbx, %rax, 1), %rsi
+	call	*inv_dlsym_addr_offset(%rbx)
+	test	%rax, %rax
+	jz	.inv_error
+
+	// 3. retval = func()
+	call	*%rax
+	movq	%rax, inv_retval_offset(%rbx)
+	movq	$1, inv_status_offset(%rbx)
+	jmp	.inv_exit
+
+.inv_error:
+	// copy dlerror() message into file_path area
+	movb	$0, inv_file_path_offset(%rbx)
+	cmpq	$0, inv_dlerror_addr_offset(%rbx)
+	je	.inv_set_err
+	call	*inv_dlerror_addr_offset(%rbx)
+	test	%rax, %rax
+	jz	.inv_set_err
+	leaq	inv_file_path_offset(%rbx), %rdi
+	leaq	page_size(%rbx), %rcx
+.inv_copy:
+	movb	(%rax), %dl
+	incq	%rax
+	movb	%dl, (%rdi)
+	incq	%rdi
+	testb	%dl, %dl
+	jz	.inv_set_err
+	cmpq	%rdi, %rcx
+	ja	.inv_copy
+
+.inv_set_err:
+	movq	$2, inv_status_offset(%rbx)
+
+.inv_exit:
+	popq	%r12
+	popq	%rbx
+	ret
+	// }
+	.size	injector_shellcode_invoke, . - injector_shellcode_invoke
+
+	.balign  4
+	.global	injector_shellcode_invoke_size
+	.hidden	injector_shellcode_invoke_size
+	.type	injector_shellcode_invoke_size, @object
+	.size	injector_shellcode_invoke_size, 4
+injector_shellcode_invoke_size:
+	.int	. - injector_shellcode_invoke
 #endif

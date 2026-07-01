@@ -757,6 +757,7 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
 {
     int status;
     int rv;
+    long backoff_ns = 1000000;  /* start at 1ms, grow to 50ms cap */
 
     rv = injector__set_regs(injector, regs);
     if (rv != 0) {
@@ -912,7 +913,9 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
             injector__set_errmsg("remote call timed out after %u ms", injector->call_timeout_ms);
             return INJERR_TIMEOUT;  /* target stays ATTACHED + STOPPED with restored state */
         }
-        struct timespec bs = {0, 1000000};  /* 1ms backoff */
+        struct timespec bs = {0, backoff_ns};
         nanosleep(&bs, NULL);
+        if (backoff_ns < 50000000L)  /* cap at 50ms */
+            backoff_ns *= 2;
     }
 }

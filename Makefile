@@ -13,6 +13,14 @@ install: all
 	install -d $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	sed -e 's,@PREFIX@,$(PREFIX),' libinjector.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/libinjector.pc
 
+uninstall:
+	rm -f $(DESTDIR)$(PREFIX)/include/injector.h
+	rm -f $(DESTDIR)$(PREFIX)/lib/libinjector.so
+	rm -f $(DESTDIR)$(PREFIX)/lib/libinjector.so.1
+	rm -f $(DESTDIR)$(PREFIX)/lib/libinjector.so.1.0.0
+	rm -f $(DESTDIR)$(PREFIX)/lib/libinjector.a
+	rm -f $(DESTDIR)$(PREFIX)/lib/pkgconfig/libinjector.pc
+
 check:
 	cd tests && $(MAKE) check
 
@@ -24,4 +32,4 @@ clean:
 	cd cmd && $(MAKE) clean
 	cd tests && $(MAKE) clean
 
-.PHONY: all install check unit clean
+.PHONY: all install uninstall check unit clean

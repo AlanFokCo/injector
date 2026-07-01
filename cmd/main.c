@@ -25,221 +25,222 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <getopt.h>
+#include <inttypes.h>
 #include "injector.h"
 
-#ifdef __linux
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <dirent.h>
-#include <unistd.h>
-#include <limits.h>
-
-#define INVALID_PID -1
-static pid_t find_process(const char *name)
+static void print_usage(const char *prog)
 {
-    DIR *dir = opendir("/proc");
-    struct dirent *dent;
-    pid_t pid = -1;
-
-    if (dir == NULL) {
-        fprintf(stderr, "Failed to read proc file system.\n");
-        exit(1);
-    }
-    while ((dent = readdir(dir)) != NULL) {
-        char path[sizeof(dent->d_name) + 11];
-        char exepath[PATH_MAX];
-        ssize_t len;
-        char *exe;
-
-        if (dent->d_name[0] < '1' || '9' < dent->d_name[0]) {
-            continue;
-        }
-        sprintf(path, "/proc/%s/exe", dent->d_name);
-        len = readlink(path, exepath, sizeof(exepath) - 1);
-        if (len == -1) {
-            continue;
-        }
-        exepath[len] = '\0';
-        exe = strrchr(exepath, '/');
-        if (exe != NULL && strcmp(exe + 1, name) == 0) {
-            pid = atoi(dent->d_name);
-            break;
-        }
-    }
-    closedir(dir);
-    return pid;
-}
+    fprintf(stderr,
+        "Usage: %s [options] [library-to-inject ...]\n"
+        "\n"
+        "Target (one required):\n"
+        "  -p, --pid PID           target process id\n"
+        "  -n, --name NAME         find target by executable basename\n"
+        "\n"
+        "Actions:\n"
+        "  (default)               inject libraries listed after options\n"
+        "  -r, --run LIB:SYMBOL    one-shot: inject LIB, call SYMBOL, detach\n"
+        "  -i, --info              print target info (non-intrusive) and exit\n"
+        "\n"
+        "Options:\n"
+        "  -t, --timeout MS        remote-call timeout in milliseconds (default: 5000)\n"
+#ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+        "  -T, --cloned-thread     use clone()-based injection (x86_64 only)\n"
 #endif
-
-#ifdef _WIN32
-#include <windows.h>
-#include <tlhelp32.h>
-#include "../util/ya_getopt.h"
-
-#define INVALID_PID 0
-static DWORD find_process(const char *name)
-{
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    DWORD pid = 0;
-    size_t namelen = strlen(name);
-
-    if (hSnapshot != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32 pe;
-        pe.dwSize = sizeof(pe);
-
-        if (Process32First(hSnapshot, &pe)) {
-            do {
-                if (_strnicmp(pe.szExeFile, name, namelen) == 0) {
-                    if (pe.szExeFile[namelen] == '\0' || stricmp(pe.szExeFile + namelen, ".exe") == 0) {
-                        pid = pe.th32ProcessID;
-                        break;
-                    }
-                }
-            } while (Process32Next(hSnapshot, &pe));
-        }
-        CloseHandle(hSnapshot);
-    }
-    return pid;
+        "  -V, --version           print version and exit\n"
+        "  -h, --help              print this help and exit\n",
+        prog);
 }
 
-#endif
-#ifdef __APPLE__
-#define INVALID_PID -1
-#import <sys/sysctl.h>
-#include "../util/ya_getopt.h"
-static pid_t find_process(const char *name)
+static void print_version(void)
 {
-	pid_t pid = -1;
-    int max_arg_size = 0;
-	size_t size = sizeof(max_arg_size);
-	if (sysctl((int[]){ CTL_KERN, KERN_ARGMAX }, 2, &max_arg_size, &size, NULL, 0) != 0) {
-		max_arg_size = 4096; 
-	}
-	
-	int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL};
-	struct kinfo_proc *processes = NULL;
-	char* buffer = NULL;
-	size_t length;
-	int count;
-
-	if (sysctl(mib, 3, NULL, &length, NULL, 0) < 0){
-		goto clean;
-	}
-	processes = malloc(length);
-	if (processes == NULL){
-		goto clean;
-	}
-	if (sysctl(mib, 3, processes, &length, NULL, 0) < 0) {
-		goto clean;
-	}
-	count = length / sizeof(struct kinfo_proc);
-	mib[0] = CTL_KERN;
-	mib[1] = KERN_PROCARGS2;
-	
-	buffer = (char *)malloc(max_arg_size);
-	for (int i = 0; i < count; i++) {
-		pid_t p_pid = processes[i].kp_proc.p_pid;
-		if (pid == 0) {
-			continue;
-		}
-		mib[2] = p_pid;
-		size = max_arg_size;
-		
-		if (sysctl(mib, 3, buffer, &size, NULL, 0) == 0) {
-			char* exe_path = buffer + sizeof(int);
-			char* exe_name = exe_path;
-			char* next = 0;
-			do{
-				next = strchr(exe_name, '/');
-				if(next != NULL){
-					exe_name = next + 1;
-				}
-			} while (next != NULL);
-			if(strcmp(exe_name, name) == 0){
-				pid = p_pid;
-				goto clean;
-			}
-		}
-	}
-clean:
-	if(buffer != 0){
-		free(buffer);
-	}
-	if(processes != 0){
-		free(processes);
-	}
-	
-	return pid;
+    printf("injector %s (ABI %u)\n", injector_version_string(), injector_abi_version());
 }
-#endif
+
+static int cmd_info(pid_t pid)
+{
+    injector_target_info_t info;
+    int rv = injector_target_info(pid, &info);
+    if (rv != 0) {
+        fprintf(stderr, "injector_target_info: %s\n", injector_last_error(NULL));
+        return 1;
+    }
+    printf("pid:            %d\n", (int)info.pid);
+    printf("alive:          %s\n", info.alive ? "yes" : "no");
+    printf("ptrace_allowed: %s\n", info.ptrace_allowed ? "yes (heuristic)" : "no (heuristic)");
+    printf("arch:           %s\n", info.arch);
+    printf("libc:           %s\n", info.libc);
+    printf("exe:            %s\n", info.exe[0] ? info.exe : "(unreadable)");
+    printf("comm:           %s\n", info.comm[0] ? info.comm : "(unreadable)");
+    printf("cwd:            %s\n", info.cwd[0] ? info.cwd : "(unreadable)");
+    printf("root:           %s\n", info.root[0] ? info.root : "(unreadable)");
+    return 0;
+}
+
+static int cmd_run(pid_t pid, const char *spec, unsigned timeout_ms)
+{
+    char buf[4096];
+    const char *colon = strchr(spec, ':');
+    if (colon == NULL) {
+        fprintf(stderr, "error: --run expects LIB:SYMBOL (missing ':')\n");
+        return 1;
+    }
+    size_t liblen = (size_t)(colon - spec);
+    if (liblen == 0 || liblen >= sizeof(buf)) {
+        fprintf(stderr, "error: library path too long or empty\n");
+        return 1;
+    }
+    memcpy(buf, spec, liblen);
+    buf[liblen] = '\0';
+    const char *symbol = colon + 1;
+    if (*symbol == '\0') {
+        fprintf(stderr, "error: symbol name is empty\n");
+        return 1;
+    }
+
+    injector_opts_t opts = INJECTOR_OPTS_INIT;
+    opts.call_timeout_ms = timeout_ms;
+    injector_result_t r;
+    int rv = injector_run(pid, buf, symbol, &opts, &r);
+    if (rv != 0) {
+        fprintf(stderr, "injector_run failed (rc=%d): %s\n", rv, r.errmsg);
+        return 1;
+    }
+    printf("%" PRIdPTR "\n", r.retval);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
-    injector_pid_t pid = INVALID_PID;
-    injector_t *injector;
-    int opt;
-    int i;
-    char *endptr;
-    int rv = 0;
+    pid_t pid = -1;
+    unsigned timeout_ms = 5000;
+    int do_info = 0;
+    const char *run_spec = NULL;
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
-    const char *optstring = "n:p:T";
     int cloned_thread = 0;
-#else
-    const char *optstring = "n:p:";
 #endif
 
-    while ((opt = getopt(argc, argv, optstring)) != -1) {
+    static struct option long_opts[] = {
+        {"pid",            required_argument, NULL, 'p'},
+        {"name",           required_argument, NULL, 'n'},
+        {"run",            required_argument, NULL, 'r'},
+        {"info",           no_argument,       NULL, 'i'},
+        {"timeout",        required_argument, NULL, 't'},
+#ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+        {"cloned-thread",  no_argument,       NULL, 'T'},
+#endif
+        {"version",        no_argument,       NULL, 'V'},
+        {"help",           no_argument,       NULL, 'h'},
+        {NULL, 0, NULL, 0}
+    };
+
+#ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+    const char *optstring = "p:n:r:it:TVh";
+#else
+    const char *optstring = "p:n:r:it:Vh";
+#endif
+
+    int opt;
+    while ((opt = getopt_long(argc, argv, optstring, long_opts, NULL)) != -1) {
         switch (opt) {
+        case 'p': {
+            char *endptr;
+            long v = strtol(optarg, &endptr, 10);
+            if (v <= 0 || *endptr != '\0') {
+                fprintf(stderr, "invalid process id: %s\n", optarg);
+                return 1;
+            }
+            pid = (pid_t)v;
+            break;
+        }
         case 'n':
-            pid = find_process(optarg);
-            if (pid == INVALID_PID) {
-                fprintf(stderr, "could not find the process: %s\n", optarg);
+            pid = injector_find_process(optarg);
+            if (pid <= 0) {
+                fprintf(stderr, "could not find process: %s\n", optarg);
                 return 1;
             }
-            printf("targeting process \"%s\" with pid %d\n", optarg, pid);
+            fprintf(stderr, "found \"%s\" at pid %d\n", optarg, (int)pid);
             break;
-        case 'p':
-            pid = strtol(optarg, &endptr, 10);
-            if (pid <= 0 || *endptr != '\0') {
-                fprintf(stderr, "invalid process id number: %s\n", optarg);
+        case 'r':
+            run_spec = optarg;
+            break;
+        case 'i':
+            do_info = 1;
+            break;
+        case 't': {
+            char *endptr;
+            long v = strtol(optarg, &endptr, 10);
+            if (v <= 0 || *endptr != '\0') {
+                fprintf(stderr, "invalid timeout: %s\n", optarg);
                 return 1;
             }
-            printf("targeting process with pid %d\n", pid);
+            timeout_ms = (unsigned)v;
             break;
+        }
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
         case 'T':
             cloned_thread = 1;
             break;
 #endif
+        case 'V':
+            print_version();
+            return 0;
+        case 'h':
+            print_usage(argv[0]);
+            return 0;
+        default:
+            print_usage(argv[0]);
+            return 1;
         }
     }
-    if (pid == INVALID_PID) {
-        fprintf(stderr, "Usage: %s [-n process-name] [-p pid] library-to-inject ...\n", argv[0]);
+
+    if (pid <= 0) {
+        fprintf(stderr, "error: --pid or --name is required\n");
+        print_usage(argv[0]);
         return 1;
     }
 
-    if (injector_attach(&injector, pid) != 0) {
-        printf("%s\n", injector_error());
+    if (do_info) {
+        return cmd_info(pid);
+    }
+
+    if (run_spec != NULL) {
+        return cmd_run(pid, run_spec, timeout_ms);
+    }
+
+    if (optind >= argc) {
+        fprintf(stderr, "error: no libraries to inject\n");
+        print_usage(argv[0]);
         return 1;
     }
-    for (i = optind; i < argc; i++) {
-        char *libname = argv[i];
+
+    injector_t *injector;
+    injector_opts_t opts = INJECTOR_OPTS_INIT;
+    opts.call_timeout_ms = timeout_ms;
+    if (injector_attach_with_opts(&injector, pid, &opts) != 0) {
+        fprintf(stderr, "attach failed: %s\n", injector_last_error(NULL));
+        return 1;
+    }
+
+    int rv = 0;
+    for (int i = optind; i < argc; i++) {
+        const char *libname = argv[i];
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
         if (cloned_thread) {
             if (injector_inject_in_cloned_thread(injector, libname, NULL) == 0) {
-                printf("clone thread to inject \"%s\" was created.\n", libname);
+                printf("\"%s\" injected (cloned thread)\n", libname);
             } else {
-                fprintf(stderr, "could not create cloned thread \"%s\"\n", libname);
-                fprintf(stderr, "  %s\n", injector_last_error(injector));
+                fprintf(stderr, "could not inject \"%s\": %s\n", libname, injector_last_error(injector));
                 rv = 1;
             }
             continue;
         }
 #endif
         if (injector_inject(injector, libname, NULL) == 0) {
-            printf("\"%s\" successfully injected\n", libname);
+            printf("\"%s\" injected\n", libname);
         } else {
-            fprintf(stderr, "could not inject \"%s\"\n", libname);
-            fprintf(stderr, "  %s\n", injector_last_error(injector));
+            fprintf(stderr, "could not inject \"%s\": %s\n", libname, injector_last_error(injector));
             rv = 1;
         }
     }

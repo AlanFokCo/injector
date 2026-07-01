@@ -1,5 +1,5 @@
 INJECTOR_OBJS = elf.o injector.o ptrace.o remote_call.o util.o shellcode.o proc.o
-CFLAGS = -Wall -fPIC -I../../include
+CFLAGS = -Wall -Wextra -Werror -fPIC -I../../include
 
 VERSION_MAJOR = 1
 VERSION = 1.0.0

@@ -132,7 +132,7 @@ static int process_wait(process_t *proc, int wait_secs)
                 printf("ERROR: The target process exited with exit code %d.\n", exitcode);
                 return 1;
             }
-        } else if (WIFEXITED(status)) {
+        } else if (WIFSIGNALED(status)) {
             int signo = WTERMSIG(status);
             printf("ERROR: The target process exited by signal %d.\n", signo);
             return 1;

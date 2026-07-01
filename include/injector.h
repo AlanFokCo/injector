@@ -50,7 +50,6 @@ extern "C" {
 #define INJERR_NO_MEMORY -2            /* linux */
 #define INJERR_NO_PROCESS -3           /* linux */
 #define INJERR_NO_LIBRARY -4           /* linux */
-#define INJERR_NO_FUNCTION -4          /* linux */
 #define INJERR_ERROR_IN_TARGET -5      /* linux */
 #define INJERR_FILE_NOT_FOUND -6       /* linux */
 #define INJERR_INVALID_MEMORY_AREA -7  /* linux */
@@ -59,9 +58,13 @@ extern "C" {
 #define INJERR_INVALID_ELF_FORMAT -10  /* linux */
 #define INJERR_WAIT_TRACEE -11         /* linux */
 #define INJERR_FUNCTION_MISSING -12    /* linux */
-#define INJERR_TIMEOUT -13          /* linux: remote call timed out */
+#define INJERR_TIMEOUT -13            /* linux: remote call timed out */
+
+/* Deprecated alias — use INJERR_FUNCTION_MISSING. */
+#define INJERR_NO_FUNCTION INJERR_FUNCTION_MISSING
 
 #define INJECTOR_ABI_VERSION 1u
+#define INJECTOR_VERSION "1.0.0"
 
 typedef enum {
     INJECTOR_DELIVERY_AUTO = 0,
@@ -85,6 +88,11 @@ typedef struct {
 #define INJECTOR_OPTS_INIT ((injector_opts_t){ .opts_size = sizeof(injector_opts_t) })
 
 unsigned injector_abi_version(void);
+
+/*!
+ * \brief Return the library version as a string (e.g. "1.0.0").
+ */
+const char *injector_version_string(void);
 
 /*!
  * \brief Library lifecycle hooks (idempotent).
@@ -395,11 +403,11 @@ int injector_uninject_all(injector_t *inj);
 /*!
  * \brief Result of a one-shot invoke/run call (Linux only)
  * \remarks Caller-owned; no lifetime issues. \c errmsg is filled on failure
- *          (empty on success). \c target_errno is best-effort (0 if not captured).
+ *          (empty on success).
  */
 typedef struct {
     intptr_t retval;        /* entry method return value */
-    int target_errno;       /* target-side errno (best-effort; 0 if not captured) */
+    int _reserved;          /* reserved for future use (always 0) */
     char errmsg[256];       /* failure message; caller-owned, no lifetime issue */
 } injector_result_t;
 

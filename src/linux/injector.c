@@ -138,8 +138,16 @@ int injector__attach_internal(injector_t **injector_out, pid_t pid, const inject
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     rv = injector__write(injector, injector->shellcode, &injector_shellcode, injector_shellcode_size);
     if (rv != 0) {
-        /* goto error_exit: must clean up mmap + detach target, not leak (was: return rv) */
         goto error_exit;
+    }
+    {
+        size_t invoke_off = ((size_t)injector_shellcode_size + 15) & ~(size_t)15;
+        injector->shellcode_invoke = injector->shellcode + invoke_off;
+        rv = injector__write(injector, injector->shellcode_invoke,
+                             &injector_shellcode_invoke, injector_shellcode_invoke_size);
+        if (rv != 0) {
+            goto error_exit;
+        }
     }
 #endif
 
@@ -293,11 +301,11 @@ retry:
         return rv;
     }
     if (handle == invalid_handle) {
-        int max_retyr_cnt = 50;
-        if (++cnt <= max_retyr_cnt) {
+        int max_retry_cnt = 50;
+        if (++cnt <= max_retry_cnt) {
             goto retry;
         }
-        injector__set_errmsg("dlopen doesn't return in %d seconds.", max_retyr_cnt / 10);
+        injector__set_errmsg("dlopen doesn't return in %d seconds.", max_retry_cnt / 10);
         return INJERR_ERROR_IN_TARGET;
     }
     if (handle_out != NULL) {
@@ -401,22 +409,27 @@ int injector_uninject(injector_t *injector, void *handle)
 
 int injector_detach(injector_t *injector)
 {
+    int rv = 0;
     /* current_inj = NULL so detach cleanup errors go to thread-local and
      * do not dangle after free(injector) below. Leave errmsg_set intact so
      * a caller reading injector_last_error() before detach sees the error. */
     injector__set_current(NULL);
 
     if (injector->mmapped) {
-        injector__call_syscall(injector, NULL, injector->sys_munmap, injector->data, remote_mem_size(injector));
+        int r = injector__call_syscall(injector, NULL, injector->sys_munmap, injector->data, remote_mem_size(injector));
+        if (r != 0 && rv == 0) rv = r;
     }
     if (injector->attached) {
-        injector__detach_process(injector);
+        int r = injector__detach_process(injector);
+        if (r != 0 && rv == 0) rv = r;
     }
     free(injector);
-    return 0;
+    return rv;
 }
 
 unsigned injector_abi_version(void) { return INJECTOR_ABI_VERSION; }
+
+const char *injector_version_string(void) { return INJECTOR_VERSION; }
 
 void injector__opts_normalize(injector_opts_t *o) {
     if (o->call_timeout_ms == 0) o->call_timeout_ms = 5000;
@@ -845,13 +858,9 @@ pid_t injector_find_process(const char *name) {
 }
 
 
-/* ---- One-shot invoke / run (M1 ptrace-based) ---- */
+/* ---- One-shot invoke / run ---- */
 
-int injector_invoke(injector_t *inj, const char *path, const char *symbol, injector_result_t *out) {
-    if (out) { memset(out, 0, sizeof(*out)); }
-    injector__set_current(inj);
-    inj->errmsg_set = 0;
-
+static int injector_invoke_ptrace(injector_t *inj, const char *path, const char *symbol, injector_result_t *out) {
     void *handle = NULL;
     int rv = injector_inject(inj, path, &handle);
     if (rv != 0) {
@@ -872,6 +881,135 @@ int injector_invoke(injector_t *inj, const char *path, const char *symbol, injec
     }
     if (out) out->retval = ret;
     return 0;
+}
+
+#ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+static int injector_invoke_nonstop(injector_t *inj, const char *path, const char *symbol, injector_result_t *out)
+{
+    char abspath[PATH_MAX];
+    size_t pathlen, symlen;
+    void *data;
+    injector_shellcode_invoke_arg_t *arg;
+    int rv;
+    intptr_t clone_ret;
+
+    if (inj->arch != ARCH_X86_64) {
+        injector__set_errmsg("NONSTOP delivery requires x86_64");
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", "NONSTOP delivery requires x86_64");
+        return INJERR_UNSUPPORTED_TARGET;
+    }
+
+    if (realpath(path, abspath) == NULL) {
+        injector__set_errmsg("failed to get the full path of '%s': %s", path, strerror(errno));
+        if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
+        return INJERR_FILE_NOT_FOUND;
+    }
+    pathlen = strlen(abspath) + 1;
+    symlen = strlen(symbol) + 1;
+
+    const size_t hdr = offsetof(injector_shellcode_invoke_arg_t, file_path);
+    size_t func_name_off = hdr + pathlen;
+    if (func_name_off + symlen > inj->data_size) {
+        injector__set_errmsg("path + symbol too long for data page");
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", "path + symbol too long");
+        return INJERR_FILE_NOT_FOUND;
+    }
+
+    data = alloca(inj->data_size);
+    memset(data, 0, inj->data_size);
+    arg = (injector_shellcode_invoke_arg_t *)data;
+
+    arg->status = 0;
+    arg->dlopen_addr = inj->dlopen_addr;
+    arg->dlsym_addr = inj->dlsym_addr;
+    arg->dlerror_addr = inj->dlerror_addr;
+    arg->dlflags = RTLD_LAZY;
+    if (inj->dlfunc_type == DLFUNC_INTERNAL) {
+#define __RTLD_DLOPEN_2 0x80000000
+        arg->dlflags |= __RTLD_DLOPEN_2;
+    }
+    arg->func_name_off = (int32_t)func_name_off;
+    memcpy(arg->file_path, abspath, pathlen);
+    memcpy((char*)data + func_name_off, symbol, symlen);
+
+    rv = injector__write(inj, inj->data, data, inj->data_size);
+    if (rv != 0) {
+        if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
+        return rv;
+    }
+
+    rv = injector__call_function(inj, &clone_ret, (long)inj->clone_addr,
+                                 (long)inj->shellcode_invoke,
+                                 (long)(inj->stack + inj->stack_size - 4096),
+                                 (long)CLONE_VM, (long)inj->data);
+    if (rv != 0) {
+        if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
+        return rv;
+    }
+    if (clone_ret == -1) {
+        injector__set_errmsg("clone error: %s", strerror(errno));
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
+        return INJERR_ERROR_IN_TARGET;
+    }
+
+    /* Main thread stays ptrace-stopped. The clone child (CLONE_VM, separate
+     * process sharing the address space) runs the invoke shellcode. Poll the
+     * data page via process_vm_readv — works on the stopped main thread's pid
+     * because the address space is shared. */
+    const struct timespec ts_poll = {0, 100000000}; /* 100ms */
+    int64_t status = 0;
+    int cnt = 0;
+    int max_cnt = (int)(inj->call_timeout_ms / 100);
+    if (max_cnt < 50) max_cnt = 50;
+
+    while (status == 0 && cnt++ < max_cnt) {
+        nanosleep(&ts_poll, NULL);
+        rv = injector__read(inj, inj->data + offsetof(injector_shellcode_invoke_arg_t, status),
+                            &status, sizeof(status));
+        if (rv != 0) {
+            if (out) snprintf(out->errmsg, sizeof(out->errmsg), "failed to read result from target");
+            return rv;
+        }
+    }
+
+    if (status == 1) {
+        intptr_t result;
+        injector__read(inj, inj->data + offsetof(injector_shellcode_invoke_arg_t, retval),
+                       &result, sizeof(result));
+        if (out) out->retval = result;
+        return 0;
+    } else if (status == 2) {
+        char errbuf[256] = {0,};
+        injector__read(inj, inj->data + offsetof(injector_shellcode_invoke_arg_t, file_path),
+                       errbuf, sizeof(errbuf) - 1);
+        injector__set_errmsg("nonstop invoke failed: %s", errbuf[0] ? errbuf : "unknown error");
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
+        return INJERR_ERROR_IN_TARGET;
+    } else {
+        injector__set_errmsg("nonstop invoke timed out after %u ms", inj->call_timeout_ms);
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
+        return INJERR_TIMEOUT;
+    }
+}
+#endif
+
+int injector_invoke(injector_t *inj, const char *path, const char *symbol, injector_result_t *out) {
+    if (out) { memset(out, 0, sizeof(*out)); }
+    injector__set_current(inj);
+    inj->errmsg_set = 0;
+
+#ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+    if (inj->mode == INJECTOR_DELIVERY_NONSTOP ||
+        (inj->mode == INJECTOR_DELIVERY_AUTO && inj->arch == ARCH_X86_64)) {
+        return injector_invoke_nonstop(inj, path, symbol, out);
+    }
+#endif
+    if (inj->mode == INJECTOR_DELIVERY_NONSTOP) {
+        injector__set_errmsg("NONSTOP delivery not available on this architecture");
+        if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
+        return INJERR_UNSUPPORTED_TARGET;
+    }
+    return injector_invoke_ptrace(inj, path, symbol, out);
 }
 
 int injector_run(pid_t pid, const char *lib, const char *symbol,

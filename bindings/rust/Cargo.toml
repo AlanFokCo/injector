@@ -1,0 +1,3 @@
+[workspace]
+members = ["injector-sys", "injector"]
+resolver = "2"

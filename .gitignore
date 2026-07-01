@@ -1,16 +1,17 @@
 *~
-*.a
 *.o
 *.so
 *.so.*
+/src/linux/*.a
 /cmd/injector
 /tests/test-prog
 /tests/test-prog-*
 /tests/test-target
 /tests/test-target-*
 /tests/unit/run
+/bindings/rust/target/
+__pycache__/
 
-# 设计/进度等文档不纳入版本管理（保留在磁盘，不 commit/push）
 docs/
 task_plan.md
 findings.md

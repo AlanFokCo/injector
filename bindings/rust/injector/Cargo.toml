@@ -1,0 +1,8 @@
+[package]
+name = "injector"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust wrapper for libinjector"
+
+[dependencies]
+injector-sys = { path = "../injector-sys" }

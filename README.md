@@ -9,20 +9,21 @@
 **A production-grade library for injecting a shared library into a running Linux process.**
 
 This is an active fork of [`kubo/injector`](https://github.com/kubo/injector),
-hardened for production use and FFI consumption (Go bindings, etc.). It keeps
-the original minimal-overhead ptrace technique and adds a clean, layered C
-API: bounded remote calls with timeouts and guaranteed state restoration,
-per-handle error reporting, non-intrusive target introspection, memory
-read/write, module listing, and a one-shot `injector_run` helper. The shared
-library carries SONAME `libinjector.so.1` and ships a pkg-config file.
+hardened for production use and FFI consumption. It keeps the original
+minimal-overhead ptrace technique and adds a clean, layered C API: bounded
+remote calls with timeouts and guaranteed state restoration, per-handle error
+reporting, non-intrusive target introspection, memory read/write, module
+listing, and a one-shot `injector_run` helper. Official bindings are provided
+for **Go**, **Python**, and **Rust**. The shared library carries SONAME
+`libinjector.so.1` and ships a pkg-config file.
 
 ---
 
 ## Features
 
-- **One-shot injection** — `injector_run(pid, lib, "entry", opts, &result)`
-  attaches, injects, calls a no-arg entry symbol, captures the return value,
-  and detaches in a single call.
+- **One-shot injection** — `injector_run(pid, lib, "entry", args, argc, opts, &result)`
+  attaches, injects, calls an entry symbol with arguments, captures the return
+  value, and detaches in a single call.
 - **Bounded remote calls** — every remote call has a configurable timeout
   (`call_timeout_ms`, default 5 s). On timeout the target's original registers
   and code are restored and the call returns `INJERR_TIMEOUT`; the target is
@@ -47,6 +48,9 @@ library carries SONAME `libinjector.so.1` and ships a pkg-config file.
   pages that reject the vector path.
 - **Signal-free** — the library installs no signal handlers and uses no
   `SIGALRM`; it is safe to embed in a Go-runtime (cgo) host.
+- **Language bindings** — idiomatic [Go](#go), [Python](#python), and
+  [Rust](#rust) bindings with vendored static linking (no system install
+  required).
 - **Packaged** — `make install`, versioned SONAME, `libinjector.pc`,
   `injector_abi_version()`, and a unit + integration test suite (`make unit`,
   `make check`).
@@ -57,6 +61,10 @@ library carries SONAME `libinjector.so.1` and ships a pkg-config file.
 - [How it works](#how-it-works)
 - [Production contract](#production-contract)
 - [C API](#c-api)
+- [Language bindings](#language-bindings)
+  - [Go](#go)
+  - [Python](#python)
+  - [Rust](#rust)
 - [Command line program](#command-line-program)
 - [Installation](#installation)
 - [Tested architectures](#tested-architectures)
@@ -83,7 +91,8 @@ Inject a library and call its `entry` symbol in one line:
 
 int main(void) {
     injector_result_t r;
-    int rc = injector_run(1234, "/path/to/libprobe.so", "entry", NULL, &r);
+    int rc = injector_run(1234, "/path/to/libprobe.so", "entry",
+                          NULL, 0, NULL, &r);
     if (rc != 0) { fprintf(stderr, "failed (rc=%d): %s\n", rc, r.errmsg); return 1; }
     printf("entry returned %ld\n", (long)r.retval);
     return 0;
@@ -177,7 +186,8 @@ introspection that never ptrace-attaches.
 int main(void) {
     injector_result_t r;
     /* attach + inject + call + detach. NULL opts => defaults. */
-    int rc = injector_run(1234, "/path/to/libprobe.so", "entry", NULL, &r);
+    int rc = injector_run(1234, "/path/to/libprobe.so", "entry",
+                          NULL, 0, NULL, &r);
     if (rc != 0) { fprintf(stderr, "injector_run (rc=%d): %s\n", rc, r.errmsg); return 1; }
     printf("entry returned %ld\n", (long)r.retval);
     return 0;
@@ -210,8 +220,15 @@ int main(void) {
     }
 
     injector_result_t r;
-    if (injector_invoke(inj, "/path/to/libprobe.so", "entry", &r) == 0)
+    if (injector_invoke(inj, "/path/to/libprobe.so", "entry",
+                        NULL, 0, &r) == 0)
         printf("entry returned %ld\n", (long)r.retval);
+
+    /* call a function with arguments */
+    intptr_t args[] = {42, 100};
+    if (injector_invoke(inj, "/path/to/libprobe.so", "add_values",
+                        args, 2, &r) == 0)
+        printf("add_values returned %ld\n", (long)r.retval);
 
     /* resolve and read a remote global */
     uintptr_t addr = 0;
@@ -258,10 +275,10 @@ int main(void) {
 }
 ```
 
-### Bindings, link flags, ABI
+### Link flags, ABI, and init
 
-Cgo and other FFI bindings should call `injector_library_init()` once at
-startup (idempotent; currently near-no-op, reserved for future use) and
+FFI bindings should call `injector_library_init()` once at startup
+(idempotent; currently near-no-op, reserved for future use) and
 `injector_library_deinit()` at shutdown. Link with
 `pkg-config --libs libinjector` (`-linjector`); the versioned SONAME is
 `libinjector.so.1`. The ABI version is available at runtime via
@@ -273,6 +290,345 @@ macro.
 The original `injector_attach` + `injector_inject` + `injector_uninject` +
 `injector_detach` sequence is still supported. `injector_error()` (the
 thread-local fallback) is deprecated in favor of `injector_last_error(inj)`.
+
+## Language bindings
+
+Official bindings for Go, Python, and Rust. All three vendor a prebuilt
+`libinjector.a` so no system-wide install is needed — just import and use.
+
+### Go
+
+**Import path:** `github.com/AlanFokCo/injector/pkg/injector`
+
+The Go binding uses cgo with a vendored static library. Requires Go 1.21+.
+
+#### One-shot injection
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    "github.com/AlanFokCo/injector/pkg/injector"
+)
+
+func main() {
+    result, err := injector.Run(1234, "/path/to/libprobe.so", "entry", nil, nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("entry returned %d\n", result.RetVal)
+}
+```
+
+#### Granular control
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+
+    inj "github.com/AlanFokCo/injector/pkg/injector"
+)
+
+func main() {
+    i, err := inj.AttachWithOpts(1234, &inj.Opts{
+        CallTimeoutMs:  2000,
+        EnableWriteMem: true,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer i.Close()
+
+    handle, err := i.Inject("/path/to/libprobe.so")
+    if err != nil {
+        log.Fatal(err)
+    }
+    _ = handle
+
+    // Call a function with arguments
+    result, err := i.Invoke("/path/to/libprobe.so", "add_values", 42, 100)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("add_values returned %d\n", result.RetVal)
+
+    // List loaded modules
+    mods, err := i.ListModules()
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, m := range mods {
+        fmt.Printf("  %s @ %#x\n", m.Name, m.Base)
+    }
+
+    // Read target memory
+    addr, err := i.ResolveSymbol("", "g_counter")
+    if err == nil {
+        data, err := i.ReadMem(addr, 8)
+        if err == nil {
+            fmt.Printf("g_counter bytes: %v\n", data)
+        }
+    }
+}
+```
+
+#### Introspection (no attach)
+
+```go
+info, err := injector.GetTargetInfo(1234)
+if err == nil {
+    fmt.Printf("pid=%d arch=%s libc=%s exe=%s\n",
+        info.PID, info.Arch, info.Libc, info.Exe)
+}
+
+if injector.CanAttach(1234) {
+    fmt.Println("ptrace attach is feasible")
+}
+
+pid, err := injector.FindProcess("mysvc")
+```
+
+#### API reference
+
+| Function | Description |
+|---|---|
+| `Run(pid, lib, sym, args, opts)` | One-shot: attach + inject + call + detach |
+| `Attach(pid)` | Attach with default options |
+| `AttachWithOpts(pid, opts)` | Attach with custom options |
+| `(*Injector).Close()` | Detach from target |
+| `(*Injector).Inject(path)` | Load a shared library, returns handle |
+| `(*Injector).Uninject(handle)` | Unload a previously injected library |
+| `(*Injector).UninjectAll()` | Unload all injected libraries |
+| `(*Injector).Invoke(path, sym, args...)` | Call a symbol in an injected library |
+| `(*Injector).ListModules()` | List loaded modules |
+| `(*Injector).ResolveSymbol(lib, sym)` | Resolve a symbol address in target |
+| `(*Injector).ReadMem(addr, size)` | Read target memory |
+| `(*Injector).WriteMem(addr, data)` | Write target memory |
+| `(*Injector).RemoteFuncAddr(handle, name)` | Get function address from handle |
+| `(*Injector).LastError()` | Last error message |
+| `GetTargetInfo(pid)` | Target introspection (no attach) |
+| `CanAttach(pid)` | Check ptrace feasibility |
+| `FindProcess(name)` | Find PID by process name |
+| `Version()` / `ABIVersion()` | Library version info |
+
+---
+
+### Python
+
+**Package:** `injector` (under `bindings/python/`)
+
+The Python binding uses ctypes. Compatible with Python 3.6+. No compilation
+required — it loads `libinjector.so` at runtime (vendored beside the package
+or from the system library path).
+
+#### One-shot injection
+
+```python
+from injector import run
+
+result = run(1234, "/path/to/libprobe.so", "entry")
+print(f"entry returned {result.retval}")
+```
+
+#### With arguments
+
+```python
+from injector import run
+
+result = run(1234, "/path/to/libprobe.so", "add_values", args=[42, 100])
+print(f"add_values returned {result.retval}")
+```
+
+#### Granular control (context manager)
+
+```python
+from injector import Injector, Opts
+
+with Injector(1234, opts=Opts(call_timeout_ms=2000, enable_write_mem=True)) as inj:
+    handle = inj.inject("/path/to/libprobe.so")
+
+    result = inj.invoke("/path/to/libprobe.so", "add_values", 42, 100)
+    print(f"add_values returned {result.retval}")
+
+    # List loaded modules
+    for mod in inj.list_modules():
+        print(f"  {mod.name} @ {mod.base:#x}")
+
+    # Read target memory
+    addr = inj.resolve_symbol(None, "g_counter")
+    data = inj.read_mem(addr, 8)
+    print(f"g_counter bytes: {data}")
+```
+
+#### Introspection (no attach)
+
+```python
+from injector import target_info, can_attach, find_process
+
+info = target_info(1234)
+print(f"pid={info.pid} arch={info.arch} libc={info.libc} exe={info.exe}")
+
+if can_attach(1234):
+    print("ptrace attach is feasible")
+
+pid = find_process("mysvc")
+```
+
+#### Error handling
+
+```python
+from injector import Injector, InjectorError
+
+try:
+    with Injector(9999) as inj:
+        inj.inject("/nonexistent.so")
+except InjectorError as e:
+    print(f"error code={e.code}: {e}")
+```
+
+#### API reference
+
+| Function / Method | Description |
+|---|---|
+| `run(pid, lib, sym, args=None, opts=None)` | One-shot: attach + inject + call + detach |
+| `Injector(pid, opts=None)` | Attach (use as context manager) |
+| `.close()` | Detach from target |
+| `.inject(path)` | Load a shared library, returns handle |
+| `.uninject(handle)` | Unload a previously injected library |
+| `.uninject_all()` | Unload all injected libraries |
+| `.invoke(path, sym, *args)` | Call a symbol in an injected library |
+| `.list_modules()` | List loaded modules |
+| `.resolve_symbol(lib, sym)` | Resolve a symbol address in target |
+| `.read_mem(addr, size)` | Read target memory |
+| `.write_mem(addr, data)` | Write target memory |
+| `.remote_func_addr(handle, name)` | Get function address from handle |
+| `.last_error()` | Last error message |
+| `target_info(pid)` | Target introspection (no attach) |
+| `can_attach(pid)` | Check ptrace feasibility |
+| `find_process(name)` | Find PID by process name |
+| `version()` / `abi_version()` | Library version info |
+
+---
+
+### Rust
+
+**Crates:** `injector` (safe wrapper) and `injector-sys` (raw FFI), under
+`bindings/rust/`.
+
+The Rust binding provides a safe `Injector` type with RAII (auto-detach on
+drop). Requires Rust 1.56+ (2021 edition). Uses a vendored static library —
+no system install needed.
+
+#### Cargo.toml
+
+```toml
+[dependencies]
+injector = { path = "bindings/rust/injector" }
+```
+
+Or if published to a registry:
+
+```toml
+[dependencies]
+injector = "0.1"
+```
+
+#### One-shot injection
+
+```rust
+use injector::run;
+
+fn main() -> Result<(), injector::InjectorError> {
+    let result = run(1234, "/path/to/libprobe.so", "entry", &[], None)?;
+    println!("entry returned {}", result.retval);
+    Ok(())
+}
+```
+
+#### Granular control
+
+```rust
+use injector::{Injector, Opts, DeliveryMode};
+
+fn main() -> Result<(), injector::InjectorError> {
+    let opts = Opts {
+        call_timeout_ms: 2000,
+        enable_write_mem: true,
+        ..Opts::default()
+    };
+    let mut inj = Injector::attach_with_opts(1234, &opts)?;
+
+    let handle = inj.inject("/path/to/libprobe.so")?;
+
+    // Call a function with arguments
+    let result = inj.invoke("/path/to/libprobe.so", "add_values", &[42, 100])?;
+    println!("add_values returned {}", result.retval);
+
+    // List loaded modules
+    for m in inj.list_modules()? {
+        println!("  {} @ {:#x}", m.name, m.base);
+    }
+
+    // Read target memory
+    if let Ok(addr) = inj.resolve_symbol(None, "g_counter") {
+        let data = inj.read_mem(addr, 8)?;
+        println!("g_counter bytes: {:?}", data);
+    }
+
+    inj.uninject(handle)?;
+    // Injector auto-detaches on drop
+    Ok(())
+}
+```
+
+#### Introspection (no attach)
+
+```rust
+use injector::{get_target_info, can_attach, find_process};
+
+fn main() {
+    if let Ok(info) = get_target_info(1234) {
+        println!("pid={} arch={} libc={} exe={}",
+            info.pid, info.arch, info.libc, info.exe);
+    }
+
+    if can_attach(1234) {
+        println!("ptrace attach is feasible");
+    }
+
+    if let Some(pid) = find_process("mysvc") {
+        println!("found mysvc at pid {}", pid);
+    }
+}
+```
+
+#### API reference
+
+| Function / Method | Description |
+|---|---|
+| `run(pid, lib, sym, args, opts)` | One-shot: attach + inject + call + detach |
+| `Injector::attach(pid)` | Attach with default options |
+| `Injector::attach_with_opts(pid, opts)` | Attach with custom options |
+| `.inject(path)` | Load a shared library, returns `Handle` |
+| `.uninject(handle)` | Unload a previously injected library |
+| `.uninject_all()` | Unload all injected libraries |
+| `.invoke(path, sym, args)` | Call a symbol in an injected library |
+| `.list_modules()` | List loaded modules |
+| `.resolve_symbol(lib, sym)` | Resolve a symbol address in target |
+| `.read_mem(addr, len)` | Read target memory |
+| `.write_mem(addr, data)` | Write target memory |
+| `.remote_func_addr(handle, name)` | Get function address from handle |
+| `.last_error()` | Last error message |
+| `get_target_info(pid)` | Target introspection (no attach) |
+| `can_attach(pid)` | Check ptrace feasibility |
+| `find_process(name)` | Find PID by process name |
+| `version()` / `abi_version()` | Library version info |
 
 ## Command line program
 
@@ -402,6 +758,8 @@ This fork is developed in milestones:
   resolution, `/proc` parser, target introspection, memory read/write,
   module listing, `injector_invoke`/`injector_run`, packaging, unit +
   integration tests.
+- **M1.5 (done)** — language bindings: idiomatic Go, Python, and Rust
+  bindings with vendored static linking and full API coverage.
 - **M2** — non-stop threaded delivery: a C-blob thread entry (zero-relocation
   build gate) replaces direct ptrace `dlopen` so the target's main thread is
   not interrupted; `injector_invoke`/`run` switch to the threaded path with

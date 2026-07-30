@@ -41,6 +41,9 @@ static void print_usage(const char *prog)
         "Actions:\n"
         "  (default)               inject libraries listed after options\n"
         "  -r, --run LIB:SYMBOL    one-shot: inject LIB, call SYMBOL, detach\n"
+        "  -d, --delivery MODE     one-shot delivery: auto|nonstop|ptrace (default: auto)\n"
+        "                          use 'ptrace' for CUDA/heavy targets (nonstop dlopen\n"
+        "                          from a TLS-less clone can fault in ld.so)\n"
         "  -a, --arg VALUE         argument for --run (up to 6, integer or 0x hex)\n"
         "  -i, --info              print target info (non-intrusive) and exit\n"
         "\n"
@@ -80,7 +83,8 @@ static int cmd_info(pid_t pid)
 }
 
 static int cmd_run(pid_t pid, const char *spec, unsigned timeout_ms,
-                   const intptr_t *run_args, int run_argc)
+                   const intptr_t *run_args, int run_argc,
+                   injector_delivery_t delivery)
 {
     char buf[4096];
     const char *colon = strchr(spec, ':');
@@ -103,6 +107,7 @@ static int cmd_run(pid_t pid, const char *spec, unsigned timeout_ms,
 
     injector_opts_t opts = INJECTOR_OPTS_INIT;
     opts.call_timeout_ms = timeout_ms;
+    opts.delivery = delivery;
     injector_result_t r;
     int rv = injector_run(pid, buf, symbol,
                           run_argc > 0 ? run_args : NULL, run_argc,
@@ -123,6 +128,7 @@ int main(int argc, char **argv)
     const char *run_spec = NULL;
     intptr_t run_args[INJECTOR_MAX_INVOKE_ARGS];
     int run_argc = 0;
+    injector_delivery_t delivery = INJECTOR_DELIVERY_AUTO;
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     int cloned_thread = 0;
 #endif
@@ -131,6 +137,7 @@ int main(int argc, char **argv)
         {"pid",            required_argument, NULL, 'p'},
         {"name",           required_argument, NULL, 'n'},
         {"run",            required_argument, NULL, 'r'},
+        {"delivery",       required_argument, NULL, 'd'},
         {"arg",            required_argument, NULL, 'a'},
         {"info",           no_argument,       NULL, 'i'},
         {"timeout",        required_argument, NULL, 't'},
@@ -143,9 +150,9 @@ int main(int argc, char **argv)
     };
 
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
-    const char *optstring = "p:n:r:a:it:TVh";
+    const char *optstring = "p:n:r:a:d:it:TVh";
 #else
-    const char *optstring = "p:n:r:a:it:Vh";
+    const char *optstring = "p:n:r:a:d:it:Vh";
 #endif
 
     int opt;
@@ -171,6 +178,12 @@ int main(int argc, char **argv)
             break;
         case 'r':
             run_spec = optarg;
+            break;
+        case 'd':
+            if (strcmp(optarg, "auto") == 0) delivery = INJECTOR_DELIVERY_AUTO;
+            else if (strcmp(optarg, "nonstop") == 0) delivery = INJECTOR_DELIVERY_NONSTOP;
+            else if (strcmp(optarg, "ptrace") == 0) delivery = INJECTOR_DELIVERY_PTRACE;
+            else { fprintf(stderr, "invalid --delivery: %s (auto|nonstop|ptrace)\n", optarg); return 1; }
             break;
         case 'a': {
             if (run_argc >= INJECTOR_MAX_INVOKE_ARGS) {
@@ -226,7 +239,7 @@ int main(int argc, char **argv)
     }
 
     if (run_spec != NULL) {
-        return cmd_run(pid, run_spec, timeout_ms, run_args, run_argc);
+        return cmd_run(pid, run_spec, timeout_ms, run_args, run_argc, delivery);
     }
 
     if (optind >= argc) {

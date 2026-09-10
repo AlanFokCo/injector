@@ -371,7 +371,15 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
  * \brief A loaded shared-library mapping in the target process (Linux only)
  */
 typedef struct {
-    char name[256];        /* .so path (full path as it appears in /proc/PID/maps) */
+    /* .so path as it appears in /proc/PID/maps, NUL-terminated.
+     *
+     * NOTE: /proc/PID/maps paths can be up to PATH_MAX long, but this field is
+     * 256 bytes and is part of the stable ABI (the Go/Python/Rust bindings
+     * hardcode the layout), so a longer path is TRUNCATED at 255 characters and
+     * the result is still NUL-terminated. Compare by suffix, or resolve the
+     * real path yourself, if you need to distinguish very long paths such as
+     * those under /nix/store or a snap/flatpak mount. */
+    char name[256];
     uintptr_t base;        /* load base address (first mapping's start) */
 } injector_module_t;
 

@@ -40,6 +40,183 @@ jobs:
     - name: x86_64 -> x86_64 (cloned thread)
       run: |
         cd tests && ./test-prog-x86_64 x86_64 --cloned-thread
+    # The suites below cover the APIs that used to be untested in CI. In
+    # particular --invoke exercises the clone()/NONSTOP delivery shellcode,
+    # which was completely broken (every invoke timed out) while CI stayed
+    # green, because no step ever ran it.
+    - name: x86_64 -> x86_64 (invoke / nonstop delivery)
+      run: |
+        cd tests && ./test-prog-x86_64 x86_64 --invoke
+    - name: x86_64 -> x86_64 (invoke, cloned thread)
+      run: |
+        cd tests && ./test-prog-x86_64 x86_64 --invoke --cloned-thread
+    - name: x86_64 -> x86_64 (remote-call timeout)
+      run: |
+        cd tests && ./test-prog-x86_64 x86_64 --timeout
+    - name: x86_64 -> x86_64 (timeout, cloned thread)
+      run: |
+        cd tests && ./test-prog-x86_64 x86_64 --timeout --cloned-thread
+    - name: x86_64 -> x86_64 (read/write target memory)
+      run: |
+        cd tests && ./test-prog-x86_64 x86_64 --mem
+    - name: x86_64 -> x86_64 (list modules + uninject all)
+      run: |
+        cd tests && ./test-prog-x86_64 x86_64 --list
+    - name: x86_64 -> x86_64 (find process by name)
+      run: |
+        cd tests && ./test-prog-x86_64 x86_64 --self-find
+    - name: CLI one-shot --run across all delivery modes
+      run: |
+        cd tests
+        ./test-target & tp=$!
+        sleep 1
+        for mode in auto nonstop ptrace; do
+          ../cmd/injector --pid $tp --delivery $mode --timeout 10000 \
+            --run "$PWD/test-library.so:entry_noarg"
+        done
+        ../cmd/injector --pid $tp --timeout 10000 \
+          --run "$PWD/test-library.so:entry_threeargs" -a 1 -a 2 -a 3
+        ../cmd/injector --pid $tp --info
+        kill $tp 2>/dev/null || true
+    - name: CLI must reject bad input without crashing
+      run: |
+        cd cmd
+        set +e
+        fail=0
+        # NOTE: never target pid 1 here. `--run` attaches, and attaching
+        # patches an int3 trampoline into the target's libc; if init executes
+        # it the kernel panics with "Attempted to kill init!". Argument
+        # validation is exercised against pids that do not exist, and the
+        # attaching cases against a throwaway target we start ourselves.
+        for args in "--pid 0 --info" "--pid -1 --info" "--pid 999999 --info" \
+                    "--pid 8589934593 --info" "--pid 4294967297 --info" \
+                    "--timeout abc --pid 999999 --info" \
+                    "--timeout 4294967300 --pid 999999 --info" \
+                    "--timeout 0 --pid 999999 --info" \
+                    "--delivery bogus --pid 999999 --run /a.so:b" \
+                    "--arg 5 --pid 999999" \
+                    "--run /nonexistent.so:foo --pid 999999" \
+                    "--run /tmp/no-colon-here --pid 999999" \
+                    "--bogus-flag"; do
+          ./injector $args >/dev/null 2>&1
+          rc=$?
+          if [ $rc -ge 128 ]; then echo "CRASH/SIGNAL on: $args (rc=$rc)"; fail=1; fi
+          if [ $rc -eq 0 ]; then echo "UNEXPECTED SUCCESS on: $args"; fail=1; fi
+        done
+        # Attaching cases: throwaway target only.
+        sleep 300 & tp=$!
+        sleep 0.5
+        for args in "--pid $tp --run /nonexistent/lib.so:foo" \
+                    "--pid $tp --info"; do
+          ./injector $args >/dev/null 2>&1
+          rc=$?
+          if [ $rc -ge 128 ]; then echo "CRASH/SIGNAL on: $args (rc=$rc)"; fail=1; fi
+        done
+        if ! kill -0 $tp 2>/dev/null; then
+          echo "throwaway target died during CLI abuse tests"; fail=1
+        fi
+        kill $tp 2>/dev/null
+        # Deliberately NOT probing pid 1 here. A live `--pid 1 --run ...`
+        # probe is only safe if the attach-path guard is present and correct,
+        # and if that guard ever regressed this very step would panic the
+        # runner ("Attempted to kill init!"). The guard is covered by the unit
+        # tests instead, which assert on the validation path directly.
+        exit $fail
+
+  fuzz_regression:
+    name: Fuzz regression + short fuzzing (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install clang
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang || true
+        clang --version | head -1
+    # Replays tests/fuzz/crashes/: minimal reproducers for memory-safety defects
+    # that were found by fuzzing the ELF and /proc parsers and then fixed.
+    - name: Replay saved fuzz crashers
+      run: |
+        cd tests/fuzz && make regress
+    - name: Short fuzz session
+      run: |
+        cd tests/fuzz && make fuzz FUZZ_SECONDS=60 JOBS=4
+
+  bindings:
+    name: Language bindings (Go / Python / Rust)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install toolchains
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang
+    - uses: actions/setup-go@v5
+      with:
+        go-version: 'stable'
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+    - name: Build the C library and test fixtures
+      run: |
+        make
+        cd tests && make build
+    # The bindings link against prebuilt archives that are committed for
+    # convenience. Refresh them from the sources we just built, so these jobs
+    # test the current C code rather than a stale artifact.
+    - name: Refresh vendored archives and headers
+      run: |
+        cp src/linux/libinjector.a pkg/injector/libinjector.a
+        cp include/injector.h      pkg/injector/injector.h
+        cp src/linux/libinjector.a bindings/rust/injector-sys/vendor/libinjector.a
+        cp include/injector.h      bindings/rust/injector-sys/vendor/injector.h
+    - name: Go binding
+      run: |
+        cd pkg/injector && go test -count=1 ./...
+    - name: Python binding
+      run: |
+        cp src/linux/libinjector.so.1.0.0 bindings/python/injector/libinjector.so
+        cd bindings/python
+        python3 tests/test_version.py
+        python3 tests/test_binding_safety.py
+        python3 tests/test_integration.py
+    - name: Rust binding
+      run: |
+        cd bindings/rust && cargo test --locked
+    # The Rust handle must NOT be Send: it is a thread-affine ptrace attachment.
+    # This step fails the build if that ever regresses.
+    - name: Rust Injector must not be Send
+      run: |
+        set -e
+        d=$(mktemp -d); mkdir -p "$d/src"
+        cat > "$d/Cargo.toml" <<EOF
+        [package]
+        name = "sendcheck"
+        version = "0.0.0"
+        edition = "2021"
+        [dependencies]
+        injector = { path = "$GITHUB_WORKSPACE/bindings/rust/injector" }
+        EOF
+        echo 'fn assert_send<T: Send>() {}' >  "$d/src/main.rs"
+        echo 'fn main(){ assert_send::<injector::Injector>(); }' >> "$d/src/main.rs"
+        cd "$d"
+        # Assert on the *reason* the build failed. Treating any build failure as
+        # proof of !Send would make this step vacuous: a missing vendored
+        # archive or an offline registry would "pass" it just as happily.
+        set +e
+        err=$(cargo build 2>&1)
+        rc=$?
+        set -e
+        if [ $rc -eq 0 ]; then
+          echo "::error::Injector is Send again - that is unsound (ptrace is thread-affine)"
+          exit 1
+        fi
+        if ! printf '%s' "$err" | grep -qE 'E0277|cannot be sent between threads'; then
+          echo "::error::build failed for an unrelated reason, so !Send was not actually proven"
+          printf '%s\n' "$err" | tail -25
+          exit 1
+        fi
+        echo "ok: Injector is !Send (rejected with E0277 as expected)"
 
   tests_on_alpine_x86_64:
     name: Tests on Alpine (x86_64 only)

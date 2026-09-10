@@ -1,3 +1,5 @@
+import builtins
+
 INJERR_SUCCESS = 0
 INJERR_OTHER = -1
 INJERR_NO_MEMORY = -2
@@ -30,24 +32,41 @@ _CODE_MAP = {
 }
 
 
+# These classes used to subclass only InjectorError while *shadowing* the
+# builtin names of the same spelling. The result was a trap: user code writing
+# `except PermissionError:` or `except OSError:` silently failed to catch them,
+# and the classes were not even exported from the package, so they could not be
+# referenced as `injector.PermissionError` at all.
+#
+# They now also derive from the matching builtin, so both the builtin hierarchy
+# (`except OSError`) and `except InjectorError` work, and they are exported.
 class NoProcessError(InjectorError):
-    pass
+    """Target process does not exist (INJERR_NO_PROCESS)."""
 
 
-class PermissionError(InjectorError):
-    pass
+class PermissionError(InjectorError, builtins.PermissionError):
+    """ptrace/permission denied (INJERR_PERMISSION)."""
 
 
-class TimeoutError(InjectorError):
-    pass
+class TimeoutError(InjectorError, builtins.TimeoutError):
+    """Remote call timed out (INJERR_TIMEOUT)."""
 
 
-class FileNotFoundError(InjectorError):
-    pass
+class FileNotFoundError(InjectorError, builtins.FileNotFoundError):
+    """Library file not found (INJERR_FILE_NOT_FOUND)."""
 
 
 class FunctionMissingError(InjectorError):
-    pass
+    """Symbol not present in the injected library (INJERR_FUNCTION_MISSING)."""
+
+
+# Unambiguous aliases, for callers who would rather not rely on a name that
+# also exists as a builtin.
+InjectorNoProcessError = NoProcessError
+InjectorPermissionError = PermissionError
+InjectorTimeoutError = TimeoutError
+InjectorFileNotFoundError = FileNotFoundError
+InjectorFunctionMissingError = FunctionMissingError
 
 
 _EXCEPTIONS = {

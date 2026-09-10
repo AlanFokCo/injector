@@ -32,11 +32,18 @@ fn check(rc: i32, inj: *mut injector_sys::injector_t) -> Result<()> {
     }
 }
 
-unsafe fn cstr_array_to_string(arr: *const c_char, _len: usize) -> String {
-    if arr.is_null() {
+/// Convert a fixed-size C `char[N]` buffer to a String.
+///
+/// `_len` used to be ignored and `CStr::from_ptr` scanned until it happened to
+/// find a NUL, which reads past the end of the array if the C side did not
+/// terminate it. The scan is now bounded by `len`.
+unsafe fn cstr_array_to_string(arr: *const c_char, len: usize) -> String {
+    if arr.is_null() || len == 0 {
         return String::new();
     }
-    CStr::from_ptr(arr).to_string_lossy().into_owned()
+    let bytes = unsafe { std::slice::from_raw_parts(arr as *const u8, len) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(len);
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 pub struct Injector {
@@ -51,7 +58,19 @@ impl std::fmt::Debug for Injector {
     }
 }
 
-unsafe impl Send for Injector {}
+// NOTE: `Injector` is deliberately NOT `Send`/`Sync`.
+//
+// `injector_attach` performs PTRACE_ATTACH from the calling OS thread and every
+// later ptrace operation on that handle - including the PTRACE_DETACH in `Drop`
+// - must come from the same thread. This used to carry `unsafe impl Send for
+// Injector`, which made it possible, from 100% safe Rust, to move a handle to
+// another thread:
+//
+//     thread::spawn(move || inj.inject("lib.so")).unwrap();
+//
+// The ptrace calls then fail with EPERM and the target process is left stopped
+// forever. The raw pointer field already makes the type `!Send`/`!Sync`, so no
+// impl is needed; use one `Injector` from one thread.
 
 impl Injector {
     pub fn attach(pid: i32) -> Result<Self> {
@@ -124,13 +143,13 @@ impl Injector {
             )
         };
         if rc != 0 {
-            let msg = unsafe { cstr_array_to_string(result.errmsg.as_ptr(), 256) };
+            let msg = unsafe { cstr_array_to_string(result.errmsg.as_ptr(), result.errmsg.len()) };
             let msg = if msg.is_empty() { unsafe { last_error(self.raw) } } else { msg };
             return Err(InjectorError { code: rc, message: msg });
         }
         Ok(InvokeResult {
             retval: result.retval as i64,
-            errmsg: unsafe { cstr_array_to_string(result.errmsg.as_ptr(), 256) },
+            errmsg: unsafe { cstr_array_to_string(result.errmsg.as_ptr(), result.errmsg.len()) },
         })
     }
 
@@ -146,8 +165,13 @@ impl Injector {
             return Ok(vec![]);
         }
         let cap = count as usize;
-        let mut buf: Vec<injector_sys::injector_module_t> = Vec::with_capacity(cap);
-        unsafe { buf.set_len(cap) };
+        // `Vec::with_capacity` + `set_len` would expose uninitialised
+        // `injector_module_t` values (UB) if C wrote fewer than `cap` entries.
+        // Zero-initialise instead: the struct is plain integers plus a char
+        // array, so all-zero is a valid bit pattern.
+        let mut buf: Vec<injector_sys::injector_module_t> = (0..cap)
+            .map(|_| unsafe { std::mem::zeroed::<injector_sys::injector_module_t>() })
+            .collect();
         let n = unsafe { injector_sys::injector_list_modules(self.raw, buf.as_mut_ptr(), cap) };
         if n < 0 {
             return Err(InjectorError {
@@ -159,7 +183,7 @@ impl Injector {
         Ok(buf[..actual]
             .iter()
             .map(|m| Module {
-                name: unsafe { cstr_array_to_string(m.name.as_ptr(), 256) },
+                name: unsafe { cstr_array_to_string(m.name.as_ptr(), m.name.len()) },
                 base: m.base,
             })
             .collect())
@@ -289,13 +313,13 @@ pub fn run(pid: i32, lib: &str, symbol: &str, args: &[isize], opts: Option<&Opts
         )
     };
     if rc != 0 {
-        let msg = unsafe { cstr_array_to_string(result.errmsg.as_ptr(), 256) };
+        let msg = unsafe { cstr_array_to_string(result.errmsg.as_ptr(), result.errmsg.len()) };
         let msg = if msg.is_empty() { unsafe { last_error(ptr::null_mut()) } } else { msg };
         return Err(InjectorError { code: rc, message: msg });
     }
     Ok(InvokeResult {
         retval: result.retval as i64,
-        errmsg: unsafe { cstr_array_to_string(result.errmsg.as_ptr(), 256) },
+        errmsg: unsafe { cstr_array_to_string(result.errmsg.as_ptr(), result.errmsg.len()) },
     })
 }
 
@@ -317,10 +341,10 @@ pub fn get_target_info(pid: i32) -> Result<TargetInfo> {
         } else {
             unsafe { CStr::from_ptr(info.libc) }.to_string_lossy().into_owned()
         },
-        exe: unsafe { cstr_array_to_string(info.exe.as_ptr(), 4096) },
-        cwd: unsafe { cstr_array_to_string(info.cwd.as_ptr(), 4096) },
-        root: unsafe { cstr_array_to_string(info.root.as_ptr(), 4096) },
-        comm: unsafe { cstr_array_to_string(info.comm.as_ptr(), 16) },
+        exe: unsafe { cstr_array_to_string(info.exe.as_ptr(), info.exe.len()) },
+        cwd: unsafe { cstr_array_to_string(info.cwd.as_ptr(), info.cwd.len()) },
+        root: unsafe { cstr_array_to_string(info.root.as_ptr(), info.root.len()) },
+        comm: unsafe { cstr_array_to_string(info.comm.as_ptr(), info.comm.len()) },
     })
 }
 

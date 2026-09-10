@@ -57,10 +57,30 @@ def _load_lib():
     if found:
         return ctypes.CDLL(found)
 
-    return ctypes.CDLL("libinjector.so")
+    try:
+        return ctypes.CDLL("libinjector.so")
+    except OSError as exc:
+        raise OSError(
+            "cannot find libinjector. Looked in {} and in the loader path "
+            "(ctypes.util.find_library). Build it with `make` at the top of the "
+            "repository and either install it (`sudo make install`) or copy "
+            "libinjector.so next to this file. Underlying error: {}".format(
+                ", ".join(candidates), exc)
+        ) from exc
 
 
 _lib = _load_lib()
+
+# The struct layouts declared below are hardcoded copies of the C headers, so
+# loading a libinjector with a different ABI would silently corrupt memory
+# rather than fail loudly. Check it once, at import time.
+EXPECTED_ABI_VERSION = 1
+_abi = _lib.injector_abi_version()
+if _abi != EXPECTED_ABI_VERSION:
+    raise RuntimeError(
+        "libinjector ABI mismatch: this binding expects ABI version {}, the "
+        "loaded library reports {}. Rebuild/reinstall libinjector from this "
+        "source tree.".format(EXPECTED_ABI_VERSION, _abi))
 
 # --- argtypes / restype declarations ---
 

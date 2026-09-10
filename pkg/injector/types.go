@@ -23,15 +23,15 @@ type Opts struct {
 }
 
 type TargetInfo struct {
-	PID            int
-	Alive          bool
-	PtraceAllowed  bool
-	Arch           string
-	Libc           string
-	Exe            string
-	Cwd            string
-	Root           string
-	Comm           string
+	PID           int
+	Alive         bool
+	PtraceAllowed bool
+	Arch          string
+	Libc          string
+	Exe           string
+	Cwd           string
+	Root          string
+	Comm          string
 }
 
 type Module struct {

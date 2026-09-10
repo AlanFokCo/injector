@@ -7,8 +7,26 @@ package injector
 import "C"
 import (
 	"fmt"
+	"os"
+	"runtime"
 	"unsafe"
 )
+
+/*
+Thread affinity: injector_attach performs PTRACE_ATTACH from the calling OS
+thread, and every subsequent ptrace operation on that handle - including the
+final PTRACE_DETACH - must come from the SAME OS thread. Go normally migrates a
+goroutine between OS threads, so Attach/AttachWithOpts call runtime.LockOSThread
+and Close calls runtime.UnlockOSThread.
+
+Consequences you must respect:
+  - Use one *Injector from a single goroutine only; do not share it across
+    goroutines.
+  - Always call Close. An *Injector that is dropped without Close leaves its
+    goroutine pinned to an OS thread and, worse, leaves the target process
+    ptrace-stopped. A finalizer makes a best-effort detach and warns on stderr,
+    but because it runs on an arbitrary thread the detach may fail with EPERM.
+*/
 
 const MaxInvokeArgs = int(C.INJECTOR_MAX_INVOKE_ARGS)
 
@@ -17,12 +35,16 @@ type Injector struct {
 }
 
 func Attach(pid int) (*Injector, error) {
+	// Pin this goroutine to its OS thread for the lifetime of the handle; the
+	// ptrace attachment is thread-affine.
+	runtime.LockOSThread()
 	var inj *C.injector_t
 	rc := C.injector_attach(&inj, C.injector_pid_t(pid))
 	if err := checkErr(rc, nil); err != nil {
+		runtime.UnlockOSThread()
 		return nil, err
 	}
-	return &Injector{inj: inj}, nil
+	return newInjector(inj), nil
 }
 
 func AttachWithOpts(pid int, opts *Opts) (*Injector, error) {
@@ -37,25 +59,52 @@ func AttachWithOpts(pid int, opts *Opts) (*Injector, error) {
 			copts.enable_write_mem = 1
 		}
 	}
+	runtime.LockOSThread()
 	var inj *C.injector_t
 	rc := C.injector_attach_with_opts(&inj, C.pid_t(pid), &copts)
 	if err := checkErr(rc, nil); err != nil {
+		runtime.UnlockOSThread()
 		return nil, err
 	}
-	return &Injector{inj: inj}, nil
+	return newInjector(inj), nil
 }
 
+// newInjector wraps a live C handle and installs a safety-net finalizer.
+func newInjector(inj *C.injector_t) *Injector {
+	i := &Injector{inj: inj}
+	runtime.SetFinalizer(i, func(x *Injector) {
+		if x.inj == nil {
+			return
+		}
+		// Deliberately does NOT call injector_detach: the ptrace attachment is
+		// bound to the OS thread that attached, and the finalizer runs on an
+		// arbitrary thread, so PTRACE_DETACH there fails with ESRCH/EPERM. It
+		// would also block the single finalizer goroutine for the length of a
+		// remote-call timeout. Warn loudly instead of pretending to clean up.
+		fmt.Fprintln(os.Stderr, "injector: an *Injector was garbage collected without Close(); "+
+			"the target process is still ptrace-attached and may be left stopped")
+	})
+	return i
+}
+
+// Close detaches from the target and releases the OS-thread pin taken by
+// Attach/AttachWithOpts. It is safe to call more than once.
 func (i *Injector) Close() error {
-	if i.inj == nil {
+	if i == nil || i.inj == nil {
 		return nil
 	}
 	rc := C.injector_detach(i.inj)
 	err := checkErr(rc, i.inj)
 	i.inj = nil
+	runtime.SetFinalizer(i, nil)
+	runtime.UnlockOSThread()
 	return err
 }
 
 func (i *Injector) Inject(path string) (uintptr, error) {
+	if i == nil || i.inj == nil {
+		return 0, ErrClosed
+	}
 	cs := C.CString(path)
 	defer C.free(unsafe.Pointer(cs))
 	var handle unsafe.Pointer
@@ -67,16 +116,25 @@ func (i *Injector) Inject(path string) (uintptr, error) {
 }
 
 func (i *Injector) Uninject(handle uintptr) error {
+	if i == nil || i.inj == nil {
+		return ErrClosed
+	}
 	rc := C.injector_uninject(i.inj, unsafe.Pointer(handle))
 	return checkErr(rc, i.inj)
 }
 
 func (i *Injector) UninjectAll() error {
+	if i == nil || i.inj == nil {
+		return ErrClosed
+	}
 	rc := C.injector_uninject_all(i.inj)
 	return checkErr(rc, i.inj)
 }
 
 func (i *Injector) Invoke(path, symbol string, args ...int64) (*InvokeResult, error) {
+	if i == nil || i.inj == nil {
+		return nil, ErrClosed
+	}
 	if len(args) > MaxInvokeArgs {
 		return nil, fmt.Errorf("too many args: %d (max %d)", len(args), MaxInvokeArgs)
 	}
@@ -110,6 +168,9 @@ func (i *Injector) Invoke(path, symbol string, args ...int64) (*InvokeResult, er
 }
 
 func (i *Injector) ListModules() ([]Module, error) {
+	if i == nil || i.inj == nil {
+		return nil, ErrClosed
+	}
 	count := C.injector_list_modules(i.inj, nil, 0)
 	if count < 0 {
 		return nil, &InjectorError{Code: ErrOther, Msg: i.LastError()}
@@ -122,8 +183,14 @@ func (i *Injector) ListModules() ([]Module, error) {
 	if n < 0 {
 		return nil, &InjectorError{Code: ErrOther, Msg: i.LastError()}
 	}
+	// The second call can legitimately report more modules than the buffer
+	// could hold (the target may have loaded more in between); only the first
+	// `count` slots were actually written, so clamp to avoid phantom entries.
+	if n > count {
+		n = count
+	}
 	result := make([]Module, int(n))
-	for idx := 0; idx < int(n) && idx < int(count); idx++ {
+	for idx := 0; idx < int(n); idx++ {
 		result[idx] = Module{
 			Name: C.GoString(&buf[idx].name[0]),
 			Base: uintptr(buf[idx].base),
@@ -133,6 +200,9 @@ func (i *Injector) ListModules() ([]Module, error) {
 }
 
 func (i *Injector) ResolveSymbol(libname, symbol string) (uintptr, error) {
+	if i == nil || i.inj == nil {
+		return 0, ErrClosed
+	}
 	var clib *C.char
 	if libname != "" {
 		clib = C.CString(libname)
@@ -149,6 +219,15 @@ func (i *Injector) ResolveSymbol(libname, symbol string) (uintptr, error) {
 }
 
 func (i *Injector) ReadMem(addr uintptr, size int) ([]byte, error) {
+	if i == nil || i.inj == nil {
+		return nil, ErrClosed
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("injector: negative read size %d", size)
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
 	buf := make([]byte, size)
 	rc := C.injector_read_mem(i.inj, C.uintptr_t(addr), unsafe.Pointer(&buf[0]), C.size_t(size))
 	if err := checkErr(rc, i.inj); err != nil {
@@ -158,11 +237,20 @@ func (i *Injector) ReadMem(addr uintptr, size int) ([]byte, error) {
 }
 
 func (i *Injector) WriteMem(addr uintptr, data []byte) error {
+	if i == nil || i.inj == nil {
+		return ErrClosed
+	}
+	if len(data) == 0 {
+		return nil // &data[0] would panic on an empty slice
+	}
 	rc := C.injector_write_mem(i.inj, C.uintptr_t(addr), unsafe.Pointer(&data[0]), C.size_t(len(data)))
 	return checkErr(rc, i.inj)
 }
 
 func (i *Injector) RemoteFuncAddr(handle uintptr, name string) (uintptr, error) {
+	if i == nil || i.inj == nil {
+		return 0, ErrClosed
+	}
 	cname := C.CString(name)
 	defer C.free(unsafe.Pointer(cname))
 	var addr C.size_t
@@ -174,6 +262,9 @@ func (i *Injector) RemoteFuncAddr(handle uintptr, name string) (uintptr, error) 
 }
 
 func (i *Injector) LastError() string {
+	if i == nil || i.inj == nil {
+		return "injector: handle is closed"
+	}
 	return C.GoString(C.injector_last_error(i.inj))
 }
 

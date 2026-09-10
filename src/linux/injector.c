@@ -44,6 +44,48 @@
 #include "proc.h"
 #include "injector_internal.h"
 
+/* MAJOR 7: every public entry point dereferences its injector_t* argument.
+ * The Python and Go bindings pass NULL after close(), which used to SIGSEGV
+ * the host process. Return INJERR_OTHER with a readable message instead.
+ * The message lands in the thread-local buffer, i.e. it is readable through
+ * injector_last_error(NULL) / injector_error(). */
+#define INJECTOR_CHECK_HANDLE(inj) do {                                     \
+    if ((inj) == NULL) {                                                    \
+        injector__set_current(NULL);                                        \
+        injector__reset_tl_errmsg();                                        \
+        injector__set_errmsg("%s: injector handle is NULL", __func__);      \
+        return INJERR_OTHER;                                                \
+    }                                                                       \
+} while (0)
+
+/* MINOR 14: readlink("/proc/PID/exe") keeps the kernel's " (deleted)" marker
+ * while the maps-derived path has it stripped, so the two never compared
+ * equal for a deleted executable. */
+static void strip_deleted_suffix(char *path)
+{
+    static const char suffix[] = " (deleted)";
+    const size_t slen = sizeof(suffix) - 1;
+    size_t len = strlen(path);
+    if (len >= slen && strcmp(path + len - slen, suffix) == 0) {
+        path[len - slen] = '\0';
+    }
+}
+
+/* MINOR 15: `strstr(path, ".so")` also matched non-libraries such as
+ * "/run/foo.socket". Require ".so" at the end of the name or followed by a
+ * dot (libc.so.6, ld-linux-x86-64.so.2). */
+static int path_is_shared_object(const char *path)
+{
+    const char *p = path;
+    while ((p = strstr(p, ".so")) != NULL) {
+        if (p[3] == '\0' || p[3] == '.') {
+            return 1;
+        }
+        p += 3;
+    }
+    return 0;
+}
+
 
 static inline size_t remote_mem_size(injector_t *injector) {
     return 2 * injector->data_size + injector->stack_size;
@@ -59,7 +101,23 @@ int injector__attach_internal(injector_t **injector_out, pid_t pid, const inject
 
     injector__set_current(NULL);
     injector__reset_tl_errmsg();
-
+    /* MAJOR 4: never leave the caller's out-param untouched on failure; a
+     * caller that ignores the error code would otherwise hand an
+     * uninitialized injector_t* to injector_detach(). Done before every
+     * early return below. */
+    if (injector_out != NULL) {
+        *injector_out = NULL;
+    }
+    /* SAFETY: refuse pid <= 1. Attaching hijacks the target's libc entry with
+     * an `int3` trampoline to run remote syscalls; doing that to init makes
+     * pid 1 die on the trap and the kernel panics ("Attempted to kill init!"),
+     * taking the whole host down. Confirmed on a real box. Non-intrusive
+     * helpers (injector_target_info / injector_can_attach) only read /proc and
+     * are deliberately left usable for pid 1. */
+    if (pid <= 1) {
+        injector__set_errmsg("refusing to attach to pid %d: attaching to init patches an int3 trampoline into its libc and will panic the host", (int)pid);
+        return INJERR_NO_PROCESS;
+    }
     injector = calloc(1, sizeof(injector_t));
     if (injector == NULL) {
         injector__set_errmsg("malloc error: %s", strerror(errno));
@@ -111,7 +169,10 @@ int injector__attach_internal(injector_t **injector_out, pid_t pid, const inject
         goto error_exit;
     }
     if (retval == -1) {
-        injector__set_errmsg("mmap error: %s", strerror(errno));
+        /* MINOR 13: injector__call_syscall() translates the remote -errno into
+         * the local errno, so strerror(errno) here really is the TARGET's mmap
+         * error -- say so explicitly instead of implying a local failure. */
+        injector__set_errmsg("mmap error in the target process: %s", strerror(errno));
         rv = INJERR_ERROR_IN_TARGET;
         goto error_exit;
     }
@@ -124,14 +185,21 @@ int injector__attach_internal(injector_t **injector_out, pid_t pid, const inject
 #else
     prot = PROT_NONE;
 #endif
+    /* Every injector__call_syscall()/injector__call_function() call site below
+     * passes exactly six arguments: remote_call.c always reads six with
+     * va_arg(), and supplying fewer makes it read past the caller's varargs
+     * area -- ASan reports that as a dynamic-stack-buffer-overflow when the
+     * over-read lands in an alloca()d buffer. The padding values are harmless:
+     * the remote callee ignores registers beyond its own parameter list. */
     rv = injector__call_syscall(injector, &retval, injector->sys_mprotect,
                                 injector->data + injector->data_size, injector->data_size,
-                                prot);
+                                prot, (long)0, (long)0, (long)0);
     if (rv != 0) {
         goto error_exit;
     }
     if (retval != 0) {
-        injector__set_errmsg("mprotect error: %s", strerror(errno));
+        /* MINOR 13: as above, errno is the TARGET's mprotect error. */
+        injector__set_errmsg("mprotect error in the target process: %s", strerror(errno));
         rv = INJERR_ERROR_IN_TARGET;
         goto error_exit;
     }
@@ -167,9 +235,14 @@ int injector_inject(injector_t *injector, const char *path, void **handle)
     int rv;
     intptr_t retval;
 
+    INJECTOR_CHECK_HANDLE(injector);
     injector__set_current(injector);
     injector->errmsg_set = 0;
 
+    if (path == NULL) {
+        injector__set_errmsg("path is NULL");
+        return INJERR_FILE_NOT_FOUND;
+    }
     if (path[0] == '/') {
         len = strlen(path) + 1;
     } else if (realpath(path, abspath) != NULL) {
@@ -194,14 +267,16 @@ int injector_inject(injector_t *injector, const char *path, void **handle)
 #define __RTLD_DLOPEN	0x80000000 // glibc internal flag
         dlflags |= __RTLD_DLOPEN;
     }
-    rv = injector__call_function(injector, &retval, injector->dlopen_addr, injector->data, dlflags);
+    rv = injector__call_function(injector, &retval, injector->dlopen_addr, injector->data, dlflags,
+                                 (long)0, (long)0, (long)0, (long)0);
     if (rv != 0) {
         return rv;
     }
     if (retval == 0) {
         char buf[256 + 1] = {0,};
         if (injector->dlerror_addr != 0) {
-            rv = injector__call_function(injector, &retval, injector->dlerror_addr);
+            rv = injector__call_function(injector, &retval, injector->dlerror_addr,
+                                         (long)0, (long)0, (long)0, (long)0, (long)0, (long)0);
             if (rv == 0 && retval != 0) {
                 injector__read(injector, retval, buf, sizeof(buf) - 1);
             }
@@ -221,14 +296,32 @@ int injector_inject(injector_t *injector, const char *path, void **handle)
         if (injector->injected_count < sizeof(injector->injected_handles) / sizeof(injector->injected_handles[0])) {
             injector->injected_handles[injector->injected_count++] = *handle;
         } else {
-            injector__set_errmsg("too many injected libraries to track (max 32)");
-            /* still succeed: the library is loaded, we just can't auto-uninject it */
+            /* MINOR 11: the inject itself succeeded, so do NOT set an error
+             * message here: include/injector.h documents that the message is
+             * only updated when a function returns non-zero, and a non-empty
+             * injector_last_error() after success contradicts that. The
+             * library stays loaded; it just cannot be auto-uninjected. */
         }
     }
     return 0;
 }
 
+/* waitpid(2): without __WALL only "non-clone" children are waited for, where a
+ * "clone" child is one that does not deliver SIGCHLD on termination. The
+ * injector_inject_in_cloned_thread() helper clones with exit_signal 0, so its
+ * child IS a clone child and a plain wait4() on it fails with ECHILD even
+ * though the child is a visible zombie. __WALL waits for all children
+ * regardless of type, which is correct for both clone sites. */
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
+
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+/* Defined below with the NONSTOP delivery code. Both clone() helpers need it:
+ * a CLONE_VM child that is never reaped stays a zombie in the target's process
+ * table for as long as the target lives. */
+static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful);
+
 int injector_inject_in_cloned_thread(injector_t *injector, const char *path, void **handle_out)
 {
     void *data;
@@ -240,9 +333,14 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
     int rv;
     intptr_t retval;
 
+    INJECTOR_CHECK_HANDLE(injector);
     injector__set_current(injector);
     injector->errmsg_set = 0;
 
+    if (path == NULL) {
+        injector__set_errmsg("path is NULL");
+        return INJERR_FILE_NOT_FOUND;
+    }
     if (injector->arch != ARCH_X86_64) {
         injector__set_errmsg("injector_inject_in_cloned_thread doesn't support %s.",
                              injector__arch2name(injector->arch));
@@ -282,14 +380,22 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
                                  injector->shellcode, injector->stack + injector->stack_size - 4096,
                                  //CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID,
                                  CLONE_VM,
-                                 injector->data);
+                                 injector->data, (long)0, (long)0);
     if (rv != 0) {
         return rv;
     }
     if (retval == -1) {
-        injector__set_errmsg("clone error: %s", strerror(errno));
+        /* MINOR 13: clone() is a remote FUNCTION call, so unlike a remote
+         * syscall its failure does NOT translate the target's errno into ours;
+         * strerror(errno) here described an unrelated local error. */
+        injector__set_errmsg("clone failed in the target process (remote return value: %ld)", (long)retval);
         return INJERR_ERROR_IN_TARGET;
     }
+    /* clone() returned the child's pid in the target's namespace. This clone
+     * uses exit_signal 0, so the target gets no SIGCHLD and will never reap the
+     * child itself: without an explicit wait4 every call leaves one zombie in
+     * the target for the rest of its life. Reap it on every exit path below. */
+    const pid_t child = (pid_t)retval;
     const struct timespec ts = {0, 100000000}; /* 0.1 second */
     void *handle;
     int cnt = 0;
@@ -298,6 +404,7 @@ retry:
     nanosleep(&ts, NULL);
     rv = injector__read(injector, injector->data, &handle, sizeof(handle));
     if (rv != 0) {
+        nonstop_cleanup_child(injector, child, 0);
         return rv;
     }
     if (handle == invalid_handle) {
@@ -306,6 +413,8 @@ retry:
             goto retry;
         }
         injector__set_errmsg("dlopen doesn't return in %d seconds.", max_retry_cnt / 10);
+        /* dlopen never returned: the child is stuck, so kill it as well. */
+        nonstop_cleanup_child(injector, child, 0);
         return INJERR_ERROR_IN_TARGET;
     }
     if (handle_out != NULL) {
@@ -314,13 +423,21 @@ retry:
     if (handle == NULL) {
         arg->file_path[0] = '\0';
         injector__read(injector, injector->data, data, injector->data_size);
+        /* SUSPECTED 16: the page came from the target. A hostile target with
+         * no NUL byte in it would make the "%s" below read past the end of
+         * the alloca()d buffer, so force termination inside our own copy. */
+        ((char *)data)[injector->data_size - 1] = '\0';
         if (arg->file_path[0] != '\0') {
             injector__set_errmsg("%s", arg->file_path);
         } else {
             injector__set_errmsg("dlopen error");
         }
+        /* Reap only AFTER the dlerror text has been copied out of the shared
+         * page: killing the child first could truncate that message. */
+        nonstop_cleanup_child(injector, child, 0);
         return INJERR_ERROR_IN_TARGET;
     }
+    nonstop_cleanup_child(injector, child, 0);
     return 0;
 }
 #endif
@@ -329,8 +446,16 @@ int injector_remote_func_addr(injector_t *injector, void *handle, const char* na
 {
     int rv;
     intptr_t retval;
-    size_t len = strlen(name) + 1;
+    size_t len;
 
+    INJECTOR_CHECK_HANDLE(injector);
+    if (name == NULL) {
+        injector__set_current(injector);
+        injector->errmsg_set = 0;
+        injector__set_errmsg("name is NULL");
+        return INJERR_FUNCTION_MISSING;
+    }
+    len = strlen(name) + 1;
     injector__set_current(injector);
     injector->errmsg_set = 0;
 
@@ -342,7 +467,8 @@ int injector_remote_func_addr(injector_t *injector, void *handle, const char* na
     if (rv != 0) {
         return rv;
     }
-    rv = injector__call_function(injector, &retval, injector->dlsym_addr, handle, injector->data);
+    rv = injector__call_function(injector, &retval, injector->dlsym_addr, handle, injector->data,
+                                 (long)0, (long)0, (long)0, (long)0);
     if (rv != 0) {
         return rv;
     }
@@ -358,6 +484,7 @@ int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_add
 {
     va_list ap;
     int rv;
+    INJECTOR_CHECK_HANDLE(injector);
     injector__set_current(injector);
     injector->errmsg_set = 0;
     va_start(ap, func_addr);
@@ -368,6 +495,7 @@ int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_add
 
 int injector_remote_vcall(injector_t *injector, intptr_t *retval, size_t func_addr, va_list ap)
 {
+    INJECTOR_CHECK_HANDLE(injector);
     injector__set_current(injector);
     injector->errmsg_set = 0;
     return injector__call_function_va_list(injector, retval, func_addr, ap);
@@ -376,11 +504,13 @@ int injector_remote_vcall(injector_t *injector, intptr_t *retval, size_t func_ad
 int injector_call(injector_t *injector, void *handle, const char* name)
 {
     size_t func_addr;
+    INJECTOR_CHECK_HANDLE(injector);
     int rv = injector_remote_func_addr(injector, handle, name, &func_addr);
     if (rv != 0) {
         return rv;
     }
-    return injector__call_function(injector, NULL, func_addr);
+    return injector__call_function(injector, NULL, func_addr,
+                                   (long)0, (long)0, (long)0, (long)0, (long)0, (long)0);
 }
 
 int injector_uninject(injector_t *injector, void *handle)
@@ -388,6 +518,7 @@ int injector_uninject(injector_t *injector, void *handle)
     int rv;
     intptr_t retval;
 
+    INJECTOR_CHECK_HANDLE(injector);
     injector__set_current(injector);
     injector->errmsg_set = 0;
     if (injector->libc_type == LIBC_TYPE_MUSL) {
@@ -396,7 +527,8 @@ int injector_uninject(injector_t *injector, void *handle)
         return INJERR_UNSUPPORTED_TARGET;
     }
 
-    rv = injector__call_function(injector, &retval, injector->dlclose_addr, handle);
+    rv = injector__call_function(injector, &retval, injector->dlclose_addr, handle,
+                                 (long)0, (long)0, (long)0, (long)0, (long)0);
     if (rv != 0) {
         return rv;
     }
@@ -410,13 +542,20 @@ int injector_uninject(injector_t *injector, void *handle)
 int injector_detach(injector_t *injector)
 {
     int rv = 0;
+    /* MAJOR 7: NULL (e.g. after a failed attach, which now always sets
+     * *out = NULL, or from a binding whose handle was already closed) used to
+     * dereference NULL. There is nothing to detach and nothing to free, so
+     * report an error instead of crashing. Detaching the same non-NULL
+     * pointer twice remains a caller bug: the handle is freed here. */
+    INJECTOR_CHECK_HANDLE(injector);
     /* current_inj = NULL so detach cleanup errors go to thread-local and
      * do not dangle after free(injector) below. Leave errmsg_set intact so
      * a caller reading injector_last_error() before detach sees the error. */
     injector__set_current(NULL);
 
     if (injector->mmapped) {
-        int r = injector__call_syscall(injector, NULL, injector->sys_munmap, injector->data, remote_mem_size(injector));
+        int r = injector__call_syscall(injector, NULL, injector->sys_munmap, injector->data,
+                                       remote_mem_size(injector), (long)0, (long)0, (long)0, (long)0);
         if (r != 0 && rv == 0) rv = r;
     }
     if (injector->attached) {
@@ -517,6 +656,15 @@ int injector_target_info(pid_t pid, injector_target_info_t *out)
         injector__set_errmsg("out is NULL");
         return INJERR_OTHER;
     }
+    /* MINOR 8: kill(0, 0) and kill(-1, 0) succeed, so pid <= 0 used to be
+     * reported as alive=1/can_attach=1 even though it means "my process
+     * group"/"every process we may signal". Reject it up front. */
+    if (pid <= 0) {
+        injector__set_current(NULL);
+        injector__reset_tl_errmsg();
+        injector__set_errmsg("invalid pid %d", (int)pid);
+        return INJERR_NO_PROCESS;
+    }
     memset(out, 0, sizeof(*out));
     out->pid = pid;
     out->arch = "unknown";
@@ -552,8 +700,13 @@ int injector_target_info(pid_t pid, injector_target_info_t *out)
     snprintf(proc_path, sizeof(proc_path), "/proc/%d/maps", (int)pid);
     fp = fopen(proc_path, "r");
     if (fp == NULL) {
-        /* alive but no maps (e.g. zombie/permission): arch/libc stay unknown */
-        return 0;
+        /* MINOR 12: include/injector.h documents INJERR_OTHER on read error;
+         * returning 0 here reported success with arch/libc left "unknown". */
+        int e = errno;
+        injector__set_current(NULL);
+        injector__reset_tl_errmsg();
+        injector__set_errmsg("failed to open %s: %s", proc_path, strerror(e));
+        return INJERR_OTHER;
     }
     while (fgets(line, sizeof(line), fp) != NULL) {
         proc_map_t m;
@@ -588,6 +741,10 @@ int injector_target_info(pid_t pid, injector_target_info_t *out)
 int injector_can_attach(pid_t pid)
 {
     /* Heuristic only. See injector.h doc comment: not a guarantee. */
+    /* MINOR 8: pid <= 0 is not a process (0 = own process group, -1 = all). */
+    if (pid <= 0) {
+        return 0;
+    }
     if (kill(pid, 0) != 0 && errno != EPERM) {
         return 0;  /* not alive */
     }
@@ -613,6 +770,12 @@ int injector_can_attach(pid_t pid)
 
 int injector_read_mem(injector_t *inj, uintptr_t addr, void *buf, size_t len)
 {
+    INJECTOR_CHECK_HANDLE(inj);
+    if (buf == NULL) {
+        injector__set_current(inj);
+        injector__set_errmsg("buf is NULL");
+        return INJERR_OTHER;
+    }
     injector__set_current(inj);
     inj->errmsg_set = 0;
     return injector__read(inj, (size_t)addr, buf, len);
@@ -620,6 +783,12 @@ int injector_read_mem(injector_t *inj, uintptr_t addr, void *buf, size_t len)
 
 int injector_write_mem(injector_t *inj, uintptr_t addr, const void *buf, size_t len)
 {
+    INJECTOR_CHECK_HANDLE(inj);
+    if (buf == NULL) {
+        injector__set_current(inj);
+        injector__set_errmsg("buf is NULL");
+        return INJERR_OTHER;
+    }
     injector__set_current(inj);
     inj->errmsg_set = 0;
     if (!inj->enable_write_mem) {
@@ -633,6 +802,8 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
 {
     char proc[64];
     char exe_path[PATH_MAX];
+    char exe_file[64];
+    int exe_truncated = 0;
     char line[PATH_MAX * 2];
     proc_map_t m;
     FILE *fp;
@@ -642,6 +813,7 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
     size_t a = 0;
     int rv;
 
+    INJECTOR_CHECK_HANDLE(inj);
     injector__set_current(inj);
     inj->errmsg_set = 0;
 
@@ -673,6 +845,13 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
         injector__set_errmsg("failed to read %s: %s", proc, strerror(errno));
         return INJERR_NO_PROCESS;
     }
+    /* MINOR 14: a readlink result that exactly fills the buffer is truncated,
+     * and the kernel appends " (deleted)" for an unlinked executable. The
+     * maps-derived path has neither, so strip the marker and remember the
+     * truncation to fall back to a prefix match. The ELF itself is parsed
+     * through /proc/PID/exe below, which stays valid in both cases. */
+    exe_truncated = (strlen(exe_path) == sizeof(exe_path) - 1);
+    strip_deleted_suffix(exe_path);
 
     snprintf(proc, sizeof(proc), "/proc/%d/maps", inj->pid);
     fp = fopen(proc, "r");
@@ -684,7 +863,8 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
         if (proc__parse_maps_line(line, &m) != 0) {
             continue;
         }
-        if (strcmp(m.path, exe_path) == 0) {
+        if (strcmp(m.path, exe_path) == 0 ||
+            (exe_truncated && strncmp(m.path, exe_path, strlen(exe_path)) == 0)) {
             if (!found || m.start < map_start) {
                 map_start = m.start;
                 found = 1;
@@ -703,7 +883,8 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
      * link base, so bias = 0. For ET_DYN (PIE exe / shared object) symbol
      * values are relative to the first PT_LOAD (p_vaddr 0 in practice), so
      * bias = the mapping start. injector__elf_load_bias reads e_type. */
-    rv = injector__elf_load_bias(exe_path, map_start, &bias);
+    snprintf(exe_file, sizeof(exe_file), "/proc/%d/exe", inj->pid);
+    rv = injector__elf_load_bias(exe_file, map_start, &bias);
     if (rv != 0) {
         return rv;
     }
@@ -711,7 +892,7 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
     {
         const char *const names[1] = { symbol };
         size_t addrs[1] = { 0 };
-        rv = injector__elf_find_symbols(exe_path, bias, names, addrs, 1);
+        rv = injector__elf_find_symbols(exe_file, bias, names, addrs, 1);
         if (rv != 0) {
             return rv;
         }
@@ -743,6 +924,7 @@ long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap)
     char prev[256];
     prev[0] = '\0';
 
+    INJECTOR_CHECK_HANDLE(inj);
     injector__set_current(inj);
     inj->errmsg_set = 0;
 
@@ -759,8 +941,9 @@ long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap)
         if (proc__parse_maps_line(line, &m) != 0) {
             continue;
         }
-        /* only shared libraries: cheap ".so" filter on the path */
-        if (strstr(m.path, ".so") == NULL) {
+        /* only shared libraries (MINOR 15: ".so" must end the name or be
+         * followed by '.', so "/run/x.socket" is no longer listed) */
+        if (!path_is_shared_object(m.path)) {
             continue;
         }
         base = strrchr(m.path, '/');
@@ -787,18 +970,38 @@ int injector_uninject_all(injector_t *inj)
 {
     int rv = 0;
     size_t i;
+    INJECTOR_CHECK_HANDLE(inj);
     injector__set_current(inj);
     inj->errmsg_set = 0;
     /* Delegate per-handle uninject to injector_uninject, which refuses musl
      * targets (INJERR_UNSUPPORTED_TARGET). The first non-zero error wins;
-     * we keep trying the rest so a single bad handle doesn't strand others. */
+     * we keep trying the rest so a single bad handle doesn't strand others.
+     * MAJOR 6: handles whose dlclose FAILED are retained, so the library can
+     * still be released by a later call instead of becoming permanently
+     * unreleasable, and the reported error and injector_last_error() are made
+     * to agree (both describe the FIRST failure). */
+    char first_errmsg[sizeof(inj->errmsg)];
+    size_t kept = 0;
+    first_errmsg[0] = '\0';
     for (i = 0; i < inj->injected_count; i++) {
         int r = injector_uninject(inj, inj->injected_handles[i]);
-        if (r != 0 && rv == 0) {
-            rv = r;
+        if (r == 0) {
+            continue;
         }
+        if (rv == 0) {
+            const char *e = injector_last_error(inj);
+            rv = r;
+            snprintf(first_errmsg, sizeof(first_errmsg), "%s", e ? e : "");
+        }
+        inj->injected_handles[kept++] = inj->injected_handles[i];
     }
-    inj->injected_count = 0;
+    inj->injected_count = kept;
+    if (rv != 0) {
+        /* injector_uninject() reset errmsg_set on every attempt, so the buffer
+         * now holds the LAST failure while rv is the FIRST one. */
+        inj->errmsg_set = 0;
+        injector__set_errmsg("%s", first_errmsg[0] ? first_errmsg : "uninject_all failed");
+    }
     return rv;
 }
 
@@ -892,6 +1095,73 @@ static int injector_invoke_ptrace(injector_t *inj, const char *path, const char 
 }
 
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+/* x86_64 syscall numbers, used to clean up the NONSTOP helper child from
+ * inside the target. The nonstop delivery path is x86_64-only (see the
+ * inj->arch check below), and injector->sys_* only carries mmap/mprotect/
+ * munmap, so these are spelled out here. */
+#define NONSTOP_SYS_kill  62
+#define NONSTOP_SYS_wait4 61
+
+/* BLOCKER 1: terminate and reap the CLONE_VM helper child started by
+ * injector_invoke_nonstop().
+ *
+ * The child shares the target's mm_struct. Left running (invoked function
+ * hangs -> INJERR_TIMEOUT) it was never killed nor reaped: it survived the
+ * target's death, was reparented to init and kept ~1.7MB of the target's
+ * address space pinned forever, and injector_detach() munmapped the region
+ * holding its stack. `graceful` sends SIGTERM first (INJECTOR_TIMEOUT_LEAVE);
+ * SIGKILL always follows so the child cannot outlive the call on any path.
+ * Best effort: failures here must not mask the caller's error code. */
+static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful)
+{
+    const struct timespec ts = {0, 20 * 1000 * 1000}; /* 20ms */
+    char saved_errmsg[sizeof(inj->errmsg)];
+    char saved_errmsg_set = inj->errmsg_set;
+    int i;
+
+    if (child <= 0) {
+        return;
+    }
+    /* Best effort: this cleanup runs after the outcome of the invoke is known,
+     * so its own diagnostics must not replace (or, on success, invent) the
+     * caller-visible error message. */
+    memcpy(saved_errmsg, inj->errmsg, sizeof(saved_errmsg));
+    if (graceful && kill(child, SIGTERM) != 0 && errno == EPERM) {
+        /* not permitted locally (different uid): the target has the right
+         * credentials, so signal it from there instead. */
+        injector__call_syscall(inj, NULL, NONSTOP_SYS_kill,
+                               (long)child, (long)SIGTERM, (long)0, (long)0, (long)0, (long)0);
+    }
+    if (kill(child, SIGKILL) != 0 && errno == EPERM) {
+        injector__call_syscall(inj, NULL, NONSTOP_SYS_kill,
+                               (long)child, (long)SIGKILL, (long)0, (long)0, (long)0, (long)0);
+    }
+    /* The child belongs to the TARGET's process table, so only the target can
+     * reap it (waitpid() here would fail with ECHILD). An unreaped zombie no
+     * longer pins the mm (exit_mm() dropped the reference), but reap it
+     * anyway so repeated invokes do not litter the target with children. */
+    for (i = 0; i < 10; i++) {
+        intptr_t w = 0;
+        nanosleep(&ts, NULL);
+        if (injector__call_syscall(inj, &w, NONSTOP_SYS_wait4, (long)child, 0,
+                                   (long)(WNOHANG | __WALL), (long)0, (long)0,
+                                   (long)0) == 0
+            && (pid_t)w == child) {
+            goto done;
+        }
+        /* The child's death delivers SIGCHLD to the ptraced target, and the
+         * first remote call after that stops with "unexpectedly stopped by
+         * signal 17". The stop consumes (and discards) the signal, so simply
+         * retry -- the next wait4 reaps the zombie. */
+        if (kill(child, 0) != 0 && errno == ESRCH) {
+            goto done; /* gone, and already reaped (e.g. by the target itself) */
+        }
+    }
+done:
+    memcpy(inj->errmsg, saved_errmsg, sizeof(inj->errmsg));
+    inj->errmsg_set = saved_errmsg_set;
+}
+
 static int injector_invoke_nonstop(injector_t *inj, const char *path, const char *symbol,
                                    const intptr_t *args, int argc,
                                    injector_result_t *out)
@@ -951,58 +1221,112 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
         return rv;
     }
 
+    /* BLOCKER 1: SIGCHLD is the clone exit_signal (low byte of the flags).
+     * Without it the kernel makes the child unwaitable -- wait4() in the
+     * target returns ECHILD even while the child is a zombie -- so a killed
+     * or exited helper would stay in the target's process table forever.
+     * With it, nonstop_cleanup_child() below can reap the child remotely. */
     rv = injector__call_function(inj, &clone_ret, (long)inj->clone_addr,
                                  (long)inj->shellcode_invoke,
                                  (long)(inj->stack + inj->stack_size - 4096),
-                                 (long)CLONE_VM, (long)inj->data);
+                                 (long)(CLONE_VM | SIGCHLD), (long)inj->data,
+                                 (long)0, (long)0);
     if (rv != 0) {
         if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
         return rv;
     }
     if (clone_ret == -1) {
-        injector__set_errmsg("clone error: %s", strerror(errno));
+        /* MINOR 13: clone() is a remote FUNCTION call, so the target's errno is
+         * not translated into ours; strerror(errno) described an unrelated
+         * local error. Report the remote return value instead. */
+        injector__set_errmsg("clone failed in the target process (remote return value: %ld)", (long)clone_ret);
         if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
         return INJERR_ERROR_IN_TARGET;
     }
+
+    /* BLOCKER 1: from here on the helper child exists and MUST be terminated
+     * and reaped before this function returns, on every path. */
+    const pid_t child = (pid_t)clone_ret;
+    int rc;
 
     /* Main thread stays ptrace-stopped. The clone child (CLONE_VM, separate
      * process sharing the address space) runs the invoke shellcode. Poll the
      * data page via process_vm_readv — works on the stopped main thread's pid
      * because the address space is shared. */
-    const struct timespec ts_poll = {0, 100000000}; /* 100ms */
     int64_t status = 0;
-    int cnt = 0;
-    int max_cnt = (int)(inj->call_timeout_ms / 100);
-    if (max_cnt < 50) max_cnt = 50;
+    unsigned timeout_ms = inj->call_timeout_ms ? inj->call_timeout_ms : 5000;
+    struct timespec ts_poll, deadline, now;
 
-    while (status == 0 && cnt++ < max_cnt) {
+    ts_poll.tv_sec = 0;
+    ts_poll.tv_nsec = 20 * 1000 * 1000; /* 20ms */
+    /* MAJOR 3: honour the requested timeout. The old code clamped the poll
+     * count to a minimum of 50 x 100ms, so call_timeout_ms=200 actually
+     * blocked ~5 s and then reported "timed out after 200 ms". Poll every
+     * 20ms against a monotonic deadline; the do/while below guarantees at
+     * least one poll iteration even for a 0/1ms timeout. */
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    do {
         nanosleep(&ts_poll, NULL);
         rv = injector__read(inj, inj->data + offsetof(injector_shellcode_invoke_arg_t, status),
                             &status, sizeof(status));
         if (rv != 0) {
             if (out) snprintf(out->errmsg, sizeof(out->errmsg), "failed to read result from target");
-            return rv;
+            rc = rv;
+            goto cleanup;
         }
-    }
+        if (status != 0) {
+            break;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &now);
+    } while (now.tv_sec < deadline.tv_sec ||
+             (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec));
 
     if (status == 1) {
-        intptr_t result;
-        injector__read(inj, inj->data + offsetof(injector_shellcode_invoke_arg_t, retval),
-                       &result, sizeof(result));
+        /* MAJOR 2: `result` was uninitialized and the read's return value was
+         * ignored, so a target that died mid-invoke returned success (0) with
+         * a garbage out->retval. */
+        intptr_t result = 0;
+        rv = injector__read(inj, inj->data + offsetof(injector_shellcode_invoke_arg_t, retval),
+                            &result, sizeof(result));
+        if (rv != 0) {
+            injector__set_errmsg("failed to read the return value from the target");
+            if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
+            rc = rv;
+            goto cleanup;
+        }
         if (out) out->retval = result;
-        return 0;
+        rc = 0;
     } else if (status == 2) {
         char errbuf[256] = {0,};
         injector__read(inj, inj->data + offsetof(injector_shellcode_invoke_arg_t, file_path),
                        errbuf, sizeof(errbuf) - 1);
+        errbuf[sizeof(errbuf) - 1] = '\0';
         injector__set_errmsg("nonstop invoke failed: %s", errbuf[0] ? errbuf : "unknown error");
         if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
-        return INJERR_ERROR_IN_TARGET;
+        rc = INJERR_ERROR_IN_TARGET;
     } else {
-        injector__set_errmsg("nonstop invoke timed out after %u ms", inj->call_timeout_ms);
+        injector__set_errmsg("nonstop invoke timed out after %u ms", timeout_ms);
         if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", injector_last_error(inj));
-        return INJERR_TIMEOUT;
+        rc = INJERR_TIMEOUT;
     }
+
+cleanup:
+    /* BLOCKER 1 / injector->timeout_action: the child must never outlive this
+     * call. INJECTOR_TIMEOUT_KILL_THREAD kills it outright;
+     * INJECTOR_TIMEOUT_LEAVE asks it to terminate first, but SIGKILL still
+     * follows -- a surviving CLONE_VM child pins the target's mm_struct
+     * forever and injector_detach() munmaps the stack it runs on. */
+    nonstop_cleanup_child(inj, child,
+                          !(rc == INJERR_TIMEOUT &&
+                            inj->timeout_action == INJECTOR_TIMEOUT_KILL_THREAD));
+    return rc;
 }
 #endif
 
@@ -1010,6 +1334,7 @@ int injector_invoke(injector_t *inj, const char *path, const char *symbol,
                     const intptr_t *args, int argc,
                     injector_result_t *out) {
     if (out) { memset(out, 0, sizeof(*out)); }
+    INJECTOR_CHECK_HANDLE(inj);
     injector__set_current(inj);
     inj->errmsg_set = 0;
 
@@ -1049,6 +1374,18 @@ int injector_run(pid_t pid, const char *lib, const char *symbol,
         return rv;
     }
     rv = injector_invoke(inj, lib, symbol, args, argc, out);
-    injector_detach(inj);
+    {
+        /* MAJOR 5: the detach result was discarded, so a failed munmap or
+         * PTRACE_DETACH after a successful invoke was reported as success.
+         * Propagate it, but never mask an earlier invoke error. */
+        int drv = injector_detach(inj);
+        if (rv == 0) {
+            rv = drv;
+            if (rv != 0 && out) {
+                const char *e = injector__tl_errmsg();
+                snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : "");
+            }
+        }
+    }
     return rv;
 }

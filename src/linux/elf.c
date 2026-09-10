@@ -40,11 +40,44 @@
 #define Elf_Ehdr Elf64_Ehdr
 #define Elf_Shdr Elf64_Shdr
 #define Elf_Sym Elf64_Sym
+#define Elf_Phdr Elf64_Phdr
 #else
 #define Elf_Ehdr Elf32_Ehdr
 #define Elf_Shdr Elf32_Shdr
 #define Elf_Sym Elf32_Sym
+#define Elf_Phdr Elf32_Phdr
 #endif
+
+/* Bounds for the attacker-controlled "entry size" fields of an ELF file.
+ * A 64-bit injector may legitimately read 32-bit ELF objects and vice versa,
+ * but nothing else: read_elf_shdr()/read_elf_sym()/read_elf_phdr() write into
+ * fixed-size Elf*_Shdr/Sym/Phdr buffers, so a bigger entry size would smash
+ * the stack or the heap. On ILP32 the minimum and the maximum are the same. */
+#define ELF_SHDR_SIZE_MIN ((size_t)sizeof(Elf32_Shdr))
+#define ELF_SHDR_SIZE_MAX ((size_t)sizeof(Elf_Shdr))
+#define ELF_SYM_SIZE_MIN  ((size_t)sizeof(Elf32_Sym))
+#define ELF_SYM_SIZE_MAX  ((size_t)sizeof(Elf_Sym))
+#define ELF_PHDR_SIZE_MIN ((size_t)sizeof(Elf32_Phdr))
+#define ELF_PHDR_SIZE_MAX ((size_t)sizeof(Elf_Phdr))
+
+/* "Does this 64-bit ELF field fit in a size_t?"
+ *
+ * On a 32-bit size_t that is a real check, because the ELF64 fields are wider
+ * than size_t. On a 64-bit size_t it is a tautology - and spelling it as a
+ * comparison makes -Wtype-limits (implied by -Wextra) reject the build, which
+ * matters because this project builds with -Werror and CI compiles the library
+ * for i386 and x32 as well as x86_64. Hiding the tautological case behind the
+ * preprocessor keeps the check where it is meaningful and the build clean
+ * everywhere. */
+static int elf_u64_fits_size_t(uint64_t v)
+{
+#if SIZE_MAX >= UINT64_MAX
+    (void)v;
+    return 1;
+#else
+    return v <= (uint64_t)SIZE_MAX;
+#endif
+}
 
 // #define INJECTOR_DEBUG_ELF_C 1
 
@@ -62,7 +95,13 @@ static FILE *fopen_with_ino(const char *path, dev_t dev, ino_t ino);
 static int read_elf_ehdr(FILE *fp, Elf_Ehdr *ehdr);
 static int read_elf_shdr(FILE *fp, Elf_Shdr *shdr, size_t shdr_size);
 static int read_elf_sym(FILE *fp, Elf_Sym *sym, size_t sym_size);
-static int locate_dynsym(FILE *fp, const Elf_Ehdr *ehdr, size_t *str_off, size_t *str_sz, size_t *sym_off, size_t *sym_num, size_t *sym_entsize);
+static int read_elf_phdr(FILE *fp, Elf_Phdr *phdr, size_t phdr_size);
+static int locate_dynsym(FILE *fp, const Elf_Ehdr *ehdr, uint64_t fsize, size_t *str_off, size_t *str_sz, size_t *sym_off, size_t *sym_num, size_t *sym_entsize);
+static int elf_file_size(FILE *fp, uint64_t *size_out);
+static int elf_seek(FILE *fp, uint64_t offset);
+static int elf_range_in_file(uint64_t off, uint64_t len, uint64_t fsize);
+static int validate_elf_layout(FILE *fp, const Elf_Ehdr *ehdr, uint64_t *fsize_out);
+static int section_name_is(FILE *fp, uint64_t strtab_off, uint64_t strtab_size, uint64_t name_off, const char *want);
 
 int injector__collect_libc_information(injector_t *injector)
 {
@@ -83,7 +122,32 @@ int injector__collect_libc_information(injector_t *injector)
         goto cleanup;
     }
 
-    injector->code_addr = libc_addr + ehdr.e_entry;
+    /* Reject a hostile header before it is used to compute any file offset. */
+    rv = validate_elf_layout(fp, &ehdr, NULL);
+    if (rv != 0) {
+        goto cleanup;
+    }
+
+    /* The meaning of e_entry depends on e_type: for ET_DYN (PIE executable or
+     * shared object) it is relative to the load base, for ET_EXEC it is an
+     * absolute virtual address. Anything else cannot be injected into. */
+    switch (ehdr.e_type) {
+    case ET_DYN:
+        if ((uint64_t)ehdr.e_entry > (uint64_t)SIZE_MAX - (uint64_t)libc_addr) {
+            injector__set_errmsg("invalid ELF entry point: 0x%" PRIx64, (uint64_t)ehdr.e_entry);
+            rv = INJERR_INVALID_ELF_FORMAT;
+            goto cleanup;
+        }
+        injector->code_addr = libc_addr + (size_t)ehdr.e_entry;
+        break;
+    case ET_EXEC:
+        injector->code_addr = (size_t)ehdr.e_entry;
+        break;
+    default:
+        injector__set_errmsg("Invalid ELF type: %u", (unsigned int)ehdr.e_type);
+        rv = INJERR_INVALID_ELF_FORMAT;
+        goto cleanup;
+    }
 
     switch (ehdr.e_machine) {
     case EM_X86_64:
@@ -312,6 +376,7 @@ int injector__elf_find_symbols(const char *path, size_t libc_addr,
     FILE *fp;
     Elf_Ehdr ehdr;
     size_t str_offset = 0, str_size = 0, sym_offset = 0, sym_num = 0, sym_entsize = 0;
+    uint64_t fsize = 0;
     char *str = NULL;
     Elf_Sym *syms = NULL;
     int rv = 0;
@@ -328,38 +393,68 @@ int injector__elf_find_symbols(const char *path, size_t libc_addr,
         goto cleanup;
     }
 
-    rv = locate_dynsym(fp, &ehdr, &str_offset, &str_size, &sym_offset, &sym_num, &sym_entsize);
+    /* Validate every header field used for offsets/sizes exactly once, before
+     * any seek or read below. */
+    rv = validate_elf_layout(fp, &ehdr, &fsize);
     if (rv != 0) {
         goto cleanup;
     }
 
-    if (str_offset == 0 || str_size == 0 || sym_offset == 0 || sym_entsize == 0) {
+    rv = locate_dynsym(fp, &ehdr, fsize, &str_offset, &str_size, &sym_offset, &sym_num, &sym_entsize);
+    if (rv != 0) {
+        goto cleanup;
+    }
+
+    if (str_offset == 0 || str_size == 0 || sym_offset == 0 || sym_entsize == 0 || sym_num == 0) {
         injector__set_errmsg("failed to find the .dynstr and .dynsym sections.");
         rv = INJERR_INVALID_ELF_FORMAT;
         goto cleanup;
     }
 
-    /* Read .dynstr into a heap buffer once. */
-    str = malloc(str_size);
+    /* Neither the string table nor the symbol table can legitimately be larger
+     * than the file itself; locate_dynsym() already enforced that. Re-check it
+     * here so that the two allocations below can never be driven by an
+     * unbounded, file-controlled size. */
+    if ((uint64_t)str_size > fsize ||
+        (uint64_t)sym_num > fsize / ELF_SYM_SIZE_MIN ||
+        (uint64_t)sym_offset > fsize) {
+        injector__set_errmsg("invalid .dynstr/.dynsym size.");
+        rv = INJERR_INVALID_ELF_FORMAT;
+        goto cleanup;
+    }
+
+    /* Read .dynstr into a heap buffer once. One extra byte is allocated and
+     * forced to NUL, so that every strcmp() below stays inside the buffer even
+     * when the file's string table has no trailing NUL byte. */
+    if (str_size > (size_t)SIZE_MAX - 1) {
+        rv = INJERR_NO_MEMORY;
+        goto cleanup;
+    }
+    str = malloc(str_size + 1);
     if (str == NULL) {
         rv = INJERR_NO_MEMORY;
         goto cleanup;
     }
-    if (fseek(fp, str_offset, SEEK_SET) != 0 ||
+    if (elf_seek(fp, str_offset) != 0 ||
         fread(str, 1, str_size, fp) != str_size) {
         injector__set_errmsg("failed to read .dynstr.");
         rv = INJERR_INVALID_ELF_FORMAT;
         goto cleanup;
     }
+    str[str_size] = '\0';
 
     /* Read .dynsym into a heap buffer of Elf_Sym (read_elf_sym handles 32->64
      * conversion on LP64). */
+    if (sym_num > (size_t)SIZE_MAX / sizeof(Elf_Sym)) {
+        rv = INJERR_NO_MEMORY;
+        goto cleanup;
+    }
     syms = malloc(sym_num * sizeof(Elf_Sym));
     if (syms == NULL) {
         rv = INJERR_NO_MEMORY;
         goto cleanup;
     }
-    if (fseek(fp, sym_offset, SEEK_SET) != 0) {
+    if (elf_seek(fp, sym_offset) != 0) {
         injector__set_errmsg("failed to seek .dynsym.");
         rv = INJERR_INVALID_ELF_FORMAT;
         goto cleanup;
@@ -376,7 +471,13 @@ int injector__elf_find_symbols(const char *path, size_t libc_addr,
         addrs[i] = 0;
     }
     for (k = 0; k < sym_num; k++) {
-        size_t nm_off = syms[k].st_name;
+        size_t nm_off = (size_t)syms[k].st_name;
+        /* An undefined symbol (an import) or a symbol without an address is
+         * not a usable function: reporting it as found would make the caller
+         * jump to libc_addr + 0 inside the target process. */
+        if (syms[k].st_shndx == SHN_UNDEF || syms[k].st_value == 0) {
+            continue;
+        }
         if (nm_off == 0 || nm_off >= str_size) {
             continue;
         }
@@ -385,7 +486,7 @@ int injector__elf_find_symbols(const char *path, size_t libc_addr,
                 continue;
             }
             if (strcmp(str + nm_off, names[i]) == 0) {
-                addrs[i] = libc_addr + syms[k].st_value;
+                addrs[i] = libc_addr + (size_t)syms[k].st_value;
             }
         }
     }
@@ -530,7 +631,11 @@ static int open_libc(FILE **fp_out, char *path_out, size_t path_out_sz, const ch
         }
     }
 #undef RECORD_WINNER
-    injector__set_errmsg("failed to open %s. (dev:0x%" PRIx64 ", ino:%lu)", path, dev, ino);
+    /* dev_t/ino_t widths differ per ABI (on x32 ino_t is `unsigned long long`
+     * while %lu expects `unsigned long`), so cast explicitly and use the
+     * PRI*64 macros: this used to break the -Werror x32 build. */
+    injector__set_errmsg("failed to open %s. (dev:0x%" PRIx64 ", ino:%" PRIu64 ")",
+                         path, (uint64_t)dev, (uint64_t)ino);
     return INJERR_NO_LIBRARY;
 }
 
@@ -634,8 +739,158 @@ static int read_elf_ehdr(FILE *fp, Elf_Ehdr *ehdr)
     return 0;
 }
 
+/* Return the size of the file behind `fp` without disturbing the read
+ * position. Returns 0 on success, -1 when the size cannot be determined. */
+static int elf_file_size(FILE *fp, uint64_t *size_out)
+{
+    struct stat sbuf;
+    fpos_t pos;
+    long sz;
+
+    if (fstat(fileno(fp), &sbuf) == 0 && S_ISREG(sbuf.st_mode) && sbuf.st_size > 0) {
+        *size_out = (uint64_t)sbuf.st_size;
+        return 0;
+    }
+    /* Not a regular file (or an fstat-less stream such as fmemopen): ask the
+     * stream itself. */
+    if (fgetpos(fp, &pos) != 0 || fseek(fp, 0, SEEK_END) != 0) {
+        return -1;
+    }
+    sz = ftell(fp);
+    if (fsetpos(fp, &pos) != 0 || sz < 0) {
+        return -1;
+    }
+    *size_out = (uint64_t)sz;
+    return 0;
+}
+
+/* fseek() with a 64-bit, file-controlled offset. Returns 0 on success. */
+static int elf_seek(FILE *fp, uint64_t offset)
+{
+    if (offset > (uint64_t)LONG_MAX) {
+        return -1;
+    }
+    return fseek(fp, (long)offset, SEEK_SET);
+}
+
+/* True when [off, off+len) lies entirely inside a file of `fsize` bytes.
+ * Written so that it cannot overflow for any input. */
+static int elf_range_in_file(uint64_t off, uint64_t len, uint64_t fsize)
+{
+    if (off > fsize) {
+        return 0;
+    }
+    if (len > fsize - off) {
+        return 0;
+    }
+    return 1;
+}
+
+/* Validate every attacker-controlled ELF header field that is later used to
+ * compute a file offset or a buffer size. Called exactly once, right after
+ * read_elf_ehdr() and before any seek/read of section or program headers.
+ * `fsize_out` (optional) receives the file size. */
+static int validate_elf_layout(FILE *fp, const Elf_Ehdr *ehdr, uint64_t *fsize_out)
+{
+    uint64_t fsize;
+
+    if (elf_file_size(fp, &fsize) != 0) {
+        injector__set_errmsg("failed to get the size of the ELF file.");
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+    if (fsize_out != NULL) {
+        *fsize_out = fsize;
+    }
+    if (fsize < sizeof(Elf_Ehdr)) {
+        injector__set_errmsg("the file is too small to be an ELF file.");
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+
+    if (ehdr->e_shoff != 0 && ehdr->e_shnum != 0) {
+        /* e_shentsize drives an fread() into a fixed-size Elf_Shdr: a value
+         * outside [sizeof(Elf32_Shdr), sizeof(Elf_Shdr)] would smash it. */
+        if ((size_t)ehdr->e_shentsize < ELF_SHDR_SIZE_MIN ||
+            (size_t)ehdr->e_shentsize > ELF_SHDR_SIZE_MAX) {
+            injector__set_errmsg("invalid section header entry size: %u",
+                                 (unsigned int)ehdr->e_shentsize);
+            return INJERR_INVALID_ELF_FORMAT;
+        }
+        if (ehdr->e_shstrndx >= ehdr->e_shnum) {
+            injector__set_errmsg("invalid section header string table index: %u (e_shnum: %u)",
+                                 (unsigned int)ehdr->e_shstrndx, (unsigned int)ehdr->e_shnum);
+            return INJERR_INVALID_ELF_FORMAT;
+        }
+        /* All arithmetic in uint64_t: e_shnum and e_shentsize are uint16_t and
+         * would overflow int when multiplied. */
+        if (!elf_range_in_file((uint64_t)ehdr->e_shoff,
+                               (uint64_t)ehdr->e_shnum * (uint64_t)ehdr->e_shentsize, fsize)) {
+            injector__set_errmsg("the section header table is out of the file.");
+            return INJERR_INVALID_ELF_FORMAT;
+        }
+    }
+
+    if (ehdr->e_phoff != 0 && ehdr->e_phnum != 0) {
+        if ((size_t)ehdr->e_phentsize < ELF_PHDR_SIZE_MIN ||
+            (size_t)ehdr->e_phentsize > ELF_PHDR_SIZE_MAX) {
+            injector__set_errmsg("invalid program header entry size: %u",
+                                 (unsigned int)ehdr->e_phentsize);
+            return INJERR_INVALID_ELF_FORMAT;
+        }
+        if (!elf_range_in_file((uint64_t)ehdr->e_phoff,
+                               (uint64_t)ehdr->e_phnum * (uint64_t)ehdr->e_phentsize, fsize)) {
+            injector__set_errmsg("the program header table is out of the file.");
+            return INJERR_INVALID_ELF_FORMAT;
+        }
+    }
+    return 0;
+}
+
+/* Exact full-name match of a section name in the section header string table.
+ * The previous fgets(buf, 8)/strcmp() pair accepted any 7-character prefix, so
+ * ".dynstrXXX" or ".dynsymx" were mistaken for the real sections.
+ * Returns 1 on match, 0 on no match, -1 on an I/O error. */
+static int section_name_is(FILE *fp, uint64_t strtab_off, uint64_t strtab_size,
+                           uint64_t name_off, const char *want)
+{
+    char buf[16];
+    size_t wantlen = strlen(want);
+    fpos_t pos;
+    int rv = 0;
+
+    if (wantlen == 0 || wantlen >= sizeof(buf)) {
+        return 0;
+    }
+    /* The name and its terminating NUL must lie inside the string table. */
+    if (name_off >= strtab_size || wantlen + 1 > strtab_size - name_off) {
+        return 0;
+    }
+    if (fgetpos(fp, &pos) != 0) {
+        return -1;
+    }
+    if (elf_seek(fp, strtab_off + name_off) != 0) {
+        rv = (fsetpos(fp, &pos) == 0) ? 0 : -1;
+        return rv;
+    }
+    if (fread(buf, 1, wantlen, fp) == wantlen && memcmp(buf, want, wantlen) == 0) {
+        if (fgetc(fp) == '\0') {
+            rv = 1;
+        }
+    }
+    if (fsetpos(fp, &pos) != 0) {
+        return -1;
+    }
+    return rv;
+}
+
 static int read_elf_shdr(FILE *fp, Elf_Shdr *shdr, size_t shdr_size)
 {
+    /* shdr_size is the file's e_shentsize. It must fit into the caller's
+     * fixed-size buffer, otherwise fread() smashes the stack or the heap. */
+    if (shdr_size < ELF_SHDR_SIZE_MIN || shdr_size > sizeof(*shdr)) {
+        injector__set_errmsg("invalid section header entry size: %lu", (unsigned long)shdr_size);
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+    memset(shdr, 0, sizeof(*shdr));
     if (fread(shdr, shdr_size, 1, fp) != 1) {
         injector__set_errmsg("failed to read a section header. (error: %s)", strerror(errno));
         return INJERR_INVALID_ELF_FORMAT;
@@ -660,6 +915,13 @@ static int read_elf_shdr(FILE *fp, Elf_Shdr *shdr, size_t shdr_size)
 
 static int read_elf_sym(FILE *fp, Elf_Sym *sym, size_t sym_size)
 {
+    /* sym_size is the file's .dynsym sh_entsize: bound it by the caller's
+     * fixed-size Elf_Sym buffer before reading. */
+    if (sym_size < ELF_SYM_SIZE_MIN || sym_size > sizeof(*sym)) {
+        injector__set_errmsg("invalid symbol table entry size: %lu", (unsigned long)sym_size);
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+    memset(sym, 0, sizeof(*sym));
     if (fread(sym, sym_size, 1, fp) != 1) {
         injector__set_errmsg("failed to read a symbol table entry. (error: %s)", strerror(errno));
         return INJERR_INVALID_ELF_FORMAT;
@@ -678,60 +940,126 @@ static int read_elf_sym(FILE *fp, Elf_Sym *sym, size_t sym_size)
     return 0;
 }
 
+static int read_elf_phdr(FILE *fp, Elf_Phdr *phdr, size_t phdr_size)
+{
+    if (phdr_size < ELF_PHDR_SIZE_MIN || phdr_size > sizeof(*phdr)) {
+        injector__set_errmsg("invalid program header entry size: %lu", (unsigned long)phdr_size);
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+    memset(phdr, 0, sizeof(*phdr));
+    if (fread(phdr, phdr_size, 1, fp) != 1) {
+        injector__set_errmsg("failed to read a program header. (error: %s)", strerror(errno));
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+#ifdef __LP64__
+    if (phdr_size == sizeof(Elf32_Phdr)) {
+        Elf32_Phdr phdr32 = *(Elf32_Phdr *)phdr;
+        phdr->p_type = phdr32.p_type;
+        phdr->p_offset = phdr32.p_offset;
+        phdr->p_vaddr = phdr32.p_vaddr;
+        phdr->p_paddr = phdr32.p_paddr;
+        phdr->p_filesz = phdr32.p_filesz;
+        phdr->p_memsz = phdr32.p_memsz;
+        phdr->p_flags = phdr32.p_flags;
+        phdr->p_align = phdr32.p_align;
+    }
+#endif
+    return 0;
+}
+
 /* Locate the .dynstr and .dynsym section offsets/sizes by scanning the
  * section header table. Mirrors the logic that used to live inline in
  * injector__collect_libc_information. */
-static int locate_dynsym(FILE *fp, const Elf_Ehdr *ehdr, size_t *str_off, size_t *str_sz, size_t *sym_off, size_t *sym_num, size_t *sym_entsize)
+static int locate_dynsym(FILE *fp, const Elf_Ehdr *ehdr, uint64_t fsize, size_t *str_off, size_t *str_sz, size_t *sym_off, size_t *sym_num, size_t *sym_entsize)
 {
     Elf_Shdr shdr;
-    size_t shstrtab_offset;
-    int idx;
+    uint64_t shstrtab_offset;
+    uint64_t shstrtab_size;
+    uint64_t shstrtab_hdr_off;
+    uint32_t idx;
     int rv;
 
     *str_off = *str_sz = *sym_off = *sym_num = *sym_entsize = 0;
 
-    if (fseek(fp, ehdr->e_shoff + ehdr->e_shstrndx * ehdr->e_shentsize, SEEK_SET) != 0) {
+    if (ehdr->e_shoff == 0 || ehdr->e_shnum == 0 || ehdr->e_shentsize == 0) {
+        injector__set_errmsg("failed to find the .dynstr and .dynsym sections.");
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+
+    /* Everything below is uint64_t arithmetic on purpose: e_shstrndx and
+     * e_shentsize are uint16_t, so `e_shstrndx * e_shentsize` used to be
+     * computed in `int` and overflowed (65535 * 65535). */
+    shstrtab_hdr_off = (uint64_t)ehdr->e_shoff + (uint64_t)ehdr->e_shstrndx * (uint64_t)ehdr->e_shentsize;
+    if (!elf_range_in_file(shstrtab_hdr_off, (uint64_t)ehdr->e_shentsize, fsize)) {
+        injector__set_errmsg("the section header string table is out of the file.");
+        return INJERR_INVALID_ELF_FORMAT;
+    }
+    if (elf_seek(fp, shstrtab_hdr_off) != 0) {
         injector__set_errmsg("failed to seek the section header string table.");
         return INJERR_INVALID_ELF_FORMAT;
     }
-    rv = read_elf_shdr(fp, &shdr, ehdr->e_shentsize);
+    rv = read_elf_shdr(fp, &shdr, (size_t)ehdr->e_shentsize);
     if (rv != 0) {
         return rv;
     }
-    shstrtab_offset = shdr.sh_offset;
+    shstrtab_offset = (uint64_t)shdr.sh_offset;
+    shstrtab_size = (uint64_t)shdr.sh_size;
+    if (!elf_range_in_file(shstrtab_offset, shstrtab_size, fsize)) {
+        injector__set_errmsg("the section header string table is out of the file.");
+        return INJERR_INVALID_ELF_FORMAT;
+    }
 
-    if (fseek(fp, ehdr->e_shoff, SEEK_SET) != 0) {
+    if (elf_seek(fp, (uint64_t)ehdr->e_shoff) != 0) {
         injector__set_errmsg("failed to seek the section header table.");
         return INJERR_INVALID_ELF_FORMAT;
     }
-    for (idx = 0; idx < ehdr->e_shnum; idx++) {
-        fpos_t pos;
-        char buf[8];
+    for (idx = 0; idx < (uint32_t)ehdr->e_shnum; idx++) {
+        int matched;
 
-        rv = read_elf_shdr(fp, &shdr, ehdr->e_shentsize);
+        rv = read_elf_shdr(fp, &shdr, (size_t)ehdr->e_shentsize);
         if (rv != 0) {
             return rv;
         }
         switch (shdr.sh_type) {
         case SHT_STRTAB:
-            fgetpos(fp, &pos);
-            fseek(fp, shstrtab_offset + shdr.sh_name, SEEK_SET);
-            fgets(buf, sizeof(buf), fp);
-            fsetpos(fp, &pos);
-            if (strcmp(buf, ".dynstr") == 0) {
-                *str_off = shdr.sh_offset;
-                *str_sz = shdr.sh_size;
+            matched = section_name_is(fp, shstrtab_offset, shstrtab_size,
+                                      (uint64_t)shdr.sh_name, ".dynstr");
+            if (matched < 0) {
+                injector__set_errmsg("failed to read a section name.");
+                return INJERR_INVALID_ELF_FORMAT;
+            }
+            if (matched == 1 &&
+                elf_range_in_file((uint64_t)shdr.sh_offset, (uint64_t)shdr.sh_size, fsize) &&
+                elf_u64_fits_size_t((uint64_t)shdr.sh_size)) {
+                *str_off = (size_t)shdr.sh_offset;
+                *str_sz = (size_t)shdr.sh_size;
             }
             break;
         case SHT_DYNSYM:
-            fgetpos(fp, &pos);
-            fseek(fp, shstrtab_offset + shdr.sh_name, SEEK_SET);
-            fgets(buf, sizeof(buf), fp);
-            fsetpos(fp, &pos);
-            if (strcmp(buf, ".dynsym") == 0) {
-                *sym_off = shdr.sh_offset;
-                *sym_entsize = shdr.sh_entsize;
-                *sym_num = shdr.sh_size / shdr.sh_entsize;
+            matched = section_name_is(fp, shstrtab_offset, shstrtab_size,
+                                      (uint64_t)shdr.sh_name, ".dynsym");
+            if (matched < 0) {
+                injector__set_errmsg("failed to read a section name.");
+                return INJERR_INVALID_ELF_FORMAT;
+            }
+            if (matched == 1 &&
+                elf_range_in_file((uint64_t)shdr.sh_offset, (uint64_t)shdr.sh_size, fsize)) {
+                uint64_t entsize = (uint64_t)shdr.sh_entsize;
+                /* Reject sh_entsize == 0 (and any other out-of-range value)
+                 * BEFORE dividing by it: the old code raised SIGFPE here, and
+                 * read_elf_sym() would have overflowed its Elf_Sym buffer. */
+                if (entsize < (uint64_t)ELF_SYM_SIZE_MIN || entsize > (uint64_t)ELF_SYM_SIZE_MAX) {
+                    injector__set_errmsg("invalid .dynsym entry size: %" PRIu64, entsize);
+                    return INJERR_INVALID_ELF_FORMAT;
+                }
+                if (!elf_u64_fits_size_t((uint64_t)shdr.sh_offset) ||
+                    !elf_u64_fits_size_t(shdr.sh_size / entsize)) {
+                    injector__set_errmsg("the .dynsym section is too large.");
+                    return INJERR_INVALID_ELF_FORMAT;
+                }
+                *sym_off = (size_t)shdr.sh_offset;
+                *sym_entsize = (size_t)entsize;
+                *sym_num = (size_t)(shdr.sh_size / entsize);
             }
             break;
         }
@@ -739,7 +1067,7 @@ static int locate_dynsym(FILE *fp, const Elf_Ehdr *ehdr, size_t *str_off, size_t
             break;
         }
     }
-    if (idx == ehdr->e_shnum) {
+    if (idx == (uint32_t)ehdr->e_shnum) {
         injector__set_errmsg("failed to find the .dynstr and .dynsym sections.");
         return INJERR_INVALID_ELF_FORMAT;
     }
@@ -774,6 +1102,7 @@ int injector__elf_load_bias(const char *path, size_t map_start, size_t *bias_out
 {
     FILE *fp;
     Elf_Ehdr ehdr;
+    size_t bias = 0;
     int rv;
 
     fp = fopen(path, "rb");
@@ -782,18 +1111,44 @@ int injector__elf_load_bias(const char *path, size_t map_start, size_t *bias_out
         return INJERR_FILE_NOT_FOUND;
     }
     rv = read_elf_ehdr(fp, &ehdr);
-    fclose(fp);
     if (rv != 0) {
+        fclose(fp);
         return rv;
     }
     /* ET_EXEC: symbol values are absolute virtual addresses; the mapping is
      * already at the ELF link base, so no bias is added.
      * ET_DYN (PIE executable or shared object): symbol values are relative to
-     * the first PT_LOAD (p_vaddr 0 in practice), so bias = mapping start. */
+     * the link base of the first PT_LOAD segment, whose p_vaddr is 0 in
+     * practice but is not guaranteed to be, so bias = map_start - p_vaddr.
+     * Any failure to read the program headers keeps the historical fallback
+     * (bias = map_start) instead of failing the whole attach. */
     if (ehdr.e_type == ET_DYN) {
-        *bias_out = map_start;
-    } else {
-        *bias_out = 0;
+        uint64_t fsize = 0;
+        bias = map_start;
+        if (ehdr.e_phoff != 0 && ehdr.e_phnum != 0 &&
+            (size_t)ehdr.e_phentsize >= ELF_PHDR_SIZE_MIN &&
+            (size_t)ehdr.e_phentsize <= ELF_PHDR_SIZE_MAX &&
+            elf_file_size(fp, &fsize) == 0 &&
+            elf_range_in_file((uint64_t)ehdr.e_phoff,
+                              (uint64_t)ehdr.e_phnum * (uint64_t)ehdr.e_phentsize, fsize) &&
+            elf_seek(fp, (uint64_t)ehdr.e_phoff) == 0) {
+            uint16_t i;
+            for (i = 0; i < ehdr.e_phnum; i++) {
+                Elf_Phdr phdr;
+                if (read_elf_phdr(fp, &phdr, (size_t)ehdr.e_phentsize) != 0) {
+                    break;
+                }
+                if (phdr.p_type != PT_LOAD) {
+                    continue;
+                }
+                if ((uint64_t)phdr.p_vaddr <= (uint64_t)map_start) {
+                    bias = map_start - (size_t)phdr.p_vaddr;
+                }
+                break;
+            }
+        }
     }
+    fclose(fp);
+    *bias_out = bias;
     return 0;
 }

@@ -197,9 +197,77 @@ typedef unsigned long user_reg_t;
 typedef unsigned long long user_reg_t;
 #elif defined(__i386__)
 typedef long user_reg_t;
+#elif defined(__x86_64__)
+/* x32: __x86_64__ is defined but __LP64__ is not (x32 is ILP32), so none of
+ * the branches above match even though user_regs_struct is the 64-bit one and
+ * the `#define eax rax` block at the top of this file makes regs.eax an
+ * unsigned long long. Without this branch user_reg_t would be a 32-bit
+ * `unsigned long` and `reg_return = &regs.eax` fails -Werror on `make x32`. */
+typedef unsigned long long user_reg_t;
 #else
 typedef unsigned long user_reg_t;
 #endif
+
+/* How many arguments the system call takes, for the syscalls this library
+ * issues itself (resolved at attach time into injector->sys_*). Reading six
+ * va_args when the caller passed two forwards indeterminate values as syscall
+ * arguments 3-6 - munmap takes two, mprotect three. Unknown numbers keep the
+ * historical six, so no existing caller changes behaviour. */
+static int syscall_arg_count(const injector_t *injector, long syscall_number)
+{
+    if (injector->sys_munmap != 0 && syscall_number == injector->sys_munmap) {
+        return 2;
+    }
+    if (injector->sys_mprotect != 0 && syscall_number == injector->sys_mprotect) {
+        return 3;
+    }
+    return 6; /* mmap and anything this file does not know about */
+}
+
+/* Same idea for the libc functions this library calls itself: dlerror(0),
+ * dlclose(1), dlopen(2), dlsym(2), clone(4). An arbitrary user function
+ * address (injector_remote_call / injector_invoke) cannot communicate its
+ * argument count through injector__call_function_va_list()'s signature, so it
+ * keeps the historical six; the reads stay in bounds because a SysV varargs
+ * caller always provides a six-slot register save area. */
+static int function_arg_count(const injector_t *injector, long function_addr)
+{
+    size_t a = (size_t)function_addr;
+
+    if (a == 0) {
+        return 6;
+    }
+    if (injector->dlerror_addr == a) {
+        return 0;
+    }
+    if (injector->dlclose_addr == a) {
+        return 1;
+    }
+    if (injector->dlopen_addr == a || injector->dlsym_addr == a) {
+        return 2;
+    }
+#ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+    if (injector->clone_addr == a) {
+        return 4;
+    }
+#endif
+    return 6;
+}
+
+/* Read exactly `nargs` varargs and zero the rest, so nothing indeterminate is
+ * ever forwarded to the target. */
+static void read_varargs(va_list ap, int nargs, long args[6])
+{
+    int i;
+
+    for (i = 0; i < 6; i++) {
+        if (i < nargs) {
+            args[i] = va_arg(ap, long);
+        } else {
+            args[i] = 0;
+        }
+    }
+}
 
 static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_struct *regs, code_t *code, size_t code_size);
 
@@ -219,7 +287,9 @@ int injector__call_syscall(const injector_t *injector, intptr_t *retval, long sy
     code_t code;
     size_t code_size;
     long arg1, arg2, arg3, arg4, arg5, arg6;
+    long sc_args[6];
     va_list ap;
+    int nargs;
     int rv;
 #if !defined(__mips__) && !defined(__powerpc__)
     user_reg_t *reg_return = NULL;
@@ -229,14 +299,16 @@ int injector__call_syscall(const injector_t *injector, intptr_t *retval, long sy
 #endif
 #endif
 
+    nargs = syscall_arg_count(injector, syscall_number);
     va_start(ap, syscall_number);
-    arg1 = va_arg(ap, long);
-    arg2 = va_arg(ap, long);
-    arg3 = va_arg(ap, long);
-    arg4 = va_arg(ap, long);
-    arg5 = va_arg(ap, long);
-    arg6 = va_arg(ap, long);
+    read_varargs(ap, nargs, sc_args);
     va_end(ap);
+    arg1 = sc_args[0];
+    arg2 = sc_args[1];
+    arg3 = sc_args[2];
+    arg4 = sc_args[3];
+    arg5 = sc_args[4];
+    arg6 = sc_args[5];
 
     DEBUG("injector__call_syscall:\n");
     DEBUG("  args: %ld, %lx, %lx, %lx, %lx, %lx, %lx\n", syscall_number, arg1, arg2, arg3, arg4, arg5, arg6);
@@ -509,6 +581,8 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
     code_t code;
     size_t code_size;
     long arg1, arg2, arg3, arg4, arg5, arg6;
+    long fc_args[6];
+    int nargs;
     int rv;
     user_reg_t *reg_return = NULL;
 #if defined(__aarch64__)
@@ -516,12 +590,14 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
     uint32_t *uregs = (uint32_t *)&regs;
 #endif
 
-    arg1 = va_arg(ap, long);
-    arg2 = va_arg(ap, long);
-    arg3 = va_arg(ap, long);
-    arg4 = va_arg(ap, long);
-    arg5 = va_arg(ap, long);
-    arg6 = va_arg(ap, long);
+    nargs = function_arg_count(injector, function_addr);
+    read_varargs(ap, nargs, fc_args);
+    arg1 = fc_args[0];
+    arg2 = fc_args[1];
+    arg3 = fc_args[2];
+    arg4 = fc_args[3];
+    arg5 = fc_args[4];
+    arg6 = fc_args[5];
 
     DEBUG("injector__call_function:\n");
     DEBUG("  args: %lx, %lx, %lx, %lx, %lx, %lx, %lx\n", function_addr, arg1, arg2, arg3, arg4, arg5, arg6);
@@ -717,7 +793,7 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
 #endif
     default:
         injector__set_errmsg("Unexpected architecture: %s", injector__arch2name(injector->arch));
-        return -1;
+        return INJERR_UNSUPPORTED_TARGET;
     }
 
     PRINT_REGS(injector, &regs);
@@ -741,23 +817,562 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
     return 0;
 }
 
-/* Restore the target's original registers and backup code. Called on every
- * exit path of kick_then_wait_sigtrap (success, failure, timeout, target death)
- * so the target is never left with hijacked state. Returns the passed-in rv.
- * The set_regs/write calls will fail with ESRCH once the target has died, but
- * that is harmless: the first (sticky) error message is already set. */
+/* ------------------------------------------------------------------------
+ * Per-handle waitpid protocol state.
+ *
+ * kick_then_wait_sigtrap() drives the tracee through a strict protocol: every
+ * PTRACE_CONT is matched by exactly one waitpid status for injector->pid. If we
+ * ever give up while the tracee is still running - because it could not be
+ * re-stopped after a timeout, because a foreign fatal signal was handed back to
+ * it, or because someone else reaped our status - that protocol is left
+ * desynchronised, and every later remote call on the same handle would consume
+ * a stale stop or never see its own. Such pids are remembered here so later
+ * calls fail fast with a clear message instead of corrupting the target.
+ *
+ * Thread-local storage: a handle is driven by one thread at a time, which is
+ * the same assumption util.c makes with injector__set_current(). A fresh
+ * attach clears the mark (see injector__attach_process in ptrace.c).
+ * ---------------------------------------------------------------------- */
+/* How long to wait for our SIGSTOP to be observed after a timeout, and how
+ * much longer to keep waiting when the target is in an uninterruptible /
+ * TASK_KILLABLE wait and therefore cannot be stopped yet (see handle_timeout). */
+#define STOP_GRACE_MS         2000L
+#define STOP_GRACE_EXTEND_MS  8000L
+
+#define DESYNC_SLOTS 8
+static __thread pid_t desync_pids[DESYNC_SLOTS];
+
+int injector__handle_is_desynced(pid_t pid)
+{
+    int i;
+    for (i = 0; i < DESYNC_SLOTS; i++) {
+        if (desync_pids[i] == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void injector__handle_mark_desynced(pid_t pid)
+{
+    int i;
+    if (pid == 0 || injector__handle_is_desynced(pid)) {
+        return;
+    }
+    for (i = 0; i < DESYNC_SLOTS; i++) {
+        if (desync_pids[i] == 0) {
+            desync_pids[i] = pid;
+            return;
+        }
+    }
+    desync_pids[0] = pid; /* table full: drop an entry rather than lose this one */
+}
+
+/* Called by injector__attach_process(): a new attach re-establishes the
+ * waitpid protocol from scratch, so forget any previous desync of this pid. */
+void injector__remote_call_reset(pid_t pid)
+{
+    int i;
+    for (i = 0; i < DESYNC_SLOTS; i++) {
+        if (desync_pids[i] == pid) {
+            desync_pids[i] = 0;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------------
+ * Poll granularity. The previous 1ms -> 50ms exponential backoff could add up
+ * to 50ms of stop latency to a single remote call, more than a small user
+ * timeout allows. 200us -> 5ms keeps the added latency far below any sensible
+ * timeout (cost: at most ~200 wakeups/second while waiting) and no sleep ever
+ * crosses the deadline.
+ * ---------------------------------------------------------------------- */
+#define POLL_MIN_NS 200000L   /* 200us */
+#define POLL_MAX_NS 5000000L  /* 5ms   */
+
+static void deadline_from_now(struct timespec *out, long ms)
+{
+    clock_gettime(CLOCK_MONOTONIC, out);
+    out->tv_sec += ms / 1000;
+    out->tv_nsec += (ms % 1000) * 1000000L;
+    if (out->tv_nsec >= 1000000000L) {
+        out->tv_sec++;
+        out->tv_nsec -= 1000000000L;
+    }
+}
+
+/* Nanoseconds left before `deadline`, 0 when it has passed. Clamped to 60s:
+ * callers only ever care about the near future. */
+static long remaining_ns(const struct timespec *deadline)
+{
+    struct timespec now;
+    long sec;
+    long ns;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    sec = deadline->tv_sec - now.tv_sec;
+    ns = deadline->tv_nsec - now.tv_nsec;
+    if (sec < 0 || (sec == 0 && ns <= 0)) {
+        return 0;
+    }
+    if (sec > 60) {
+        sec = 60;
+    }
+    return sec * 1000000000L + ns;
+}
+
+static void poll_sleep(long *backoff_ns, const struct timespec *deadline)
+{
+    long rem = remaining_ns(deadline);
+    long nap = *backoff_ns;
+    struct timespec ts;
+
+    if (*backoff_ns < POLL_MAX_NS) {
+        *backoff_ns *= 2;
+        if (*backoff_ns > POLL_MAX_NS) {
+            *backoff_ns = POLL_MAX_NS;
+        }
+    }
+    if (rem <= 0) {
+        return; /* let the caller observe the timeout immediately */
+    }
+    if (nap > rem) {
+        nap = rem;
+    }
+    ts.tv_sec = nap / 1000000000L;
+    ts.tv_nsec = nap % 1000000000L;
+    nanosleep(&ts, NULL);
+}
+
+/* Wait up to grace_ms for the tracee to stop.
+ *   > 0 : WSTOPSIG() of the observed stop
+ *     0 : still running when the grace period expired
+ *    -1 : the tracee exited or was killed (*exit_sig gets WTERMSIG, 0 if it exited)
+ *    -2 : the waitpid protocol is broken (ECHILD - e.g. the host process
+ *         installed a SIGCHLD handler reaping with wait(-1) and stole our
+ *         status, or another tracer took the tracee over) */
+static int wait_for_stop(pid_t pid, long grace_ms, int *exit_sig)
+{
+    struct timespec dl;
+    long backoff = POLL_MIN_NS;
+    int status;
+
+    if (exit_sig != NULL) {
+        *exit_sig = 0;
+    }
+    deadline_from_now(&dl, grace_ms);
+    for (;;) {
+        pid_t p = waitpid(pid, &status, WNOHANG);
+        if (p == pid) {
+            if (WIFSTOPPED(status)) {
+                return WSTOPSIG(status);
+            }
+            if (WIFSIGNALED(status) && exit_sig != NULL) {
+                *exit_sig = WTERMSIG(status);
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                return -1;
+            }
+            return -2;
+        }
+        if (p == -1) {
+            if (errno == EINTR) {
+                if (remaining_ns(&dl) <= 0) {
+                    return 0;
+                }
+                poll_sleep(&backoff, &dl);   /* no busy spin under a signal storm */
+                continue;
+            }
+            return -2;
+        }
+        if (remaining_ns(&dl) <= 0) {
+            return 0;
+        }
+        poll_sleep(&backoff, &dl);
+    }
+}
+
+/* Consume the death status of a tracee we just killed so that no stale waitpid
+ * status is left behind for a later call on this handle. Bounded to 1s. */
+static void reap_dead_tracee(pid_t pid)
+{
+    struct timespec dl;
+    long backoff = POLL_MIN_NS;
+    int status;
+
+    deadline_from_now(&dl, 1000);
+    while (remaining_ns(&dl) > 0) {
+        pid_t p = waitpid(pid, &status, WNOHANG);
+        if (p == pid) {
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                return;
+            }
+            /* still in a stop with SIGKILL pending: keep polling */
+        } else if (p == -1 && errno != EINTR) {
+            return; /* ECHILD: someone else reaped it */
+        }
+        poll_sleep(&backoff, &dl);
+    }
+}
+
+/* Signals a tracee may legitimately receive from the outside world while we
+ * are running a remote call in it (an exiting child, a terminal resize, a
+ * timer, ...). They are neither ours nor fatal-by-nature, so handing them back
+ * to the target and keeping waiting is what a debugger does; failing the call
+ * over them would make remote calls unusable in any process that has children.
+ * Job-control signals are deliberately absent: re-delivering them would just
+ * produce the same group-stop again. Fatal/hardware signals (SIGSEGV, SIGBUS,
+ * SIGILL, SIGFPE, SIGABRT, SIGSYS, ...) must still fail the call. */
+static int signal_is_benign(int sig)
+{
+    switch (sig) {
+    case SIGCHLD:
+    case SIGWINCH:
+    case SIGALRM:
+    case SIGVTALRM:
+    case SIGPROF:
+    case SIGURG:
+    case SIGIO:
+    case SIGUSR1:
+    case SIGUSR2:
+    case SIGPIPE:
+    case SIGHUP:
+    case SIGINT:
+    case SIGTERM:
+    case SIGQUIT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Is the tracee stopped exactly at the breakpoint instruction *we* wrote at
+ * injector->code_addr? A SIGTRAP from anywhere else (the target's own int3, a
+ * hardware watchpoint, another tracer's breakpoint) must not be mistaken for
+ * the completion of our remote call: its rax would otherwise be used as, say,
+ * an mmap base address. */
+static int stopped_at_our_break(const injector_t *injector, const struct user_regs_struct *regs, size_t *pc_out)
+{
+    int match;
+
+    *pc_out = 0;
+    switch (injector->arch) {
+#if defined(__x86_64__) && defined(__LP64__)
+    case ARCH_X86_64:
+    case ARCH_X86_64_X32:
+        /* `ff d0 cc` (call *%rax) or `0f 05 cc` (syscall): the `int3` sits at
+         * code_addr + 2. Measured on Linux 6.8/x86-64 the trap reports rip one
+         * past the `int3` (code_addr + 3, the convention gdb compensates for
+         * with decr_pc_after_break); accept both that and a kernel reporting
+         * rip at the `int3` itself, and reject everything else. */
+        *pc_out = (size_t)regs->rip;
+        match = (*pc_out == injector->code_addr + 3 || *pc_out == injector->code_addr + 2);
+        break;
+#endif
+#if defined(__x86_64__) || defined(__i386__)
+    case ARCH_I386:
+        *pc_out = (size_t)(regs->eip & 0xffffffffu);
+        match = (*pc_out == injector->code_addr + 3 || *pc_out == injector->code_addr + 2);
+        break;
+#endif
+#if defined(__aarch64__)
+    case ARCH_ARM64:
+        /* `blr x6; brk #0` */
+        *pc_out = (size_t)regs->pc;
+        match = (*pc_out == injector->code_addr + 4);
+        break;
+#endif
+#if defined(__aarch64__) || defined(__arm__)
+    case ARCH_ARM_EABI_THUMB:
+        /* `blx r4; <thumb breakinst>` */
+        *pc_out = (size_t)(((const uint32_t *)regs)[15] & ~(size_t)THUMB_MODE_BIT);
+        match = (*pc_out == injector->code_addr + 2);
+        break;
+    case ARCH_ARM_EABI:
+        /* `blx r4; <arm breakinst>` */
+        *pc_out = (size_t)(((const uint32_t *)regs)[15] & ~(size_t)THUMB_MODE_BIT);
+        match = (*pc_out == injector->code_addr + 4);
+        break;
+#endif
+#if defined(__mips__)
+    case ARCH_MIPS_64:
+    case ARCH_MIPS_N32:
+    case ARCH_MIPS_O32:
+        /* `jalr; or; syscall; break` */
+        *pc_out = (size_t)regs->cp0_epc;
+        match = (*pc_out == injector->code_addr + 12);
+        break;
+#endif
+#if defined(__powerpc__)
+    case ARCH_POWERPC:
+#ifdef __LP64__
+    case ARCH_POWERPC_64:
+#endif
+        /* `sc; trap` */
+        *pc_out = (size_t)regs->nip;
+        match = (*pc_out == injector->code_addr + 4);
+        break;
+#endif
+#if defined(__riscv)
+    case ARCH_RISCV_64:
+    case ARCH_RISCV_32:
+        /* `ecall; ebreak` */
+        *pc_out = (size_t)regs->pc;
+        match = (*pc_out == injector->code_addr + 4);
+        break;
+#endif
+    default:
+        /* An architecture this build cannot validate: accept the trap. */
+        return 1;
+    }
+    return match;
+}
+
+/* Restore the target's original registers - integer *and* FP/vector state, see
+ * injector__set_regs() - and its backup code, then PROVE the code is back by
+ * reading it out of the target again.
+ *
+ * Returns 0 only when both halves succeeded. *regs_rv / *code_rv / *regs_err /
+ * *code_err report the halves separately, because they fail for different
+ * reasons and matter differently:
+ *   - PTRACE_SETREGS needs a STOPPED tracee;
+ *   - the code restore goes through process_vm_writev() first and therefore
+ *     also works while the target is RUNNING (injector__write() additionally
+ *     falls back to PTRACE_POKETEXT word-by-word).
+ * A failed code restore leaves the `ff d0 cc` trampoline patched into the
+ * target's libc e_entry. A live process that later executes it takes a SIGTRAP
+ * with no tracer attached and dies - which panics the host if that process
+ * happens to be pid 1 - so it must never be reported as success.
+ *
+ * injector__set_errmsg() is sticky (first writer wins), so the restore runs
+ * with the handle detached from the message buffer (injector__set_current(NULL),
+ * the same mechanism injector.c uses) and the failures are returned instead:
+ * a cleanup-time error must not clobber the primary error the caller reports. */
+static int cleanup_restore_full(const injector_t *inj, size_t code_size,
+                                int *regs_rv, int *code_rv, int *regs_err, int *code_err)
+{
+    unsigned char readback[sizeof(code_t)];
+    int rrv;
+    int crv;
+
+    *regs_rv = 0;
+    *code_rv = 0;
+    *regs_err = 0;
+    *code_err = 0;
+    injector__set_current(NULL);
+    rrv = injector__set_regs(inj, &inj->regs);
+    if (rrv != 0) {
+        *regs_err = errno;
+    }
+    crv = injector__write(inj, inj->code_addr, &inj->backup_code, code_size);
+    if (crv != 0) {
+        /* process_vm_writev failed (EFAULT/EIO) and so did the POKETEXT
+         * fallback inside injector__write(): retry once - giving up here is
+         * what leaves a trampoline installed in a live process. */
+        *code_err = errno;
+        crv = injector__write(inj, inj->code_addr, &inj->backup_code, code_size);
+    }
+    if (crv == 0) {
+        memset(readback, 0, sizeof(readback));
+        if (injector__read(inj, inj->code_addr, readback, code_size) != 0) {
+            *code_err = errno;
+            crv = INJERR_OTHER;   /* cannot prove the trampoline is gone */
+        } else if (memcmp(readback, &inj->backup_code, code_size) != 0) {
+            *code_err = EIO;
+            crv = INJERR_OTHER;   /* wrote it, but the target does not show it */
+        }
+    } else {
+        *code_err = errno;
+    }
+    injector__set_current((injector_t *)inj);
+    *regs_rv = rrv;
+    *code_rv = crv;
+    return (rrv != 0) ? rrv : crv;
+}
+
+/* Called on every exit path of kick_then_wait_sigtrap (success, failure,
+ * timeout, target death) so the target is never left with hijacked state.
+ * Returns `rv` when the target was restored (or when a more important error
+ * already happened), otherwise the restore error: a failed restore must never
+ * be reported as success, that would leave the `ff d0 cc` trampoline patched
+ * into the target's libc e_entry and its registers hijacked.
+ *
+ * State left behind on return:
+ *   - rv == 0 and the restore worked : ATTACHED + STOPPED, original regs/code.
+ *   - restore failed                 : pid marked desynchronised; callers must
+ *                                      detach (and re-attach) to use it again. */
 static int cleanup_remote_call(const injector_t *inj, size_t code_size, int rv)
 {
-    injector__set_regs(inj, &inj->regs);
-    injector__write(inj, inj->code_addr, &inj->backup_code, code_size);
+    int regs_rv, code_rv, regs_err, code_err;
+    int cleanup_rv = cleanup_restore_full(inj, code_size, &regs_rv, &code_rv, &regs_err, &code_err);
+
+    if (cleanup_rv != 0) {
+        injector__handle_mark_desynced(inj->pid);
+        if (code_rv != 0 && kill(inj->pid, 0) == 0) {
+            /* Live process with a trampoline we could not verifiably remove:
+             * that outranks whatever else went wrong. */
+            injector__set_errmsg("the remote call's trampoline at %p in pid %d could NOT be restored and verified (%s); the target may still execute it",
+                                 (void *)inj->code_addr, inj->pid, strerror(code_err));
+            return code_rv;
+        }
+        if (rv == 0) {
+            injector__set_errmsg("remote call finished but the target's state could not be restored (pid %d): regs=%s code=%s",
+                                 inj->pid,
+                                 regs_rv != 0 ? strerror(regs_err) : "ok",
+                                 code_rv != 0 ? strerror(code_err) : "ok");
+            return cleanup_rv;
+        }
+    }
     return rv;
+}
+
+/* Timeout handling. Honours injector->timeout_action:
+ *
+ *  INJECTOR_TIMEOUT_LEAVE (default)
+ *      The tracee is RUNNING (we PTRACE_CONT'ed it), so it has to be stopped
+ *      again before its registers and code can be restored. PTRACE_INTERRUPT is
+ *      unusable here - the library attaches with PTRACE_ATTACH, not
+ *      PTRACE_SEIZE, and PTRACE_INTERRUPT returns EIO for an ATTACH tracee - so
+ *      send SIGSTOP instead. That is a ptrace control signal delivered to the
+ *      TARGET, not a handler installed in our own process, so the library stays
+ *      signal-handler-free (Go-runtime friendly).
+ *      On success the handle is left ATTACHED + STOPPED with the original
+ *      registers and code, INJERR_TIMEOUT is returned, and the caller's
+ *      injector_detach() munmaps and PTRACE_DETACHes normally: no mmap leak, no
+ *      stale flags, no hijacked code, and the target resumes at its original pc.
+ *
+ *  INJECTOR_TIMEOUT_KILL_THREAD
+ *      Terminate the thread that is stuck executing the hijacked code. Linux
+ *      has no per-thread SIGKILL - a SIGKILL sent to a single tid takes down
+ *      its whole thread group - so on the ptrace delivery path, where the
+ *      hijacked thread *is* a thread of the target, this terminates the target
+ *      process. (The clone/nonstop delivery path runs the hijack in a separate
+ *      CLONE_VM task that can be killed on its own; that timeout loop lives in
+ *      injector.c, not here.) The death status is reaped so no stale waitpid
+ *      status is left behind, and the handle is marked desynchronised.
+ */
+static int handle_timeout(const injector_t *injector, size_t code_size)
+{
+    int stop_sig;
+    int exit_sig = 0;
+    int regs_rv = 0, code_rv = 0, regs_err = 0, code_err = 0;
+    int restore_rv;
+
+    if (injector->timeout_action == INJECTOR_TIMEOUT_KILL_THREAD) {
+        if (kill(injector->pid, SIGKILL) != 0) {
+            int e = errno;
+            injector__set_errmsg("remote call timed out after %u ms; timeout_action=INJECTOR_TIMEOUT_KILL_THREAD but kill(pid %d, SIGKILL) failed: %s",
+                                 injector->call_timeout_ms, injector->pid, strerror(e));
+            injector__handle_mark_desynced(injector->pid);
+            return INJERR_TIMEOUT;
+        }
+        reap_dead_tracee(injector->pid);
+        injector__set_errmsg("remote call timed out after %u ms; timeout_action=INJECTOR_TIMEOUT_KILL_THREAD: sent SIGKILL to the hijacked thread (pid %d)",
+                             injector->call_timeout_ms, injector->pid);
+        injector__handle_mark_desynced(injector->pid);
+        return INJERR_TIMEOUT;
+    }
+
+    /* INJECTOR_TIMEOUT_LEAVE */
+    if (kill(injector->pid, SIGSTOP) != 0) {
+        int e = errno;
+        injector__set_errmsg("remote call timed out after %u ms; kill(pid %d, SIGSTOP) failed (%s), so the target could not be stopped to restore its state: it keeps running the hijacked code and its libc e_entry stays patched",
+                             injector->call_timeout_ms, injector->pid, strerror(e));
+        injector__handle_mark_desynced(injector->pid);
+        return INJERR_TIMEOUT;
+    }
+
+    /* Only SIGSTOP is positively ours; anything else did not come from us. */
+    stop_sig = wait_for_stop(injector->pid, STOP_GRACE_MS, &exit_sig);
+    if (stop_sig == 0) {
+        /* Still running. Without a stop the trampoline CANNOT be removed:
+         * injector__write() has to fall back to PTRACE_POKETEXT for libc's text
+         * page (process_vm_writev returns EFAULT on a file-backed r-x page -
+         * measured on Linux 6.8), and POKETEXT needs a stopped tracee. Leaving
+         * `ff d0 cc` behind in a live process is fatal for any process that
+         * later executes it, so keep waiting for our pending SIGSTOP to be
+         * delivered: a TASK_KILLABLE (vfork) or D-state wait ends eventually,
+         * and the alternative is to give up with the trampoline installed. */
+        stop_sig = wait_for_stop(injector->pid, STOP_GRACE_EXTEND_MS, &exit_sig);
+    }
+
+    if (stop_sig == SIGSTOP) {
+        /* Positively our own stop: the tracee is stopped, so restoring its
+         * registers and code is safe and the handle stays ATTACHED + STOPPED.
+         * cleanup_restore_full() also reads the code back out of the target to
+         * prove the trampoline is gone. */
+        restore_rv = cleanup_restore_full(injector, code_size, &regs_rv, &code_rv, &regs_err, &code_err);
+        if (restore_rv == 0) {
+            injector__set_errmsg("remote call timed out after %u ms", injector->call_timeout_ms);
+            return INJERR_TIMEOUT;
+        }
+        injector__handle_mark_desynced(injector->pid);
+        injector__set_errmsg("remote call timed out after %u ms and the target's state could not be fully restored (registers: %s; trampoline at %p: %s)",
+                             injector->call_timeout_ms,
+                             regs_rv != 0 ? strerror(regs_err) : "restored",
+                             (void *)injector->code_addr,
+                             code_rv != 0 ? strerror(code_err) : "restored and verified");
+        return INJERR_TIMEOUT;
+    }
+
+    if (stop_sig > 0) {
+        /* Stopped, but not by our SIGSTOP. The tracee being stopped makes the
+         * restore safe, so restore first - then hand the signal back instead of
+         * swallowing it: a SIGSEGV/SIGTRAP that is not ours must stay fatal. */
+        (void)cleanup_restore_full(injector, code_size, &regs_rv, &code_rv, &regs_err, &code_err);
+        injector__set_errmsg("remote call timed out after %u ms; while re-stopping, pid %d was stopped by signal %d (not our SIGSTOP). Registers: %s. Trampoline at %p: %s. Re-delivered signal %d; this handle is left desynchronised",
+                             injector->call_timeout_ms, injector->pid, stop_sig,
+                             regs_rv != 0 ? strerror(regs_err) : "restored",
+                             (void *)injector->code_addr,
+                             code_rv != 0 ? strerror(code_err) : "restored and verified",
+                             stop_sig);
+        (void)injector__ptrace(PTRACE_CONT, injector->pid, 0, stop_sig, "PTRACE_CONT");
+        injector__handle_mark_desynced(injector->pid);
+        return INJERR_TIMEOUT;
+    }
+
+    if (stop_sig == -1) {
+        injector__set_errmsg("remote call timed out after %u ms; pid %d terminated while being re-stopped%s%d",
+                             injector->call_timeout_ms, injector->pid,
+                             exit_sig != 0 ? " by signal " : " with exit code ", exit_sig);
+        injector__handle_mark_desynced(injector->pid);
+        return INJERR_TIMEOUT;
+    }
+
+    /* 0: never stopped even after the extended grace (TASK_KILLABLE /
+     * uninterruptible sleep), -2: our waitpid status was stolen. Nothing can be
+     * restored without a stop: PTRACE_SETREGS needs one, and so does the code
+     * restore, because injector__write() has to fall back to PTRACE_POKETEXT for
+     * libc's text page (process_vm_writev returns EFAULT on a file-backed r-x
+     * mapping - measured on Linux 6.8). Still attempt it, then report exactly
+     * what state the target is in: a leftover `ff d0 cc` in a live process is
+     * what kills any process that later executes libc's e_entry, so the caller
+     * must be told rather than handed INJERR_TIMEOUT alone. */
+    (void)cleanup_restore_full(injector, code_size, &regs_rv, &code_rv, &regs_err, &code_err);
+    injector__set_errmsg("remote call timed out after %u ms; could not re-stop pid %d within %ld ms (%s), so its registers could not be restored (%s). Trampoline at %p: %s. This handle is left desynchronised",
+                         injector->call_timeout_ms, injector->pid,
+                         STOP_GRACE_MS + STOP_GRACE_EXTEND_MS,
+                         stop_sig == -2 ? "the waitpid status was lost, e.g. a host SIGCHLD handler reaping with wait(-1) stole it"
+                                        : "uninterruptible/TASK_KILLABLE sleep",
+                         regs_rv != 0 ? strerror(regs_err) : "unexpectedly succeeded",
+                         (void *)injector->code_addr,
+                         code_rv != 0 ? strerror(code_err) : "removed and verified");
+    injector__handle_mark_desynced(injector->pid);
+    return INJERR_TIMEOUT;
 }
 
 static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_struct *regs, code_t *code, size_t code_size)
 {
+    struct timespec deadline;
     int status;
     int rv;
-    long backoff_ns = 1000000;  /* start at 1ms, grow to 50ms cap */
+    long backoff_ns = POLL_MIN_NS;
+
+    if (injector__handle_is_desynced(injector->pid)) {
+        injector__set_errmsg("remote call refused: an earlier call on this handle timed out and could not leave pid %d stopped, so the ptrace/waitpid protocol is out of sync. Detach and attach again.",
+                             injector->pid);
+        return INJERR_WAIT_TRACEE;
+    }
 
     rv = injector__set_regs(injector, regs);
     if (rv != 0) {
@@ -772,34 +1387,58 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
         return cleanup_remote_call(injector, code_size, rv);
     }
 
-    /* deadline = now + call_timeout_ms.
-     * Use CLOCK_MONOTONIC + polling waitpid(WNOHANG). NO SIGALRM (the library
-     * must remain signal-free so it can be used from a Go runtime). */
-    struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += injector->call_timeout_ms / 1000;
-    long add_ns = (long)(injector->call_timeout_ms % 1000) * 1000000L;
-    deadline.tv_nsec += add_ns;
-    if (deadline.tv_nsec >= 1000000000L) {
-        deadline.tv_sec++;
-        deadline.tv_nsec -= 1000000000L;
-    }
+    /* deadline = now + call_timeout_ms. CLOCK_MONOTONIC + polling
+     * waitpid(WNOHANG): no SIGALRM, the library must stay signal-free so it can
+     * be used from a Go runtime. */
+    deadline_from_now(&deadline, (long)injector->call_timeout_ms);
 
     for (;;) {
         pid_t pid = waitpid(injector->pid, &status, WNOHANG);
         if (pid == -1) {
             if (errno == EINTR) {
+                /* A signal interrupted waitpid. Honour the deadline and keep
+                 * the bounded sleep, otherwise a host/target delivering signals
+                 * at a high rate turns this into a busy spin that burns a core
+                 * and never observes the timeout. */
+                if (remaining_ns(&deadline) <= 0) {
+                    return handle_timeout(injector, code_size);
+                }
+                poll_sleep(&backoff_ns, &deadline);
                 continue;
             }
-            injector__set_errmsg("waitpid error: %s", strerror(errno));
+            /* ECHILD means our tracee status is gone: a host SIGCHLD handler
+             * reaping with wait(-1) stole it, or another tracer took over. */
+            injector__set_errmsg("waitpid error: %s%s", strerror(errno),
+                                 errno == ECHILD ? " (the tracee status was reaped by someone else, e.g. a host SIGCHLD handler using wait(-1))" : "");
+            injector__handle_mark_desynced(injector->pid);
             return cleanup_remote_call(injector, code_size, INJERR_WAIT_TRACEE);
         }
         if (pid == injector->pid) {
             if (WIFSTOPPED(status)) {
                 switch (WSTOPSIG(status)) {
-                case SIGTRAP:
+                case SIGTRAP: {
+                    size_t trap_pc = 0;
+                    int ours;
                     rv = injector__get_regs(injector, regs);
-                    return cleanup_remote_call(injector, code_size, rv);
+                    if (rv != 0) {
+                        return cleanup_remote_call(injector, code_size, rv);
+                    }
+                    ours = stopped_at_our_break(injector, regs, &trap_pc);
+                    if (ours) {
+                        return cleanup_remote_call(injector, code_size, 0);
+                    }
+                    /* Not our breakpoint: the target's own int3, a hardware
+                     * watchpoint or another tracer. Its rax must not be used as
+                     * the result of our call - hand SIGTRAP back to the target
+                     * and keep waiting, bounded by the timeout. */
+                    DEBUG("ignoring a SIGTRAP that is not ours (pc=%"SIZE_T_FMT"lx, expected %"SIZE_T_FMT"lx)\n",
+                          trap_pc, injector->code_addr + 2);
+                    rv = injector__ptrace(PTRACE_CONT, injector->pid, 0, SIGTRAP, "PTRACE_CONT");
+                    if (rv != 0) {
+                        return cleanup_remote_call(injector, code_size, rv);
+                    }
+                    break; /* keep waiting */
+                }
                 case SIGSTOP:
                     rv = injector__continue(injector);
                     if (rv != 0) {
@@ -823,6 +1462,15 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
                         }
                     }
 #endif
+                    if (signal_is_benign(WSTOPSIG(status))) {
+                        /* Not ours, not fatal: give it back to the target and
+                         * keep waiting for our own stop, bounded by the timeout. */
+                        rv = injector__ptrace(PTRACE_CONT, injector->pid, 0, WSTOPSIG(status), "PTRACE_CONT");
+                        if (rv != 0) {
+                            return cleanup_remote_call(injector, code_size, rv);
+                        }
+                        break; /* keep waiting */
+                    }
                     injector__set_errmsg("The target process unexpectedly stopped by signal %d.", WSTOPSIG(status));
                     return cleanup_remote_call(injector, code_size, INJERR_OTHER);
                 }
@@ -837,85 +1485,10 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
                 return cleanup_remote_call(injector, code_size, INJERR_OTHER);
             }
         }
-        /* pid == 0: child not yet changed state. Check the deadline. */
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > deadline.tv_sec ||
-            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
-            /* Timeout. The tracee is RUNNING (we PTRACE_CONT'd it), so we
-            * cannot set its regs / write its code until it is STOPPED again.
-            *
-            * PTRACE_INTERRUPT is the textbook tool, but it is unusable here:
-            * the library attaches with PTRACE_ATTACH, not PTRACE_SEIZE, and
-            * PTRACE_INTERRUPT against an ATTACH-tracee returns EIO (it is a
-            * seize-only request). Send SIGSTOP to the target instead. This is
-            * a ptrace control signal delivered to the TARGET, not a signal
-            * handler installed in the library's own process, so the library
-            * stays signal-handler-free (Go-runtime friendly) -- ptrace itself
-            * is signal-mediated, and the main wait loop already handles SIGSTOP.
-            *
-            * Once re-stopped, restore the original regs+code and return
-            * INJERR_TIMEOUT while still ATTACHED + STOPPED. The caller's
-            * injector_detach() then munmaps + PTRACE_DETACHes normally: the
-            * pending SIGSTOP is discarded by the PTRACE_CONT that runs the
-            * munmap syscall (or by PTRACE_DETACH if no munmap), so no mmap
-            * leak, no stale flags, no hijacked code left behind, and the
-            * target resumes at its original rip. */
-            if (kill(injector->pid, SIGSTOP) == 0) {
-                struct timespec stop_dl;
-                clock_gettime(CLOCK_MONOTONIC, &stop_dl);
-                stop_dl.tv_sec += 2;  /* 2s grace to observe the stop */
-                int stopped = 0;
-                for (;;) {
-                    int st2;
-                    pid_t p2 = waitpid(injector->pid, &st2, WNOHANG);
-                    if (p2 == injector->pid) {
-                        if (WIFSTOPPED(st2)) {
-                            stopped = 1;
-                            break;
-                        } else if (WIFEXITED(st2)) {
-                            injector__set_errmsg("The target process unexpectedly terminated with exit code %d.", WEXITSTATUS(st2));
-                            return cleanup_remote_call(injector, code_size, INJERR_OTHER);
-                        } else if (WIFSIGNALED(st2)) {
-                            injector__set_errmsg("The target process unexpectedly terminated by signal %d.", WTERMSIG(st2));
-                            return cleanup_remote_call(injector, code_size, INJERR_OTHER);
-                        } else {
-                            break;  /* unexpected status: treat as not-stopped */
-                        }
-                    }
-                    if (p2 == -1 && errno != EINTR) {
-                        break;  /* target gone */
-                    }
-                    struct timespec now2;
-                    clock_gettime(CLOCK_MONOTONIC, &now2);
-                    if (now2.tv_sec > stop_dl.tv_sec ||
-                        (now2.tv_sec == stop_dl.tv_sec && now2.tv_nsec >= stop_dl.tv_nsec)) {
-                        break;
-                    }
-                    struct timespec bs2 = {0, 1000000};
-                    nanosleep(&bs2, NULL);
-                }
-                if (stopped) {
-                    injector__set_regs(injector, &injector->regs);
-                    injector__write(injector, injector->code_addr, &injector->backup_code, code_size);
-                } else {
-                    /* D-state / uninterruptible sleep, or target vanished:
-                     * could not re-stop to restore. Best-effort: leave attached
-                     * so injector_detach still attempts cleanup; code at
-                     * code_addr may remain unrestored. */
-                    injector__set_errmsg("remote call timed out after %u ms; could not stop target to restore state (target may have unrestored code at libc entry)", injector->call_timeout_ms);
-                    return INJERR_TIMEOUT;
-                }
-            } else {
-                injector__set_errmsg("remote call timed out after %u ms; kill(SIGSTOP) failed (%s); target may have unrestored code", injector->call_timeout_ms, strerror(errno));
-                return INJERR_TIMEOUT;
-            }
-            injector__set_errmsg("remote call timed out after %u ms", injector->call_timeout_ms);
-            return INJERR_TIMEOUT;  /* target stays ATTACHED + STOPPED with restored state */
+        /* pid == 0: the tracee has not changed state yet. */
+        if (remaining_ns(&deadline) <= 0) {
+            return handle_timeout(injector, code_size);
         }
-        struct timespec bs = {0, backoff_ns};
-        nanosleep(&bs, NULL);
-        if (backoff_ns < 50000000L)  /* cap at 50ms */
-            backoff_ns *= 2;
+        poll_sleep(&backoff_ns, &deadline);
     }
 }

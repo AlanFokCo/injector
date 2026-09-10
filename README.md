@@ -504,7 +504,7 @@ except InjectorError as e:
 | `.uninject_all()` | Unload all injected libraries |
 | `.invoke(path, sym, *args)` | Call a symbol in an injected library |
 | `.list_modules()` | List loaded modules |
-| `.resolve_symbol(lib, sym)` | Resolve a symbol address in target |
+| `.resolve_symbol(lib, sym)` | Resolve a symbol address in the **target executable** (`lib` is reserved and ignored; pass `None`/`""`) |
 | `.read_mem(addr, size)` | Read target memory |
 | `.write_mem(addr, data)` | Write target memory |
 | `.remote_func_addr(handle, name)` | Get function address from handle |
@@ -620,7 +620,7 @@ fn main() {
 | `.uninject_all()` | Unload all injected libraries |
 | `.invoke(path, sym, args)` | Call a symbol in an injected library |
 | `.list_modules()` | List loaded modules |
-| `.resolve_symbol(lib, sym)` | Resolve a symbol address in target |
+| `.resolve_symbol(lib, sym)` | Resolve a symbol address in the **target executable** (`lib` is reserved and ignored; pass `None`/`""`) |
 | `.read_mem(addr, len)` | Read target memory |
 | `.write_mem(addr, data)` | Write target memory |
 | `.remote_func_addr(handle, name)` | Get function address from handle |
@@ -730,6 +730,22 @@ $ cc -o myapp myapp.c $(pkg-config --cflags --libs libinjector)
   [`--cap-add=SYS_PTRACE`](https://docs.docker.com/engine/reference/run/#runtime-privilege-and-linux-capabilities)
   to `docker run`.
 - Linux inside UserLAnd (Android app) (see [issue #17](https://github.com/kubo/injector/issues/17#issuecomment-1113990177)).
+
+### Never target `init`/PID 1 or other critical system processes
+
+To run a function inside the target, `injector` temporarily patches a short
+`call *%rax; int3` trampoline into the target's libc and restores the original
+bytes afterwards. That means the target is *modified*, however briefly.
+
+If PID 1 executes that `int3`, it dies, and the Linux kernel responds with
+`Kernel panic - not syncing: Attempted to kill init!` — **the whole machine
+goes down**. This is not hypothetical: it happened twice on the test host while
+a CLI smoke test ran `injector --pid 1 --run ...`.
+
+The attach path therefore refuses `pid <= 1`. More generally, only target
+processes you own and can afford to lose, and prefer `injector_target_info()`
+(which is non-intrusive and reads only `/proc`) when you just want to inspect
+something.
 
 `injector` calls functions inside a target process interrupted by `ptrace()`.
 If the target is interrupted while holding a non-reentrant lock and `injector`

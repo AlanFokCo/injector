@@ -87,6 +87,11 @@ injector_shellcode_size:
 injector_shellcode_invoke:
 	pushq	%rbx
 	pushq	%r12
+	// glibc's clone() enters the child as if via `call`, so %rsp == 8 (mod 16)
+	// here. Two pushes would leave %rsp == 8 (mod 16) again at every `call`
+	// site below, violating the x86-64 ABI and making dlopen/dlsym fault on
+	// aligned SSE stack spills (#GP). Keep %rsp 16-byte aligned for calls.
+	subq	$8, %rsp
 	movq	%rdi, %rbx
 
 	// 1. handle = dlopen(file_path, dlflags)
@@ -142,6 +147,7 @@ injector_shellcode_invoke:
 	movq	$2, inv_status_offset(%rbx)
 
 .inv_exit:
+	addq	$8, %rsp
 	popq	%r12
 	popq	%rbx
 	ret
@@ -155,4 +161,20 @@ injector_shellcode_invoke:
 	.size	injector_shellcode_invoke_size, 4
 injector_shellcode_invoke_size:
 	.int	. - injector_shellcode_invoke
+#endif /* defined(__x86_64__) */
+
+/* Mark this object as not requiring an executable stack. The shellcode above is
+ * copied into an mmap'd PROT_READ|PROT_EXEC page inside the target (see
+ * injector__attach_internal), never executed from the stack, so without this
+ * note the linker marks every consumer of libinjector as needing an executable
+ * stack (GNU_STACK RWE) - which breaks on hardened systems and is a gratuitous
+ * security regression.
+ *
+ * This deliberately sits OUTSIDE the __x86_64__ guard: on architectures with no
+ * shellcode this file still assembles to an object, and an object with no
+ * .note.GNU-stack is exactly what makes binutils >= 2.39 warn "missing
+ * .note.GNU-stack section implies executable stack" and produce an RWE
+ * GNU_STACK - e.g. in the i386 build that CI performs. */
+#if defined(__linux__) && defined(__ELF__)
+.section .note.GNU-stack,"",@progbits
 #endif

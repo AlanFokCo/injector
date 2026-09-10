@@ -1,5 +1,9 @@
 INJECTOR_OBJS = elf.o injector.o ptrace.o remote_call.o util.o shellcode.o proc.o
-CFLAGS = -Wall -Wextra -Werror -fPIC -I../../include
+# Append to, rather than replace, any CFLAGS that come from the environment or
+# the command line. A plain `CFLAGS = ...` assignment wins over the
+# environment, which silently discards distro hardening flags (dpkg-buildflags,
+# %optflags) and makes `make CFLAGS=...` drop our own -I paths.
+override CFLAGS += -Wall -Wextra -Werror -fPIC -I../../include
 
 VERSION_MAJOR = 1
 VERSION = 1.0.0
@@ -7,7 +11,7 @@ VERSION = 1.0.0
 all: libinjector.so libinjector.a
 
 libinjector.so.$(VERSION): $(INJECTOR_OBJS)
-	$(CC) -shared -Wl,-soname,libinjector.so.$(VERSION_MAJOR) -o $@ $(INJECTOR_OBJS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -shared -Wl,-soname,libinjector.so.$(VERSION_MAJOR) -o $@ $(INJECTOR_OBJS)
 
 libinjector.so.$(VERSION_MAJOR): libinjector.so.$(VERSION)
 	ln -sf libinjector.so.$(VERSION) $@

@@ -27,11 +27,20 @@
 #include <string.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <errno.h>
+#include <limits.h>
 #include "injector.h"
 
-static void print_usage(const char *prog)
+/* Linux caps pids at 4194304 (the maximum of /proc/sys/kernel/pid_max).
+ * Anything above that cannot be a pid and must not be truncated into one. */
+#define INJECTOR_PID_MAX 4194304
+/* Reject timeouts that cannot round-trip through the unsigned millisecond
+ * field of injector_opts_t. */
+#define INJECTOR_TIMEOUT_MAX_MS 3600000u
+
+static void print_usage(const char *prog, FILE *out)
 {
-    fprintf(stderr,
+    fprintf(out,
         "Usage: %s [options] [library-to-inject ...]\n"
         "\n"
         "Target (one required):\n"
@@ -160,9 +169,15 @@ int main(int argc, char **argv)
         switch (opt) {
         case 'p': {
             char *endptr;
-            long v = strtol(optarg, &endptr, 10);
-            if (v <= 0 || *endptr != '\0') {
-                fprintf(stderr, "invalid process id: %s\n", optarg);
+            errno = 0;
+            long long v = strtoll(optarg, &endptr, 10);
+            /* Without these checks a value such as 8589934593 (0x200000001)
+             * silently truncates to pid 1 when cast to pid_t, i.e. the injector
+             * would operate on init/systemd. */
+            if (errno == ERANGE || *endptr != '\0' || endptr == optarg ||
+                v <= 0 || v > INJECTOR_PID_MAX) {
+                fprintf(stderr, "invalid process id: %s (expected 1-%d)\n",
+                        optarg, INJECTOR_PID_MAX);
                 return 1;
             }
             pid = (pid_t)v;
@@ -191,11 +206,13 @@ int main(int argc, char **argv)
                 return 1;
             }
             char *endptr;
-            run_args[run_argc++] = (intptr_t)strtoimax(optarg, &endptr, 0);
-            if (*endptr != '\0') {
+            errno = 0;
+            intmax_t v = strtoimax(optarg, &endptr, 0);
+            if (errno == ERANGE || *endptr != '\0' || endptr == optarg) {
                 fprintf(stderr, "invalid --arg value: %s\n", optarg);
                 return 1;
             }
+            run_args[run_argc++] = (intptr_t)v;
             break;
         }
         case 'i':
@@ -203,9 +220,13 @@ int main(int argc, char **argv)
             break;
         case 't': {
             char *endptr;
-            long v = strtol(optarg, &endptr, 10);
-            if (v <= 0 || *endptr != '\0') {
-                fprintf(stderr, "invalid timeout: %s\n", optarg);
+            errno = 0;
+            long long v = strtoll(optarg, &endptr, 10);
+            /* 4294967300 used to truncate to 4 ms. */
+            if (errno == ERANGE || *endptr != '\0' || endptr == optarg ||
+                v <= 0 || v > INJECTOR_TIMEOUT_MAX_MS) {
+                fprintf(stderr, "invalid timeout: %s (expected 1-%u ms)\n",
+                        optarg, INJECTOR_TIMEOUT_MAX_MS);
                 return 1;
             }
             timeout_ms = (unsigned)v;
@@ -220,37 +241,59 @@ int main(int argc, char **argv)
             print_version();
             return 0;
         case 'h':
-            print_usage(argv[0]);
+            print_usage(argv[0], stdout);
             return 0;
         default:
-            print_usage(argv[0]);
+            print_usage(argv[0], stderr);
             return 1;
         }
     }
 
     if (pid <= 0) {
         fprintf(stderr, "error: --pid or --name is required\n");
-        print_usage(argv[0]);
+        print_usage(argv[0], stderr);
+        return 1;
+    }
+
+    if (run_argc > 0 && run_spec == NULL) {
+        fprintf(stderr, "error: --arg requires --run LIB:SYMBOL\n");
         return 1;
     }
 
     if (do_info) {
+        if (run_spec != NULL || optind < argc) {
+            fprintf(stderr, "error: --info cannot be combined with --run or library arguments\n");
+            return 1;
+        }
         return cmd_info(pid);
     }
 
     if (run_spec != NULL) {
+        if (optind < argc) {
+            fprintf(stderr, "error: --run takes LIB:SYMBOL only; unexpected extra argument: %s\n",
+                    argv[optind]);
+            return 1;
+        }
+#ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
+        if (cloned_thread) {
+            fprintf(stderr, "error: --cloned-thread cannot be combined with --run "
+                            "(use --delivery nonstop)\n");
+            return 1;
+        }
+#endif
         return cmd_run(pid, run_spec, timeout_ms, run_args, run_argc, delivery);
     }
 
     if (optind >= argc) {
         fprintf(stderr, "error: no libraries to inject\n");
-        print_usage(argv[0]);
+        print_usage(argv[0], stderr);
         return 1;
     }
 
     injector_t *injector;
     injector_opts_t opts = INJECTOR_OPTS_INIT;
     opts.call_timeout_ms = timeout_ms;
+    opts.delivery = delivery;   /* --delivery used to be ignored on this path */
     if (injector_attach_with_opts(&injector, pid, &opts) != 0) {
         fprintf(stderr, "attach failed: %s\n", injector_last_error(NULL));
         return 1;
@@ -277,6 +320,14 @@ int main(int argc, char **argv)
             rv = 1;
         }
     }
-    injector_detach(injector);
+    /* A failed detach can leave the target stopped, so it must not be
+     * reported as success. */
+    if (injector_detach(injector) != 0) {
+        /* injector_detach() frees the handle, so asking it for the error would
+         * be a use-after-free. detach sets the "current" handle to NULL and
+         * the message lives in the thread-local buffer, so pass NULL. */
+        fprintf(stderr, "detach failed: %s\n", injector_last_error(NULL));
+        rv = 1;
+    }
     return rv;
 }

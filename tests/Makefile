@@ -177,7 +177,7 @@ check: all
 	 done
 
 UNIT_TESTS = unit/run
-UNIT_OBJS = unit/run.o unit/test_errmsg.o unit/test_opts.o unit/test_elf.o unit/test_proc.o unit/test_init.o
+UNIT_OBJS = unit/run.o unit/test_errmsg.o unit/test_opts.o unit/test_elf.o unit/test_proc.o unit/test_init.o unit/test_guards.o
 
 unit: $(UNIT_TESTS) $(UNIT_OBJS)
 	@for t in $(UNIT_TESTS); do echo "=== $$t ==="; ./$$t || exit 1; done
@@ -205,6 +205,9 @@ unit/test_proc.o: unit/test_proc.c unit/minunit.h ../src/linux/proc.h
 
 unit/test_init.o: unit/test_init.c unit/minunit.h
 	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_init.c
+
+unit/test_guards.o: unit/test_guards.c unit/minunit.h ../src/linux/proc.h
+	$(CC) $(CFLAGS) -I. -I../include -I../src/linux -c -o $@ unit/test_guards.c
 
 clean:
 	$(RM) test-prog$(EXE_EXT) test-prog-* test-target$(EXE_EXT) test-target-* test-library.$(SO_EXT) test-library-*.$(SO_EXT) $(UNIT_TESTS) $(UNIT_OBJS)

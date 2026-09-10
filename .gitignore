@@ -16,3 +16,17 @@ docs/
 task_plan.md
 findings.md
 progress.md
+
+# fuzzing (tests/fuzz): built harnesses, corpora and libFuzzer working files
+tests/fuzz/fuzz_elf
+tests/fuzz/fuzz_proc
+tests/fuzz/corpus/
+tests/fuzz/work/
+.fuzzbin/
+
+# sanitizer / debug helpers used during verification
+*.asan
+uaf_probe*.c
+# sanitizer-instrumented test binaries built ad hoc during verification
+/tests/*-asan
+/tests/test-library-asan.so

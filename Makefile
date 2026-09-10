@@ -27,9 +27,18 @@ check:
 unit:
 	cd tests && $(MAKE) unit
 
+# Fuzz the input parsers (ELF + /proc) under ASan/UBSan. Requires clang.
+# fuzz-regress replays tests/fuzz/crashes/ and is what CI runs.
+fuzz-regress:
+	cd tests/fuzz && $(MAKE) regress
+
+fuzz:
+	cd tests/fuzz && $(MAKE) fuzz
+
 clean:
 	cd $(SRC_DIR) && $(MAKE) clean
 	cd cmd && $(MAKE) clean
 	cd tests && $(MAKE) clean
+	-cd tests/fuzz && $(MAKE) clean
 
-.PHONY: all install uninstall check unit clean
+.PHONY: all install uninstall check unit fuzz fuzz-regress clean

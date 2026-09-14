@@ -28,6 +28,7 @@
 #include <sys/uio.h>   /* process_vm_readv/writev, struct iovec */
 #include <unistd.h>    /* getpagesize */
 #include <errno.h>
+#include <stdlib.h>  /* the one-off regset size probe */
 
 #include <elf.h>   /* NT_PRSTATUS, NT_FPREGSET, NT_X86_XSTATE */
 
@@ -184,7 +185,11 @@ int injector__detach_process(const injector_t *injector)
  *   injector__detach_process() drops the slot.
  *
  * A regset the kernel or the target does not support is skipped: a missing
- * NT_X86_XSTATE (no XSAVE) or NT_FPREGSET must never fail the attach.
+ * NT_X86_XSTATE (no XSAVE) or NT_FPREGSET must never fail the attach. A regset
+ * that EXISTS but is larger than the slot's buffer is the opposite case and
+ * does fail the attach: saving it truncated would be indistinguishable from
+ * saving it whole, and the truncated half could not be written back, so the
+ * remote call would leave the target's high vector registers clobbered.
  *
  * The slots are thread-local (__thread), matching the one-handle-per-thread
  * model that util.c's injector__set_current() and remote_call.c's desync_pids
@@ -192,7 +197,9 @@ int injector__detach_process(const injector_t *injector)
  * threads cannot race on the table (no torn entries, no cross-thread eviction
  * of a LIVE handle's slot) without any locking; FP_SLOTS concurrent handles
  * *per thread* are supported and an overflow evicts that thread's least
- * recently used slot.  Nothing is heap-allocated, so there is nothing to free:
+ * recently used slot.  The slots themselves are not heap-allocated (the only
+ * malloc is the one-off size probe in regset_probe(), freed before it
+ * returns), so there is nothing to free:
  * the TLS block for a thread is released by the runtime when the thread exits,
  * and fp_slot_release() clears a slot as soon as its handle detaches.
  * (The slots are only reachable through attach/get_regs/set_regs/detach, all of
@@ -204,11 +211,26 @@ int injector__detach_process(const injector_t *injector)
 #define XSTATE_SIZE   16384  /* NT_X86_XSTATE: 2696 bytes for AVX-512 on Linux
                               * 6.8; enough for AMX (XTILEDATA ~8KiB) too */
 
+/* The kernel answers PTRACE_GETREGSET with EIO both for "there is no such
+ * regset" (ptrace_regset() cannot find the NT_*) and for "your iov_len is not a
+ * multiple of the regset's granularity". regset_probe() has to read EIO as the
+ * former - it is the ordinary no-XSAVE / no-FPU case - which is only sound while
+ * the probe length stays a multiple of every granularity in use (1 for xstate,
+ * up to 16 for the arch FP regsets). Both buffers are multiples of 16 and the
+ * probe doubles them, so this holds; assert it, because getting it wrong means
+ * concluding "the target has no FP state", saving nothing, restoring nothing,
+ * and leaving its vector registers as the remote call left them. */
+_Static_assert(FP_STATE_SIZE % 16 == 0 && XSTATE_SIZE % 16 == 0,
+               "FP_STATE_SIZE and XSTATE_SIZE must stay multiples of 16 - see the "
+               "EIO ambiguity documented in regset_probe()");
+
 struct fp_slot {
     pid_t pid;            /* 0: free slot */
     unsigned int seq;     /* LRU counter */
     size_t fp_len;        /* valid bytes in fp[]; 0: regset unavailable */
     size_t xs_len;        /* valid bytes in xs[]; 0: regset unavailable */
+    size_t oversize;      /* >0: a regset needs this many bytes, see below */
+    unsigned int oversize_ntype; /* which NT_* did not fit */
     char fp[FP_STATE_SIZE];
     char xs[XSTATE_SIZE];
 };
@@ -250,6 +272,8 @@ static fp_slot_t *fp_slot_acquire(pid_t pid)
     s->seq = ++fp_slot_seq;
     s->fp_len = 0;
     s->xs_len = 0;
+    s->oversize = 0;
+    s->oversize_ntype = 0;
     return s;
 }
 
@@ -260,6 +284,8 @@ static void fp_slot_release(pid_t pid)
         s->pid = 0;
         s->fp_len = 0;
         s->xs_len = 0;
+        s->oversize = 0;
+        s->oversize_ntype = 0;
     }
 }
 
@@ -284,27 +310,133 @@ static int regset_op(int request, pid_t pid, unsigned int type, void *buf, size_
     return 0;
 }
 
-static void fp_state_save(pid_t pid, fp_slot_t *s)
+/* How many bytes does the kernel really want to hand back for this regset?
+ *
+ * ptrace() clamps the returned length to min(iov_len, regset->n * regset->size),
+ * so a read that EXACTLY fills our buffer is ambiguous: it may be complete, or
+ * the regset may be larger and have been silently truncated. The old
+ * "len < sizeof(buf)" test resolved that ambiguity by throwing the state away,
+ * which on a future kernel (an xstate >= XSTATE_SIZE) would leave the target's
+ * AVX-512/AMX registers unrestored after every remote call.
+ *
+ * Asking with iov_len == 0 does not work either - the kernel clamps that to 0
+ * and copies nothing. So read once into a temporary buffer twice the size we
+ * can store: the clamped length it reports is the true size (or "at least
+ * 2x", which is enough to decide). Reading a regset has no side effect on the
+ * tracee. Returns 0 when the regset is unavailable. */
+#define REGSET_SAVED         0   /* from the probe: the real size is known */
+#define REGSET_UNAVAILABLE   1   /* the kernel/target genuinely has no such regset */
+#define REGSET_OVERSIZE      2   /* it exists and does not fit the slot */
+#define REGSET_PROBE_FAILED  3   /* it exists but we could not read it; errno says why */
+
+static int regset_probe(pid_t pid, unsigned int type, size_t minimum, size_t *out_size)
 {
+    size_t probe = minimum * 2;
+    struct iovec iov;
+    void *buf;
+    int saved_errno;
+
+    *out_size = 0;
+    buf = malloc(probe);
+    if (buf == NULL) {
+        /* Transient, and about US - not a fact about the target's hardware. It
+         * must not be reported as "the target has a 32768-byte xstate, rebuild
+         * with a larger XSTATE_SIZE", which is what folding it into the oversize
+         * case would say. */
+        errno = ENOMEM;
+        return REGSET_PROBE_FAILED;
+    }
+    iov.iov_base = buf;
+    iov.iov_len = probe;
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)(long)type, &iov) != 0) {
+        saved_errno = errno;
+        free(buf);
+        errno = saved_errno;
+        /* "No such regset" is ordinary (a kernel without XSAVE, an unsupported
+         * NT_*). Everything else - EPERM, EACCES, EFAULT, EINTR - means the
+         * regset IS there and we failed to read it. Reporting that as
+         * "unavailable" would skip the save, skip the restore, and let every
+         * remote call leave the target's vector registers clobbered, which is
+         * exactly the failure the oversize path exists to prevent. */
+        if (saved_errno == EIO || saved_errno == ENXIO || saved_errno == EINVAL ||
+            saved_errno == ENODEV || saved_errno == EOPNOTSUPP) {
+            return REGSET_UNAVAILABLE;
+        }
+        return REGSET_PROBE_FAILED;
+    }
+    free(buf);
+    if (iov.iov_len == 0) {
+        return REGSET_UNAVAILABLE;
+    }
+    *out_size = iov.iov_len;
+    return REGSET_SAVED;
+}
+
+/* Read one regset into dst (dstsz bytes). *out_len receives the valid length,
+ * *out_need the size the kernel says the regset really has. */
+static int fp_regset_read(pid_t pid, unsigned int type, void *dst, size_t dstsz,
+                          size_t *out_len, size_t *out_need)
+{
+    size_t need = 0;
     size_t len = 0;
+    int r;
+
+    *out_len = 0;
+    *out_need = 0;
+    r = regset_probe(pid, type, dstsz, &need);
+    if (r != REGSET_SAVED) {
+        return r;                    /* UNAVAILABLE, or PROBE_FAILED with errno set */
+    }
+    *out_need = need;
+    if (need > dstsz) {
+        return REGSET_OVERSIZE;      /* cannot be saved whole -> caller must refuse */
+    }
+    errno = 0;   /* a stale ESRCH/EPERM from the probe must not be blamed here */
+    if (regset_op(PTRACE_GETREGSET, pid, type, dst, need, &len) != 0) {
+        /* It exists and it fits, but the read into the slot failed. Same
+         * reasoning as the probe: never pretend there was nothing to save. */
+        if (errno == 0) {
+            errno = EIO;
+        }
+        return REGSET_PROBE_FAILED;
+    }
+    if (len == 0 || len > dstsz) {
+        errno = EIO;   /* the kernel promised `need` bytes and did not deliver */
+        return REGSET_PROBE_FAILED;
+    }
+    *out_len = len;
+    return REGSET_SAVED;
+}
+
+/* Returns REGSET_SAVED when every regset that exists was saved whole, otherwise
+ * the reason it could not be (REGSET_OVERSIZE or REGSET_PROBE_FAILED);
+ * s->oversize_ntype always says which regset it was and s->oversize its size
+ * when that size is known (0 for a failed probe). */
+static int fp_state_save(pid_t pid, fp_slot_t *s)
+{
+    size_t need = 0;
+    int r;
 
     s->fp_len = 0;
     s->xs_len = 0;
-    if (regset_op(PTRACE_GETREGSET, pid, NT_FPREGSET, s->fp, sizeof(s->fp), &len) == 0 && len > 0) {
-        s->fp_len = len;
+    s->oversize = 0;
+    s->oversize_ntype = 0;
+
+    r = fp_regset_read(pid, NT_FPREGSET, s->fp, sizeof(s->fp), &s->fp_len, &need);
+    if (r == REGSET_OVERSIZE || r == REGSET_PROBE_FAILED) {
+        s->oversize_ntype = NT_FPREGSET;
+        s->oversize = (r == REGSET_OVERSIZE) ? need : 0;
+        return r;
     }
 #if defined(__x86_64__) || defined(__i386__)
-    len = 0;
-    /* The kernel clamps iov_len to min(our buffer, the real xstate size), so a
-     * full read is recognisable by len < sizeof(s->xs).  A truncated buffer
-     * must not be written back: PTRACE_SETREGSET rejects it with EFAULT and,
-     * worse, a partial restore would leave the high vector registers as the
-     * remote call left them. */
-    if (regset_op(PTRACE_GETREGSET, pid, NT_X86_XSTATE, s->xs, sizeof(s->xs), &len) == 0 &&
-        len > 0 && len < sizeof(s->xs)) {
-        s->xs_len = len;
+    r = fp_regset_read(pid, NT_X86_XSTATE, s->xs, sizeof(s->xs), &s->xs_len, &need);
+    if (r == REGSET_OVERSIZE || r == REGSET_PROBE_FAILED) {
+        s->oversize_ntype = NT_X86_XSTATE;
+        s->oversize = (r == REGSET_OVERSIZE) ? need : 0;
+        return r;
     }
 #endif
+    return REGSET_SAVED;
 }
 
 /* Returns 0 on success, otherwise the errno of the first failed regset. */
@@ -328,7 +460,50 @@ int injector__get_regs(const injector_t *injector, struct user_regs_struct *regs
      * remote call hijacks the thread. Subsequent calls (which read back the
      * result registers of a remote call) must not overwrite it. */
     if (fp_slot_find(injector->pid) == NULL) {
-        fp_state_save(injector->pid, fp_slot_acquire(injector->pid));
+        fp_slot_t *s = fp_slot_acquire(injector->pid);
+        int fr = fp_state_save(injector->pid, s);
+        if (fr != REGSET_SAVED) {
+            /* Either the target has an extended FPU state we cannot store, or we
+             * could not read the state it does have. In both cases it could never
+             * be restored, and hijacking the thread anyway would clobber
+             * registers the target is entitled to keep (AVX-512/AMX and above).
+             * Refuse BEFORE any register is touched, and drop the slot so a later
+             * attach re-probes instead of reusing a half-saved one. Keep errno
+             * aside first: injector__set_errmsg() may clobber it. */
+            int why = (errno != 0) ? errno : EIO;
+            int rv;
+            if (fr == REGSET_OVERSIZE) {
+                why = E2BIG;
+                injector__set_errmsg("pid %d has a %zu-byte regset (NT_%s) that does not fit "
+                                     "injector's %zu-byte save buffer; refusing to hijack its "
+                                     "registers (rebuild with a larger XSTATE_SIZE/FP_STATE_SIZE)",
+                                     (int)injector->pid, s->oversize,
+                                     s->oversize_ntype == NT_X86_XSTATE ? "X86_XSTATE" : "FPREGSET",
+                                     s->oversize_ntype == NT_X86_XSTATE ? (size_t)XSTATE_SIZE
+                                                                        : (size_t)FP_STATE_SIZE);
+            } else {
+                injector__set_errmsg("cannot save the FP/vector state of pid %d (NT_%s): %s; "
+                                     "refusing to hijack its registers, because without a saved "
+                                     "copy the remote call would leave them clobbered",
+                                     (int)injector->pid,
+                                     s->oversize_ntype == NT_X86_XSTATE ? "X86_XSTATE" : "FPREGSET",
+                                     strerror(why));
+            }
+            /* The same mapping set_ptrace_error() uses, so a caller sees one
+             * vocabulary: EFAULT is a bad memory area and anything unrecognised
+             * is INJERR_OTHER - not UNSUPPORTED_TARGET, which is reserved for the
+             * one case that really is about the target's capabilities (a regset
+             * too large to store) and tells the user to rebuild with a bigger
+             * buffer. ENOMEM is ours, from the probe's allocation. */
+            rv = (fr == REGSET_OVERSIZE) ? INJERR_UNSUPPORTED_TARGET :
+                 (why == ESRCH) ? INJERR_NO_PROCESS :
+                 (why == EPERM || why == EACCES) ? INJERR_PERMISSION :
+                 (why == EFAULT) ? INJERR_INVALID_MEMORY_AREA :
+                 (why == ENOMEM) ? INJERR_NO_MEMORY : INJERR_OTHER;
+            fp_slot_release(injector->pid);
+            errno = why;
+            return rv;
+        }
     }
 
 #ifdef USE_REGSET

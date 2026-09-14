@@ -94,7 +94,14 @@ func (i *Injector) Close() error {
 		return nil
 	}
 	rc := C.injector_detach(i.inj)
-	err := checkErr(rc, i.inj)
+	// BLOCKER: injector_detach() frees the handle before it returns, so handing
+	// i.inj to checkErr() - which forwards it to injector_last_error(), and that
+	// dereferences inj->errmsg - is a heap use-after-free. detach calls
+	// injector__set_current(NULL) first, so the message it just recorded for a
+	// failed detach lives in the library's thread-local buffer: pass nil to read
+	// that instead of the freed handle. (cmd/main.c and the Python binding
+	// already read the error this way.)
+	err := checkErr(rc, nil)
 	i.inj = nil
 	runtime.SetFinalizer(i, nil)
 	runtime.UnlockOSThread()

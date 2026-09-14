@@ -219,7 +219,7 @@ static int canary_intact(const char *canary, const char *what)
         }
         if (canary[i] != 'X') {
             fprintf(stderr,
-                    "    %s(n=0) wrote out of bounds: canary[%d] (== out[%d]) "
+                    "    %s wrote out of bounds: canary[%d] (== out[%d]) "
                     "is '%c' (0x%02x), expected 'X'\n", what, i, i - 4,
                     (canary[i] >= 32 && canary[i] < 127) ? canary[i] : '.',
                     (unsigned char)canary[i]);
@@ -229,15 +229,24 @@ static int canary_intact(const char *canary, const char *what)
     return 1;
 }
 
-/* out[0] may legitimately be left as the 'Y' we wrote, or be set to '\0';
- * anything else means the zero-length guard did not hold. */
+/* out[0] must still hold the 'Y' we wrote. Accepting '\0' here as well - as
+ * this helper used to - makes every n == 0 assertion in this file vacuous:
+ * canary_intact() deliberately skips index 4 because that byte IS out[0], so
+ * out_byte_untouched() is the only thing looking at it, and the exact defect
+ * these tests exist to pin (proc__read_comm's fopen-failure branch writing
+ * out[0] = '\0' into a buffer the caller declared zero bytes long) writes
+ * precisely '\0' and nothing else. With '\0' accepted, that write passed both
+ * assertions and `make unit` stayed green on the buggy code. Every caller below
+ * passes n == 0, where the contract is that NOTHING is written, so 'Y' is the
+ * only correct answer; the n == 1 case asserts out[0] == '\0' separately. */
 static int out_byte_untouched(char c, const char *what)
 {
-    if (c == '\0' || c == 'Y') {
+    if (c == 'Y') {
         return 1;
     }
     fprintf(stderr,
-            "    %s(n=0) modified out[0]: got '%c' (0x%02x), expected 'Y' or '\\0'\n",
+            "    %s modified out[0]: got '%c' (0x%02x), expected the "
+            "untouched 'Y' (0x59) - n == 0 must write nothing at all\n",
             what, (c >= 32 && c < 127) ? c : '.', (unsigned char)c);
     return 0;
 }
@@ -257,8 +266,8 @@ int test_proc_zero_length_buffer(void) {
     out[0] = 'Y';
     rv = proc__read_link("/proc/self/exe", out, 0);
     MU_ASSERT(rv == -1);
-    MU_ASSERT(out_byte_untouched(out[0], "proc__read_link"));
-    MU_ASSERT(canary_intact(canary, "proc__read_link"));
+    MU_ASSERT(out_byte_untouched(out[0], "proc__read_link(n=0)"));
+    MU_ASSERT(canary_intact(canary, "proc__read_link(n=0)"));
 
     /* --- proc__read_comm --- */
     memset(canary, 'X', sizeof(canary));
@@ -266,8 +275,62 @@ int test_proc_zero_length_buffer(void) {
     out[0] = 'Y';
     rv = proc__read_comm(getpid(), out, 0);
     MU_ASSERT(rv == -1);
-    MU_ASSERT(out_byte_untouched(out[0], "proc__read_comm"));
-    MU_ASSERT(canary_intact(canary, "proc__read_comm"));
+    MU_ASSERT(out_byte_untouched(out[0], "proc__read_comm(n=0)"));
+    MU_ASSERT(canary_intact(canary, "proc__read_comm(n=0)"));
+
+    /* --- proc__read_comm on a path that CANNOT be opened ---
+     * getpid() opens /proc/<pid>/comm successfully, so the case above only ever
+     * reached the n == 0 guard that sits after fopen(). When fopen() fails - a
+     * pid that exited, one we may not read, or a negative pid - that branch used
+     * to write out[0] = '\0' before any guard could stop it: one byte written
+     * into a buffer the caller declared to be zero bytes long. Fuzzing found it
+     * (tests/fuzz/crashes/proc__canary__proc.c_70__proc__read_comm.bin, whose
+     * entire input is empty); this pins it in a test that runs everywhere.
+     * The reproducer is named for the harness' CANARY, not for a
+     * heap-buffer-overflow, because that canary is what detects this defect and
+     * ASan cannot: the n == 0 sweep allocates n + 1 == 1 byte and puts its canary
+     * at index n, so the stray out[0] = '\0' lands INSIDE the allocation. No
+     * redzone is touched, ASan reports nothing, and only the canary byte proves
+     * the write happened.
+     * pid -1 is used because "/proc/-1/comm" cannot exist, so there is no race,
+     * no permission dependency and nothing to clean up. */
+    memset(canary, 'X', sizeof(canary));
+    out = &canary[4];
+    out[0] = 'Y';
+    rv = proc__read_comm(-1, out, 0);
+    MU_ASSERT(rv == -1);
+    MU_ASSERT(out_byte_untouched(out[0], "proc__read_comm(unopenable, n=0)"));
+    MU_ASSERT(canary_intact(canary, "proc__read_comm(unopenable, n=0)"));
+
+    /* The same two shapes for proc__read_link, which was already correct: a
+     * missing path with n == 0 must not write at all, and with n == 1 the
+     * failure branch must NUL-terminate INSIDE the one byte it was given. */
+    memset(canary, 'X', sizeof(canary));
+    out = &canary[4];
+    out[0] = 'Y';
+    rv = proc__read_link("/proc/-1/exe", out, 0);
+    MU_ASSERT(rv == -1);
+    MU_ASSERT(out_byte_untouched(out[0], "proc__read_link(missing, n=0)"));
+    MU_ASSERT(canary_intact(canary, "proc__read_link(missing, n=0)"));
+
+    /* n == 1 makes proc__read_link() call readlink() with bufsiz 0. POSIX
+     * requires EINVAL for a non-positive bufsiz and Linux/glibc/musl deliver it,
+     * so -1 is the expected answer - but that is a libc property, not a property
+     * of the code under test. Hard-asserting -1 would let a libc that merely
+     * differs (returns 0 and stores nothing but the NUL) fail this suite and mask
+     * real defects behind a spurious red, so the return value is relaxed to
+     * "failed, or succeeded with an empty string". The relaxation is deliberate
+     * and bounded: out[0] == '\0' is asserted either way, so NUL-termination
+     * inside the single byte the caller provided still holds, as does the canary
+     * below and the "nothing written at all when n == 0" case above.
+     * tests/fuzz/fuzz_proc.c carries the identical relaxation. */
+    memset(canary, 'X', sizeof(canary));
+    out = &canary[4];
+    out[0] = 'Y';
+    rv = proc__read_link("/proc/-1/exe", out, 1);
+    MU_ASSERT(rv == -1 || (rv == 0 && out[0] == '\0'));
+    MU_ASSERT(out[0] == '\0');
+    MU_ASSERT(canary_intact(canary, "proc__read_link(missing, n=1)"));
     return 0;
 }
 

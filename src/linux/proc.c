@@ -64,17 +64,29 @@ int proc__read_link(const char *proc_path, char *out, size_t n)
 int proc__read_comm(pid_t pid, char *out, size_t n)
 {
     char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
-    FILE *fp = fopen(path, "r");
-    if (fp == NULL) {
-        out[0] = '\0';
-        return -1;
-    }
+    FILE *fp;
     size_t i = 0;
     int c;
-    /* MINOR 9: guard n == 0 (`n - 1` wraps to SIZE_MAX). */
+
+    /* MINOR 9, and the half of it that was still broken: the n == 0 guard has to
+     * come FIRST. It used to sit below the fopen() failure branch, which writes
+     * out[0] = '\0' unconditionally - so a caller that passed a zero-length
+     * buffer still took a one-byte write whenever /proc/<pid>/comm could not be
+     * opened (a pid that has exited, or one we are not allowed to read). Guarding
+     * only the `n - 1` wrap left that path untouched.
+     * The guard is purely defensive. n == 0 carries no "how long is the name?"
+     * meaning in this API - there is no length-probe mode and no way to ask for
+     * one; proc__read_comm() just returns -1 and writes nothing, the same as
+     * proc__read_link() already did. It exists only so that no branch, present or
+     * future, can ever store into a buffer the caller declared to be zero bytes
+     * long, whatever that caller thought it was asking for. */
     if (n == 0) {
-        fclose(fp);
+        return -1;
+    }
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    fp = fopen(path, "r");
+    if (fp == NULL) {
+        out[0] = '\0';
         return -1;
     }
     while ((c = fgetc(fp)) != EOF && c != '\n' && i < n - 1) {

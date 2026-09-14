@@ -69,7 +69,18 @@ static int process_start(process_t *proc, char *test_target)
 {
     int fds[2];
     int child_errno = 0;
+    int wstatus = 0;
+    char why[64];
+    pid_t w;
     ssize_t r;
+
+    /* MINOR 6: leave a SAFE state behind on every early return below. The
+     * pipe()/fcntl() failures return before the fork() that assigns proc->pid, so
+     * without this a later process_terminate() would act on whatever the caller's
+     * struct held - garbage if the caller never initialised it, which is worse
+     * than the pid==0 case its `pid > 0` guard covers. */
+    proc->pid = 0;
+    proc->waited = 1;
 
     /* pipe() + F_SETFD rather than pipe2(): pipe2 is GNU/BSD-only and this file
      * is built without _GNU_SOURCE on every arch pair in tests/Makefile. The two
@@ -93,15 +104,26 @@ static int process_start(process_t *proc, char *test_target)
         close(fds[0]);
         execl(test_target, test_target, NULL);
         child_errno = errno;
-        /* best effort: if even this fails the parent sees EOF and reports the
-         * target as not started, which is still better than a silent corpse. */
+        /* Best effort: if this write fails the parent sees EOF, which is the
+         * same thing a successful exec looks like - so EOF alone no longer
+         * means "started" (see the waitpid(WNOHANG) check below), and the exit
+         * status is what tells the two apart.
+         * MINOR 5: _exit(), not exit(). execl() failed, so the parent's atexit
+         * handlers and its buffered stdio are still ours; exit() would flush
+         * the harness's own output a second time. */
         (void)!write(fds[1], &child_errno, sizeof(child_errno));
-        exit(2);
+        _exit(2);
     }
     if (proc->pid < 0) {
         printf("ERROR: fork failed: %s\n", strerror(errno));
         close(fds[0]);
         close(fds[1]);
+        /* MINOR 6: -1 is not a pid. process_terminate()'s `pid > 0` guard would
+         * catch it, but leaving a negative pid in the struct invites kill(-1)
+         * from any future caller, so normalise it like every other failure path
+         * does. */
+        proc->pid = 0;
+        proc->waited = 1;
         return -1;
     }
     close(fds[1]);
@@ -118,8 +140,38 @@ static int process_start(process_t *proc, char *test_target)
      * to inject into a pid it never proved was alive - the exact silent-corpse
      * failure this pipe was added to prevent. */
     if (r == 0) {
-        /* EOF: the O_CLOEXEC write end was closed by a successful exec. */
-        return 0;
+        /* EOF: the O_CLOEXEC write end was closed - either by a successful
+         * exec, or by a child that died before it could report anything (a
+         * failed execl() whose errno write also failed). MINOR 5: those two are
+         * indistinguishable from the pipe alone, and the old code took EOF as
+         * proof of a clean start, contradicting both its own comment and
+         * 94b778f's "only a clean EOF means the child exec'd". So ask the
+         * kernel instead of inferring: the write end can only have closed at
+         * exec or at exit, so by now the child is either running (a real exec)
+         * or already a zombie (it never started). */
+        do {
+            w = waitpid(proc->pid, &wstatus, WNOHANG);
+        } while (w < 0 && errno == EINTR);
+        if (w == 0) {
+            return 0;                       /* still running: it exec'd */
+        }
+        if (w == proc->pid) {
+            if (WIFEXITED(wstatus)) {
+                snprintf(why, sizeof(why), "exited with status %d", WEXITSTATUS(wstatus));
+            } else if (WIFSIGNALED(wstatus)) {
+                snprintf(why, sizeof(why), "was killed by signal %d", WTERMSIG(wstatus));
+            } else {
+                snprintf(why, sizeof(why), "did not run (wait status 0x%x)", wstatus);
+            }
+        } else {
+            snprintf(why, sizeof(why), "its status could not be read: %s", strerror(errno));
+        }
+        printf("ERROR: cannot confirm that '%s' started: it closed the exec-status "
+               "pipe without reporting an errno and %s\n", test_target, why);
+        /* Reaped above (or unreapable), so nothing is left to wait for. */
+        proc->pid = 0;
+        proc->waited = 1;
+        return -1;
     }
     if (r < 0) {
         printf("ERROR: cannot read the exec status of '%s': %s\n",
@@ -132,6 +184,7 @@ static int process_start(process_t *proc, char *test_target)
         kill(proc->pid, SIGKILL);
         waitpid(proc->pid, NULL, 0);
         proc->pid = 0;
+        proc->waited = 1;   /* MINOR 6: reaped here - see process_terminate() */
         return -1;
     }
     if (r < (ssize_t)sizeof(child_errno)) {
@@ -146,6 +199,7 @@ static int process_start(process_t *proc, char *test_target)
         kill(proc->pid, SIGKILL);   /* see the read-error path above */
         waitpid(proc->pid, NULL, 0);
         proc->pid = 0;
+        proc->waited = 1;   /* MINOR 6: reaped here - see process_terminate() */
         return -1;
     }
     /* r == sizeof(child_errno): the child reported a failed execl(). */
@@ -153,6 +207,7 @@ static int process_start(process_t *proc, char *test_target)
            test_target, strerror(child_errno));
     waitpid(proc->pid, NULL, 0);
     proc->pid = 0;
+    proc->waited = 1;   /* MINOR 6: reaped here - see process_terminate() */
     return -1;
 }
 
@@ -246,10 +301,18 @@ static int process_wait(process_t *proc, int wait_secs)
 static void process_terminate(process_t *proc)
 {
     int status;
-    if (!proc->waited) {
+    /* MINOR 6: `pid > 0` is load-bearing, not cosmetic. kill(0, sig) delivers
+     * to EVERY process in the caller's process group, so a proc whose pid was
+     * reset to 0 by a failed process_start() - while `waited` was still 0 -
+     * would SIGKILL and SIGCONT the whole harness, its shell and anything else
+     * in the group. Today main() returns before cleanup on that path, so the
+     * trap is only latent; this guard makes it unreachable for any future
+     * `goto cleanup`, and the failure paths now set `waited` as well. */
+    if (!proc->waited && proc->pid > 0) {
         kill(proc->pid, SIGKILL);
         kill(proc->pid, SIGCONT);
         waitpid(proc->pid, &status, 0);
+        proc->waited = 1;   /* idempotent: a second call must not wait again */
     }
 }
 
@@ -525,7 +588,11 @@ int main(int argc, char **argv)
     char test_target[64];
     char test_library[64];
     injector_t *injector;
-    process_t proc;
+    /* MINOR 6: initialised, not left to the stack. process_start() can return
+     * early without ever assigning proc.pid, and process_terminate() must never
+     * see a pid that did not come from a successful fork(). waited=1 means
+     * "nothing to reap", which is the truth about a process that never started. */
+    process_t proc = { 0, 1, 0 };   /* pid, waited, is_musl */
     void *handle = NULL;
     int rv = 1;
     int loop_cnt;

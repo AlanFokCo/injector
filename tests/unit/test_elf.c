@@ -7,6 +7,7 @@
  */
 #include "minunit.h"
 #include "injector.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,15 +16,32 @@
 #include <elf.h>
 #include <dlfcn.h>
 
+/* Defined in run.c and reported in its summary line. Declared here rather than
+ * in minunit.h so that the skip count stays local to this suite. */
+extern int tests_skipped;
+
 /* Internal helper exposed for testing (declared in src/linux/injector_internal.h). */
 int injector__elf_find_symbols(const char *path, size_t libc_addr,
                                const char *const names[], size_t addrs[], size_t n);
 
 /* run.c registers exactly one ELF entry point, so the sub-tests are driven
- * from it through this local runner, which mirrors MU_RUN_TEST. */
-#define RUN_ELF_SUB(t) do { tests_run++; \
-    if (t() != 0) { tests_failed++; fprintf(stderr, "  FAIL: %s\n", #t); } \
+ * from it through this local runner. It mirrors MU_RUN_TEST and adds a third
+ * outcome: returning -1 means "deliberately skipped", which is counted and
+ * printed instead of passing for free. A setup failure that used to `return 0`
+ * was a lie - CI stayed green with zero coverage. */
+#define RUN_ELF_SUB(t) do { int mu_rv_ = t(); tests_run++; \
+    if (mu_rv_ < 0) { tests_skipped++; fprintf(stderr, "  skip: %s\n", #t); } \
+    else if (mu_rv_ != 0) { tests_failed++; fprintf(stderr, "  FAIL: %s\n", #t); } \
     else fprintf(stderr, "  ok:   %s\n", #t); } while (0)
+
+/* Skipping a sub-test is opt-in per run: without INJECTOR_ALLOW_SKIP=1 a
+ * missing toolchain or an unwritable /tmp is a hard failure, so it can never
+ * quietly turn a positive-path test into a no-op. */
+static int elf_allow_skip(void)
+{
+    const char *v = getenv("INJECTOR_ALLOW_SKIP");
+    return v != NULL && strcmp(v, "1") == 0;
+}
 
 #define ELF_SYM_VALUE  0x1234u
 #define ELF_LIBC_BASE  ((size_t)0x7f0000000000u)
@@ -252,22 +270,36 @@ static int t_real_so_resolves(void)
     size_t addrs[3] = {0};
     void *h;
     int rc = 1;
+    int build_rc;
 
     snprintf(srcpath, sizeof(srcpath), "/tmp/inj_elf_src_%ld.c", (long)getpid());
     snprintf(sopath, sizeof(sopath), "/tmp/inj_elf_fixture_%ld.so", (long)getpid());
 
     FILE *f = fopen(srcpath, "w");
     if (f == NULL) {
-        return 0; /* cannot stage fixtures here: skip, not fail */
+        fprintf(stderr, "    cannot stage fixture %s: %s\n", srcpath, strerror(errno));
+        if (!elf_allow_skip()) {
+            fprintf(stderr,
+                    "    (set INJECTOR_ALLOW_SKIP=1 to downgrade this to a counted skip)\n");
+            return 1;
+        }
+        return -1;                      /* counted, visible skip */
     }
     if (fputs(src, f) == EOF || fclose(f) != 0) {
         unlink(srcpath);
         return 1;
     }
     snprintf(cmd, sizeof(cmd), "cc -shared -fPIC -o %s %s", sopath, srcpath);
-    if (system(cmd) != 0) {
-        unlink(srcpath); /* no compiler available: skip, not fail */
-        return 0;
+    build_rc = system(cmd);
+    if (build_rc != 0) {
+        unlink(srcpath);
+        fprintf(stderr, "    fixture build failed (rc=%d): %s\n", build_rc, cmd);
+        if (!elf_allow_skip()) {
+            fprintf(stderr,
+                    "    (set INJECTOR_ALLOW_SKIP=1 to downgrade this to a counted skip)\n");
+            return 1;
+        }
+        return -1;                      /* counted, visible skip */
     }
 
     if (injector__elf_find_symbols(sopath, 0, names, addrs, 3) != 0) {

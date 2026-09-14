@@ -1,6 +1,11 @@
 #include "minunit.h"
+#include <stdlib.h>     /* getenv */
+#include <string.h>     /* strcmp */
 int tests_run = 0;
 int tests_failed = 0;
+/* Counted skips. Kept in the summary so a test that could not set itself up is
+ * visible instead of looking like a pass. */
+int tests_skipped = 0;
 static int test_dummy(void) { MU_ASSERT(1 + 1 == 2); return 0; }
 int test_error_after_failed_attach(void);
 int test_opts_default(void);
@@ -36,6 +41,32 @@ int main(void) {
     MU_RUN_TEST(test_nonpositive_pid_rejected);
     MU_RUN_TEST(test_proc_zero_length_buffer);
     MU_RUN_TEST(test_proc_long_path_still_detects_deleted);
-    fprintf(stderr, "unit: %d run, %d failed\n", tests_run, tests_failed);
-    return tests_failed ? 1 : 0;
+    /* The "unit: N run, M failed" prefix is parsed by tooling - keep it and
+     * only append to it. */
+    fprintf(stderr, "unit: %d run, %d failed, %d skipped\n",
+            tests_run, tests_failed, tests_skipped);
+    if (tests_failed != 0) {
+        return 1;
+    }
+    if (tests_skipped != 0) {
+        /* A counted skip that still exits 0 is indistinguishable from a run in
+         * which nothing was skipped, so the suite can go silently vacuous (a
+         * missing toolchain, an unwritable /tmp, a fixture that never built)
+         * while CI stays green. Make that red unless the caller explicitly
+         * opts in with INJECTOR_ALLOW_SKIP=1 - which is also the knob the ELF
+         * sub-tests honour before they report a skip instead of a failure. */
+        const char *allow = getenv("INJECTOR_ALLOW_SKIP");
+        if (allow == NULL || strcmp(allow, "1") != 0) {
+            fprintf(stderr,
+                    "ERROR: %d sub-test(s) were skipped, and a skipped sub-test "
+                    "is not a passing one.\n"
+                    "       Re-run with INJECTOR_ALLOW_SKIP=1 to accept a run "
+                    "that skips.\n", tests_skipped);
+            return 1;
+        }
+        fprintf(stderr,
+                "WARNING: %d sub-test(s) skipped because INJECTOR_ALLOW_SKIP=1\n",
+                tests_skipped);
+    }
+    return 0;
 }

@@ -19,7 +19,12 @@ jobs:
         sudo apt-get remove mono-runtime
     - name: build
       run: |
-        cd tests && make cross
+        # `make cross` builds the per-arch fixtures (test-prog-x86_64,
+        # test-target-i386, ...) that the arch-pair steps below run, but not the
+        # unsuffixed test-target / test-library.so that the CLI steps use, so
+        # build those too. `cross` also leaves src/linux/libinjector.a rebuilt
+        # for the host arch; see tests/Makefile.
+        cd tests && make cross && make all
     - name: unit tests
       run: |
         make unit
@@ -68,16 +73,33 @@ jobs:
     - name: CLI one-shot --run across all delivery modes
       run: |
         cd tests
-        ./test-target & tp=$!
-        sleep 1
+        # Fail with a diagnosis instead of a shell error plus a bewildering
+        # "PTRACE_ATTACH error : No such process" from the first injection.
+        test -x ./test-target || {
+          echo "::error::tests/test-target is missing - the build step must run 'make cross && make all'"
+          exit 1; }
+        test -f ./test-library.so || {
+          echo "::error::tests/test-library.so is missing - the build step must run 'make cross && make all'"
+          exit 1; }
+        # One target per invocation: test-target only lives ~6 s (SLEEP_SECS),
+        # so a single target cannot outlive four sequential attach/invoke/detach
+        # round trips on a loaded runner. Reusing one made this step flaky by
+        # construction rather than by bug.
         for mode in auto nonstop ptrace; do
+          ./test-target & tp=$!
+          sleep 1
           ../cmd/injector --pid $tp --delivery $mode --timeout 10000 \
             --run "$PWD/test-library.so:entry_noarg"
+          kill $tp 2>/dev/null || true
+          wait $tp 2>/dev/null || true
         done
+        ./test-target & tp=$!
+        sleep 1
         ../cmd/injector --pid $tp --timeout 10000 \
           --run "$PWD/test-library.so:entry_threeargs" -a 1 -a 2 -a 3
         ../cmd/injector --pid $tp --info
         kill $tp 2>/dev/null || true
+        wait $tp 2>/dev/null || true
     - name: CLI must reject bad input without crashing
       run: |
         cd cmd
@@ -88,15 +110,61 @@ jobs:
         # it the kernel panics with "Attempted to kill init!". Argument
         # validation is exercised against pids that do not exist, and the
         # attaching cases against a throwaway target we start ourselves.
-        for args in "--pid 0 --info" "--pid -1 --info" "--pid 999999 --info" \
+        #
+        # "Does not exist" must be *proven*, and /proc alone cannot prove it:
+        # a live thread's TID has NO /proc/<tid> entry (only
+        # /proc/<tgid>/task/<tid>), and injector_attach() does not require a
+        # thread-group leader, so PTRACE_ATTACH on a TID *succeeds*. Scanning
+        # /proc for a gap can therefore land on somebody's thread - and
+        # `--run /nonexistent.so:foo` attaches *before* it fails to load the
+        # library, so it would really patch an int3 trampoline into that
+        # thread's libc. That is precisely the accident this step exists to
+        # prevent, so no /proc gap scan is used here.
+        #
+        # Use pid_max itself instead. The kernel only allocates pids in
+        # [1, pid_max - 1], so pid_max is never a process and never a thread,
+        # and - unlike a scanned gap - it cannot be claimed by a fork() in the
+        # window between the check below and the attach, i.e. there is no
+        # TOCTOU at all. It is still re-checked with BOTH /proc and kill -0
+        # (kill -0 is what would catch a TID), and if anything answers to it
+        # this step fails loudly instead of silently substituting another
+        # number that has not been proven free.
+        #
+        # Reading pid_max is all-or-nothing for the same reason: if it cannot be
+        # read there is NO number left that is proven free, and falling back to a
+        # constant (32768 used to be it) is a guess - on a host with the common
+        # pid_max=4194304 that constant is well inside the allocatable range and
+        # may be a live process or a live thread, i.e. the `--run` cases below
+        # could really patch an int3 trampoline into somebody else's libc. The
+        # "(== pid_max)" wording in the messages is only true because nothing is
+        # ever substituted here.
+        pid_max=$(cat /proc/sys/kernel/pid_max 2>/dev/null)
+        case "$pid_max" in
+          ''|*[!0-9]*)
+            echo "::error::cannot read /proc/sys/kernel/pid_max; refusing to guess a victim pid"
+            exit 1
+            ;;
+        esac
+        p=$pid_max
+        # 4194304 == PID_MAX_LIMIT, the largest pid the CLI will accept.
+        if [ "$p" -le 1 ] || [ "$p" -gt 4194304 ]; then
+          echo "::error::pid_max=$p is outside the usable range (1, 4194304]; refusing to guess a victim pid"
+          exit 1
+        fi
+        if [ -e "/proc/$p" ] || kill -0 "$p" 2>/dev/null; then
+          echo "::error::pid $p (== pid_max) unexpectedly exists (/proc entry or kill -0 answered); refusing to substitute another guess"
+          exit 1
+        fi
+        echo "exercising argument validation against pid $p (== pid_max: never allocated as a process or a thread)"
+        for args in "--pid 0 --info" "--pid -1 --info" "--pid $p --info" \
                     "--pid 8589934593 --info" "--pid 4294967297 --info" \
-                    "--timeout abc --pid 999999 --info" \
-                    "--timeout 4294967300 --pid 999999 --info" \
-                    "--timeout 0 --pid 999999 --info" \
-                    "--delivery bogus --pid 999999 --run /a.so:b" \
-                    "--arg 5 --pid 999999" \
-                    "--run /nonexistent.so:foo --pid 999999" \
-                    "--run /tmp/no-colon-here --pid 999999" \
+                    "--timeout abc --pid $p --info" \
+                    "--timeout 4294967300 --pid $p --info" \
+                    "--timeout 0 --pid $p --info" \
+                    "--delivery bogus --pid $p --run /a.so:b" \
+                    "--arg 5 --pid $p" \
+                    "--run /nonexistent.so:foo --pid $p" \
+                    "--run /tmp/no-colon-here --pid $p" \
                     "--bogus-flag"; do
           ./injector $args >/dev/null 2>&1
           rc=$?
@@ -115,6 +183,21 @@ jobs:
         if ! kill -0 $tp 2>/dev/null; then
           echo "throwaway target died during CLI abuse tests"; fail=1
         fi
+        # kill -0 is NOT sufficient: it also succeeds for a ptrace-stopped
+        # process, which is precisely the regression this step is here to catch
+        # (an attach that fails and leaves the target stopped instead of
+        # detaching cleanly). Ask the kernel for the real state instead.
+        # 'T' = stopped, 't' = tracing stop; both mean the target is stuck.
+        state=$(awk '/^State:/ { print $2 }' "/proc/$tp/status" 2>/dev/null)
+        if [ -z "$state" ]; then
+          echo "could not read State: from /proc/$tp/status"; fail=1
+        else
+          echo "throwaway target state after CLI abuse: $state"
+          case "$state" in
+            T|t) echo "REGRESSION: throwaway target left stopped/tracing-stopped (State: $state)"; fail=1 ;;
+          esac
+        fi
+        kill -CONT $tp 2>/dev/null
         kill $tp 2>/dev/null
         # Deliberately NOT probing pid 1 here. A live `--pid 1 --run ...`
         # probe is only safe if the attach-path guard is present and correct,
@@ -172,7 +255,9 @@ jobs:
         cp include/injector.h      bindings/rust/injector-sys/vendor/injector.h
     - name: Go binding
       run: |
-        cd pkg/injector && go test -count=1 ./...
+        # -v so that SKIPs are visible: a silently skipped binding test must
+        # not read as a passing one.
+        cd pkg/injector && go test -v -count=1 ./...
     - name: Python binding
       run: |
         cp src/linux/libinjector.so.1.0.0 bindings/python/injector/libinjector.so

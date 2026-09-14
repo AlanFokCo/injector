@@ -71,17 +71,6 @@ def _load_lib():
 
 _lib = _load_lib()
 
-# The struct layouts declared below are hardcoded copies of the C headers, so
-# loading a libinjector with a different ABI would silently corrupt memory
-# rather than fail loudly. Check it once, at import time.
-EXPECTED_ABI_VERSION = 1
-_abi = _lib.injector_abi_version()
-if _abi != EXPECTED_ABI_VERSION:
-    raise RuntimeError(
-        "libinjector ABI mismatch: this binding expects ABI version {}, the "
-        "loaded library reports {}. Rebuild/reinstall libinjector from this "
-        "source tree.".format(EXPECTED_ABI_VERSION, _abi))
-
 # --- argtypes / restype declarations ---
 
 _lib.injector_abi_version.argtypes = []
@@ -171,6 +160,26 @@ _lib.injector_remote_func_addr.argtypes = [
     ctypes.POINTER(ctypes.c_size_t),
 ]
 _lib.injector_remote_func_addr.restype = ctypes.c_int
+
+# The struct layouts declared above are hardcoded copies of the C headers, so
+# loading a libinjector with a different ABI would silently corrupt memory
+# rather than fail loudly. Check it once, at import time.
+#
+# MINOR: the check runs *after* the declarations above, not before them.
+# injector_abi_version() is `unsigned` in include/injector.h, while an
+# undeclared ctypes function defaults to restype c_int: checking first decoded
+# the version as a signed int, so a library reporting a version with the top bit
+# set (>= 2**31) was compared - and quoted in the mismatch message - as a
+# negative number. The declarations are pure ctypes metadata and call nothing in
+# C, so checking after them still means nothing below, and no user code, ever
+# runs against a mismatched library: the import raises.
+EXPECTED_ABI_VERSION = 1
+_abi = _lib.injector_abi_version()
+if _abi != EXPECTED_ABI_VERSION:
+    raise RuntimeError(
+        "libinjector ABI mismatch: this binding expects ABI version {}, the "
+        "loaded library reports {}. Rebuild/reinstall libinjector from this "
+        "source tree.".format(EXPECTED_ABI_VERSION, _abi))
 
 
 def get_lib():

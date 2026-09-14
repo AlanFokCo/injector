@@ -4,22 +4,26 @@ on:
   pull_request:
   # Run on demand: `gh workflow run tests --ref master`.
   #
-  # This repository is a fork, and GitHub does not start push/pull_request
-  # workflows on a fork until somebody with admin rights clicks "I understand my
-  # workflows, go ahead and enable them" on the Actions tab - a toggle that is
-  # only reachable from the web UI, not from the REST API (the API already
-  # reports actions/permissions enabled=true).
+  # This trigger was added on a theory that turned out to be wrong, and the
+  # correction is worth keeping because the wrong version was plausible.
   #
-  # workflow_dispatch is kept as a FALLBACK path: it is BELIEVED not to be gated
-  # on that per-event toggle, which is why it stays available rather than the
-  # suite silently never executing anywhere. Believed, not verified - a dispatch
-  # API call returned HTTP 422 "no workflow_dispatch trigger", which only proves
-  # the trigger was missing from this file. It says nothing about whether the
-  # web-UI gate above would let a dispatch through, so the premise this fallback
-  # rests on is still an assumption.
+  # The theory: this repository is a fork, and GitHub withholds push and
+  # pull_request workflows on a fork until somebody with admin rights clicks "I
+  # understand my workflows, go ahead and enable them" on the Actions tab - a
+  # toggle reachable only from the web UI, while the REST API already reported
+  # actions/permissions enabled=true and not one run had ever been created.
+  # workflow_dispatch was added as a fallback believed not to be gated on that
+  # per-event toggle. A dispatch API call had returned HTTP 422 "no
+  # workflow_dispatch trigger", which proved only that the trigger was missing
+  # from this file, and was read as more support than it gave.
   #
-  # As of this commit zero workflow runs have been observed on this fork, so
-  # nothing in this file is proven to have executed on a real runner yet.
+  # Measured: the first push after this trigger landed started a push run AND an
+  # explicit `gh workflow run tests --ref master` started a dispatch run, with
+  # no UI toggle ever clicked. So the fork gate was not what had kept the suite
+  # from executing - the likelier explanation is that nothing had been pushed
+  # since Actions was enabled. Both triggers are kept because both are useful
+  # (push covers every change, dispatch re-runs without a new commit), not
+  # because one is a workaround for the other.
   workflow_dispatch:
 
 jobs:

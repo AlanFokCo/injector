@@ -4,6 +4,15 @@ on:
     
 jobs:
   gh-pages:
+    # Skipped on a fork, where this job cannot succeed and never will: it pushes
+    # to a `gh-pages` branch that does not exist there (so `git fetch origin
+    # gh-pages` fails), using GITHUB_TOKEN, which is read-only for a fork's own
+    # Actions. Publishing the API docs is a release concern of the upstream
+    # repository, not of a fork, and an unconditionally red workflow on every
+    # push is worse than no workflow - it trains people to read past red, which
+    # is how a real failure in tests.yml gets missed. The condition is on the
+    # job, not on the trigger, so nothing about the upstream behaviour changes.
+    if: ${{ !github.event.repository.fork }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3

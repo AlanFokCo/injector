@@ -33,8 +33,10 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -320,7 +322,9 @@ int injector_inject(injector_t *injector, const char *path, void **handle)
 /* Defined below with the NONSTOP delivery code. Both clone() helpers need it:
  * a CLONE_VM child that is never reaped stays a zombie in the target's process
  * table for as long as the target lives. */
-static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful);
+static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful,
+                                  unsigned long long child_starttime);
+static unsigned long long nonstop_child_stamp(pid_t child);
 
 int injector_inject_in_cloned_thread(injector_t *injector, const char *path, void **handle_out)
 {
@@ -396,6 +400,9 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
      * child itself: without an explicit wait4 every call leaves one zombie in
      * the target for the rest of its life. Reap it on every exit path below. */
     const pid_t child = (pid_t)retval;
+    /* Identity stamp for nonstop_cleanup_child()'s local-signal fallback; see
+     * the same call in injector_invoke_nonstop(). */
+    const unsigned long long child_starttime = nonstop_child_stamp(child);
     const struct timespec ts = {0, 100000000}; /* 0.1 second */
     void *handle;
     int cnt = 0;
@@ -404,7 +411,7 @@ retry:
     nanosleep(&ts, NULL);
     rv = injector__read(injector, injector->data, &handle, sizeof(handle));
     if (rv != 0) {
-        nonstop_cleanup_child(injector, child, 0);
+        nonstop_cleanup_child(injector, child, 0, child_starttime);
         return rv;
     }
     if (handle == invalid_handle) {
@@ -414,7 +421,7 @@ retry:
         }
         injector__set_errmsg("dlopen doesn't return in %d seconds.", max_retry_cnt / 10);
         /* dlopen never returned: the child is stuck, so kill it as well. */
-        nonstop_cleanup_child(injector, child, 0);
+        nonstop_cleanup_child(injector, child, 0, child_starttime);
         return INJERR_ERROR_IN_TARGET;
     }
     if (handle_out != NULL) {
@@ -434,10 +441,10 @@ retry:
         }
         /* Reap only AFTER the dlerror text has been copied out of the shared
          * page: killing the child first could truncate that message. */
-        nonstop_cleanup_child(injector, child, 0);
+        nonstop_cleanup_child(injector, child, 0, child_starttime);
         return INJERR_ERROR_IN_TARGET;
     }
-    nonstop_cleanup_child(injector, child, 0);
+    nonstop_cleanup_child(injector, child, 0, child_starttime);
     return 0;
 }
 #endif
@@ -1101,6 +1108,208 @@ static int injector_invoke_ptrace(injector_t *inj, const char *path, const char 
  * munmap, so these are spelled out here. */
 #define NONSTOP_SYS_kill  62
 #define NONSTOP_SYS_wait4 61
+/* 20ms x 5: how long INJECTOR_TIMEOUT_LEAVE lets the helper terminate on its
+ * own before SIGKILL follows. Bounded so a hung helper cannot extend the
+ * caller-visible latency of an invoke that has already timed out. */
+#define NONSTOP_TERM_GRACE_POLLS 5
+
+/* BLOCKER 2: is `pid_number` meaningful in OUR pid namespace?
+ *
+ * The helper's pid is the return value of clone() executed INSIDE the target,
+ * so it is a pid in the TARGET's namespace. With a containerised target the
+ * same number names a completely unrelated host process, and signalling it
+ * from here would SIGKILL an innocent victim. If the namespaces cannot be
+ * compared at all (no /proc, no nsfs), assume they differ: refusing to signal
+ * locally is always safe, signalling the wrong process is not. */
+static int nonstop_pidns_shared(pid_t target)
+{
+    struct stat self_ns, target_ns;
+    char path[64];
+
+    if (target <= 0) {
+        return 0;
+    }
+    if (stat("/proc/self/ns/pid", &self_ns) != 0) {
+        return 0;
+    }
+    snprintf(path, sizeof(path), "/proc/%d/ns/pid", (int)target);
+    if (stat(path, &target_ns) != 0) {
+        return 0;
+    }
+    return self_ns.st_dev == target_ns.st_dev && self_ns.st_ino == target_ns.st_ino;
+}
+
+/* Is `child` still OUR helper, and not somebody else who inherited the number?
+ *
+ * Only meaningful when both processes share a pid namespace. A pid-namespace
+ * check says nothing about RECYCLING: if the remote kill could not be performed
+ * (typically because the target died), the helper is usually gone too and the
+ * kernel is free to hand its pid to an unrelated process. Signalling that would
+ * kill an innocent victim, so the local fallback has to prove identity first.
+ * The helper is a clone() child of the target's main thread, so its PPid is the
+ * target and stays the target until the target dies; a recycled pid has a
+ * different parent. */
+struct nonstop_proc_id {
+    char state;                     /* field 3 of /proc/pid/stat */
+    long ppid;                      /* field 4 */
+    unsigned long long starttime;   /* field 22: the kernel's per-process stamp */
+};
+
+/* Read the identity fields of a process. Returns 0 on success, -1 if it is gone
+ * or /proc is unparseable (which the caller must treat as "not ours"). */
+static int nonstop_read_id(pid_t pid, struct nonstop_proc_id *out)
+{
+    char path[64], buf[1024];
+    const char *after_comm, *p;
+    FILE *f;
+    size_t n;
+    int field;
+
+    if (pid <= 0 || out == NULL) {
+        return -1;
+    }
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
+    f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    /* Field 2 (comm) is parenthesised and may itself contain spaces and
+     * parentheses, so parse from the LAST ')' - everything after it is numeric
+     * except the single-character state. strtoull rather than sscanf("%c %ld"):
+     * starttime (field 22) has to be reached by counting, and a %*d skip list
+     * long enough to do that is unreadable and brittle. */
+    after_comm = strrchr(buf, ')');
+    if (after_comm == NULL) {
+        return -1;
+    }
+    p = after_comm + 1;
+    while (*p == ' ') { p++; }
+    if (*p == '\0') {
+        return -1;
+    }
+    out->state = *p++;
+    out->ppid = 0;
+    out->starttime = 0;
+    for (field = 4; field <= 22; field++) {
+        char *end = NULL;
+        unsigned long long v;
+
+        while (*p == ' ') { p++; }
+        if (*p == '\0') {
+            return -1;
+        }
+        v = strtoull(p, &end, 10);
+        if (end == p) {
+            return -1;
+        }
+        p = end;
+        if (field == 4) {
+            out->ppid = (long)v;
+        } else if (field == 22) {
+            out->starttime = v;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* The kernel start time of a freshly cloned helper, recorded while it is
+ * certainly ours. 0 when it cannot be read - which is the case whenever the
+ * helper lives in another pid namespace (no /proc entry here), and that
+ * deliberately disables the local-signal fallback in nonstop_cleanup_child():
+ * cross-namespace there is no safe way to identify the process wearing a pid. */
+static unsigned long long nonstop_child_stamp(pid_t child)
+{
+    struct nonstop_proc_id id;
+
+    if (nonstop_read_id(child, &id) != 0) {
+        return 0;
+    }
+    return id.starttime;
+}
+
+/* Is `child` still the helper we cloned, rather than somebody else wearing a
+ * recycled pid? `want_starttime` is the stamp recorded right after clone(); 0
+ * means it could not be recorded (different pid namespace), and then this always
+ * answers no - the caller must not signal locally in that case anyway.
+ *
+ * PPid alone is not enough: the helper is a child of the target, and so is any
+ * process the target forks afterwards, so a target that forks steadily can hand
+ * the recycled pid to a new child of its own and PPid would match again. The
+ * kernel never reuses starttime for a recycled pid, so requiring both closes
+ * that window. */
+static int nonstop_child_is_ours(pid_t child, pid_t target, unsigned long long want_starttime)
+{
+    struct nonstop_proc_id id;
+
+    if (target <= 0 || want_starttime == 0) {
+        return 0;
+    }
+    if (nonstop_read_id(child, &id) != 0) {
+        return 0;
+    }
+    return id.state != 'Z' && id.ppid == (long)target && id.starttime == want_starttime;
+}
+
+/* kill(2) executed BY THE TARGET, the one process for which `child` is
+ * unambiguous. Returns 0 when the outcome is known (*alive tells whether the
+ * child still existed), -1 when it could not be determined (remote call
+ * failure, or an unexpected errno). */
+static int nonstop_remote_kill(injector_t *inj, pid_t child, int sig, int *alive)
+{
+    intptr_t r = 0;
+
+    errno = 0;
+    if (injector__call_syscall(inj, &r, NONSTOP_SYS_kill, (long)child, (long)sig,
+                               (long)0, (long)0, (long)0, (long)0) != 0) {
+        return -1;
+    }
+    if (r == 0) {
+        if (alive != NULL) { *alive = 1; }
+        return 0;
+    }
+    /* injector__call_syscall() turns a remote -errno into retval -1 + errno. */
+    if (errno == ESRCH) {
+        if (alive != NULL) { *alive = 0; }
+        return 0;
+    }
+    return -1;
+}
+
+/* wait4(WNOHANG|__WALL) executed BY THE TARGET, the only process that can reap
+ * the helper (waitpid() here would fail with ECHILD). Returns 0 when the outcome
+ * is known - *reaped says whether the child is out of the target's process
+ * table - and -1 when the remote call itself failed.
+ *
+ * This, not kill(child, 0), is how "has it terminated?" must be asked: an exited
+ * helper is a ZOMBIE until the target reaps it, and the target is ptrace-stopped
+ * and cannot reap on its own, so a zombie keeps answering kill(pid, 0)
+ * indefinitely. __WALL is required because the clone child's exit_signal is
+ * SIGCHLD but it is not a thread of the target either. */
+static int nonstop_remote_reap(injector_t *inj, pid_t child, int *reaped)
+{
+    intptr_t w = 0;
+
+    *reaped = 0;
+    errno = 0;
+    if (injector__call_syscall(inj, &w, NONSTOP_SYS_wait4, (long)child, (long)0,
+                               (long)(WNOHANG | __WALL), (long)0, (long)0,
+                               (long)0) != 0) {
+        return -1;
+    }
+    if ((pid_t)w == child) {
+        *reaped = 1;                          /* reaped just now */
+        return 0;
+    }
+    if (w == -1 && errno == ECHILD) {
+        *reaped = 1;                          /* already gone from its table */
+        return 0;
+    }
+    return 0;                                 /* still running, or a zombie */
+}
 
 /* BLOCKER 1: terminate and reap the CLONE_VM helper child started by
  * injector_invoke_nonstop().
@@ -1109,15 +1318,21 @@ static int injector_invoke_ptrace(injector_t *inj, const char *path, const char 
  * hangs -> INJERR_TIMEOUT) it was never killed nor reaped: it survived the
  * target's death, was reparented to init and kept ~1.7MB of the target's
  * address space pinned forever, and injector_detach() munmapped the region
- * holding its stack. `graceful` sends SIGTERM first (INJECTOR_TIMEOUT_LEAVE);
+ * holding its stack. `graceful` (a timeout combined with INJECTOR_TIMEOUT_LEAVE)
+ * sends SIGTERM first and waits briefly for the helper to terminate on its own;
  * SIGKILL always follows so the child cannot outlive the call on any path.
  * Best effort: failures here must not mask the caller's error code. */
-static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful)
+static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful,
+                                  unsigned long long child_starttime)
 {
     const struct timespec ts = {0, 20 * 1000 * 1000}; /* 20ms */
     char saved_errmsg[sizeof(inj->errmsg)];
     char saved_errmsg_set = inj->errmsg_set;
-    int i;
+    const int local_pids_usable = nonstop_pidns_shared(inj->pid);
+    int alive = 0;
+    int reaped = 0;
+    int unreachable = 0;
+    int i;   /* reused by the SIGTERM grace loop and the reap loop */
 
     if (child <= 0) {
         return;
@@ -1126,35 +1341,80 @@ static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful)
      * so its own diagnostics must not replace (or, on success, invent) the
      * caller-visible error message. */
     memcpy(saved_errmsg, inj->errmsg, sizeof(saved_errmsg));
-    if (graceful && kill(child, SIGTERM) != 0 && errno == EPERM) {
-        /* not permitted locally (different uid): the target has the right
-         * credentials, so signal it from there instead. */
-        injector__call_syscall(inj, NULL, NONSTOP_SYS_kill,
-                               (long)child, (long)SIGTERM, (long)0, (long)0, (long)0, (long)0);
+
+    /* BLOCKER 2: kill from INSIDE the target. The previous code signalled the
+     * child locally first and only fell back to a remote kill on EPERM, which
+     * was wrong twice over:
+     *   - cross-namespace, kill(child, SIGKILL) hits an unrelated host process
+     *     that merely happens to own that pid number;
+     *   - the fallback never ran when the local kill failed with ESRCH, which
+     *     is exactly what a containerised target's pid looks like from here, so
+     *     the helper was left alive, pinning the target's mm and running on a
+     *     stack that injector_detach() then munmaps.
+     * Note the local path is NOT a harmless extra: once the helper dies its pid
+     * can be recycled, so a "belt and braces" local SIGKILL can still kill an
+     * innocent process. It is therefore only used when the remote kill could
+     * not be performed at all AND both processes share a pid namespace. */
+    if (graceful) {
+        (void)nonstop_remote_kill(inj, child, SIGTERM, NULL);
+        /* INJECTOR_TIMEOUT_LEAVE promises the helper gets a chance to terminate,
+         * and SIGKILL used to follow the SIGTERM with no gap at all, so the two
+         * timeout actions behaved identically. Poll for a bounded moment - with a
+         * remote wait4, because an exited helper is a zombie that still answers
+         * kill(pid, 0) while the stopped target cannot reap it, so a liveness
+         * probe here would never see the exit and would always burn the whole
+         * grace period. */
+        for (i = 0; i < NONSTOP_TERM_GRACE_POLLS; i++) {
+            nanosleep(&ts, NULL);
+            if (nonstop_remote_reap(inj, child, &reaped) != 0) {
+                break;              /* target unreachable: waiting cannot help */
+            }
+            if (reaped) {
+                goto done;          /* it terminated on its own, and is reaped */
+            }
+        }
     }
-    if (kill(child, SIGKILL) != 0 && errno == EPERM) {
-        injector__call_syscall(inj, NULL, NONSTOP_SYS_kill,
-                               (long)child, (long)SIGKILL, (long)0, (long)0, (long)0, (long)0);
+    if (nonstop_remote_kill(inj, child, SIGKILL, &alive) != 0) {
+        unreachable++;
+        /* Last resort, and a narrow one: the remote kill could not be performed
+         * at all (target dead or desynced). Signalling locally is only safe when
+         * the pid namespace matches AND /proc still shows this pid as the
+         * target's own child - otherwise the number may already have been
+         * recycled and we would SIGKILL an unrelated process. */
+        if (local_pids_usable &&
+            nonstop_child_is_ours(child, inj->pid, child_starttime)) {
+            kill(child, SIGKILL);
+        }
     }
+
     /* The child belongs to the TARGET's process table, so only the target can
      * reap it (waitpid() here would fail with ECHILD). An unreaped zombie no
      * longer pins the mm (exit_mm() dropped the reference), but reap it
      * anyway so repeated invokes do not litter the target with children. */
     for (i = 0; i < 10; i++) {
-        intptr_t w = 0;
         nanosleep(&ts, NULL);
-        if (injector__call_syscall(inj, &w, NONSTOP_SYS_wait4, (long)child, 0,
-                                   (long)(WNOHANG | __WALL), (long)0, (long)0,
-                                   (long)0) == 0
-            && (pid_t)w == child) {
-            goto done;
+        if (nonstop_remote_reap(inj, child, &reaped) == 0) {
+            unreachable = 0;
+            if (reaped) {
+                goto done;                      /* reaped */
+            }
+        } else {
+            /* The child's death delivers SIGCHLD to the ptraced target, and the
+             * first remote call after that stops with "unexpectedly stopped by
+             * signal 17". The stop consumes (and discards) the signal, so simply
+             * retry -- the next wait4 reaps the zombie. A target that is
+             * unreachable for several calls in a row will not become reachable:
+             * stop instead of burning one call timeout per iteration. */
+            if (++unreachable >= 3) {
+                goto done;
+            }
+            continue;
         }
-        /* The child's death delivers SIGCHLD to the ptraced target, and the
-         * first remote call after that stops with "unexpectedly stopped by
-         * signal 17". The stop consumes (and discards) the signal, so simply
-         * retry -- the next wait4 reaps the zombie. */
-        if (kill(child, 0) != 0 && errno == ESRCH) {
-            goto done; /* gone, and already reaped (e.g. by the target itself) */
+        /* Still in the target's process table. A local kill(child, 0) would ask
+         * about a different process cross-namespace, and about a recycled pid
+         * even in the same one, so ask the target. */
+        if (nonstop_remote_kill(inj, child, 0, &alive) == 0 && !alive) {
+            goto done;
         }
     }
 done:
@@ -1248,6 +1508,10 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
      * and reaped before this function returns, on every path. */
     const pid_t child = (pid_t)clone_ret;
     int rc;
+    /* Stamp the helper's identity now, while it is certainly ours: if a remote
+     * kill later fails and cleanup has to consider signalling the pid locally,
+     * nonstop_child_is_ours() needs something a recycled pid cannot fake. */
+    const unsigned long long child_starttime = nonstop_child_stamp(child);
 
     /* Main thread stays ptrace-stopped. The clone child (CLONE_VM, separate
      * process sharing the address space) runs the invoke shellcode. Poll the
@@ -1319,13 +1583,17 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
 
 cleanup:
     /* BLOCKER 1 / injector->timeout_action: the child must never outlive this
-     * call. INJECTOR_TIMEOUT_KILL_THREAD kills it outright;
-     * INJECTOR_TIMEOUT_LEAVE asks it to terminate first, but SIGKILL still
-     * follows -- a surviving CLONE_VM child pins the target's mm_struct
-     * forever and injector_detach() munmaps the stack it runs on. */
+     * call. A timeout with INJECTOR_TIMEOUT_LEAVE asks it to terminate first;
+     * every other outcome - including a SUCCESSFUL invoke, where the helper has
+     * already exited and is only waiting to be reaped - goes straight to
+     * SIGKILL, because a grace period there would add latency to every invoke
+     * without anything left to spare. SIGKILL always follows the SIGTERM too:
+     * a surviving CLONE_VM child pins the target's mm_struct forever and
+     * injector_detach() munmaps the stack it runs on. */
     nonstop_cleanup_child(inj, child,
-                          !(rc == INJERR_TIMEOUT &&
-                            inj->timeout_action == INJECTOR_TIMEOUT_KILL_THREAD));
+                          rc == INJERR_TIMEOUT &&
+                          inj->timeout_action == INJECTOR_TIMEOUT_LEAVE,
+                          child_starttime);
     return rc;
 }
 #endif

@@ -165,6 +165,40 @@ int injector__call_syscall(const injector_t *injector, intptr_t *retval, long sy
 int injector__call_function(const injector_t *injector, intptr_t *retval, long function_addr, ...);
 int injector__call_function_va_list(const injector_t *injector, intptr_t *retval, long function_addr, va_list ap);
 
+/* The x86 trampoline bytes, shared by the two remote-call writers in
+ * remote_call.c and by injector__code_is_trampoline(). They were previously spelled out as literals
+ * in three places, so editing a writer changed what this library patches into a
+ * live target without changing what the detector looks for - a silent false
+ * negative in the one check whose job is to stop us adopting our own trampoline
+ * as the target's original code. Nothing would have failed: not the compiler,
+ * and not any test. tests/unit/test_trampoline.c now also asserts the detector
+ * against these macros, so a detector that stops following a writer is a red
+ * build. The non-x86 branches already shared their BREAKINST and REG constants
+ * and needed no such table. */
+#if defined(__x86_64__) || defined(__i386__)
+#define TRAMP_LEN        3    /* instruction bytes before the `nop` padding */
+#define TRAMP_NOP        0x90 /* padding, up to sizeof(long) == sizeof(code_t) */
+#define TRAMP_INT3       0xcc /* the break the remote call stops on */
+#define TRAMP_SYSCALL64_B0 0x0f /* `0f 05` syscall     (x86_64 / x32) */
+#define TRAMP_SYSCALL64_B1 0x05
+#define TRAMP_SYSCALL32_B0 0xcd /* `cd 80` int $0x80   (i386) */
+#define TRAMP_SYSCALL32_B1 0x80
+#define TRAMP_CALLFUNC_B0  0xff /* `ff d0` call *%rax / call *%eax - identical */
+#define TRAMP_CALLFUNC_B1  0xd0 /* encoding on both, so one pair serves both */
+#endif
+
+/* True if `code` is one of the trampolines the two callers above patch into a
+ * target, for `injector->arch`. Used at attach time to refuse a target that is
+ * still carrying one, rather than adopting it as the target's original code.
+ * Declared here, not forward-declared in the two .c files that use it, so the
+ * signature is checked against the definition in one place. */
+int injector__code_is_trampoline(const injector_t *injector, const code_t *code);
+
+/* Thread-group leader of `pid` (field 1 of /proc/<pid>/stat, i.e. what a clone
+ * child reports as its PPid), or -1. A clone child's parent is the TGID, never
+ * a non-leader thread's tid, so identity checks that compare ppid need this. */
+int injector__read_tgid(pid_t pid, pid_t *tgid_out);
+
 /* util.c */
 void injector__set_errmsg(const char *format, ...) __attribute__((format (printf, 1, 2)));
 const char *injector__arch2name(arch_t arch);

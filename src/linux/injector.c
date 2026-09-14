@@ -93,6 +93,11 @@ static inline size_t remote_mem_size(injector_t *injector) {
     return 2 * injector->data_size + injector->stack_size;
 }
 
+/* remote_call.c: do these bytes read out of the target match one of the
+ * trampolines injector itself writes at injector->code_addr? Declared at the
+ * call site rather than in injector_internal.h, the way ptrace.c declares
+ * injector__remote_call_reset(). */
+
 int injector__attach_internal(injector_t **injector_out, pid_t pid, const injector_opts_t *o)
 {
     injector_t *injector;
@@ -158,6 +163,38 @@ int injector__attach_internal(injector_t **injector_out, pid_t pid, const inject
     }
     rv = injector__read(injector, injector->code_addr, &injector->backup_code, sizeof(injector->backup_code));
     if (rv != 0) {
+        goto error_exit;
+    }
+
+    /* MAJOR 1: refuse to adopt our own trampoline as the target's original
+     * code.
+     *
+     * A handle that desynchronised (see remote_call.c's handle_timeout) can be
+     * left with the `syscall; int3` or `call *rax; int3` trampoline still
+     * patched into libc's e_entry, and the message it reports tells the user to
+     * "Detach and attach again". Following that advice used to read those very
+     * bytes into backup_code above, so from then on every "restore" - including
+     * the verified one cleanup_restore_full() performs - wrote the int3 back and
+     * reported success. The target's text is then permanently wrong and the
+     * original bytes are unrecoverable, because they are exactly what is
+     * missing; a live process that ever executes that address takes a SIGTRAP
+     * with no tracer attached and dies (the same failure remote_call.c's
+     * cleanup_restore_full() comment describes). On glibc the address is the
+     * libc.so banner stub, which an ordinary process does not call, so the trap
+     * is usually latent rather than immediate - but the corruption is real, it
+     * is silent, it survives every later attach because each one re-adopts it,
+     * and it is not ours to leave behind in a process that did nothing wrong.
+     * That is worse than the leak the desync table was built to contain.
+     *
+     * Detect and refuse. Nothing here may repair or overwrite the target, and
+     * the check is additive: injector__code_is_trampoline() matches the writers'
+     * full pattern including their nop padding, which no compiler emits after
+     * an int3 in a function prologue, so a clean target takes the same path it
+     * always did. error_exit detaches, leaving the target exactly as found. */
+    if (injector__code_is_trampoline(injector, &injector->backup_code)) {
+        injector__set_errmsg("refusing to attach to pid %d: it is still carrying an injector trampoline at %p (its libc entry point), left behind by an earlier session that could not restore the original bytes. Attaching would adopt the trampoline as the target's original code, so every later restore would re-install it and the original bytes would be lost for good; the target dies if it ever executes %p again. It cannot be repaired automatically - do not re-attach to it.",
+                             (int)pid, (void *)injector->code_addr, (void *)injector->code_addr);
+        rv = INJERR_OTHER;
         goto error_exit;
     }
 
@@ -319,12 +356,61 @@ int injector_inject(injector_t *injector, const char *path, void **handle)
 #endif
 
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
-/* Defined below with the NONSTOP delivery code. Both clone() helpers need it:
- * a CLONE_VM child that is never reaped stays a zombie in the target's process
- * table for as long as the target lives. */
+/* Everything the local-signal fallback in nonstop_cleanup_child() needs to
+ * identify the helper, captured right after clone() - the only moment when the
+ * helper is certainly ours AND the target is certainly alive:
+ *
+ *   child_starttime   the helper's kernel start stamp, read as /proc/<child>
+ *                     resolves in OUR namespace - so it is the HELPER's stamp
+ *                     only when the namespaces match. Cross-namespace the same
+ *                     number can name a stranger here, whose stamp would be
+ *                     recorded and matched just as happily. A non-zero stamp is
+ *                     therefore NOT evidence of a shared namespace (and 0 is not
+ *                     proof of a different one): `pidns_shared` below is the only
+ *                     thing that makes the number mean the helper, and the
+ *                     fallback must keep requiring both. 0 - unreadable, so no
+ *                     identity to check - disables it outright.
+ *   target_starttime  the target's stamp, so "the target is gone" can be told
+ *                     apart from "the target's pid was recycled by a stranger"
+ *                     after the target died.
+ *   pidns_shared      whether the helper's pid number means the same process in
+ *                     our namespace as in the target's - the gate that makes
+ *                     child_starttime mean anything, and so never dropped even
+ *                     when a stamp looks convincing. This MUST be evaluated
+ *                     while the target lives: nonstop_pidns_shared() compares
+ *                     /proc/<target>/ns/pid, which disappears with the target,
+ *                     and a dead target therefore used to look like "different
+ *                     namespace" - exactly when the fallback is needed most
+ *                     (MAJOR 1). A process's pid namespace cannot change during
+ *                     its lifetime, so the answer stays valid until it dies. */
+struct nonstop_child_ctx {
+    pid_t target;
+    /* MINOR 2: the target's thread-group leader - the pid that owns the mm the
+     * helper shares, that the helper's PPid actually names, and whose lifetime
+     * decides whether the helper can still be a child of a LIVE target. Equal
+     * to `target` for an ordinary (leader) attach, and also used as the
+     * fallback when /proc could not be read at clone time, in which case it is
+     * simply the pre-fix anchor. */
+    pid_t target_tgid;
+    unsigned long long child_starttime;
+    /* The stamp of `target_tgid`, NOT of `target`: for a non-leader-thread
+     * attach /proc/<tid>/stat reports that one thread's start time and
+     * /proc/<tid> disappears when the thread exits, neither of which says
+     * anything about the process that has to be gone before the fallback may
+     * signal. Read from the same pid nonstop_target_is_gone() later probes, so
+     * the comparison stays self-consistent. */
+    unsigned long long target_starttime;
+    int pidns_shared;
+};
+
+/* Both functions are defined below with the NONSTOP delivery code. Both clone()
+ * helpers need them: a CLONE_VM child that is never terminated and reaped stays
+ * a zombie in the target's process table for as long as the target lives, and
+ * outlives a dead target while pinning its mm. */
 static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful,
-                                  unsigned long long child_starttime);
-static unsigned long long nonstop_child_stamp(pid_t child);
+                                  const struct nonstop_child_ctx *ctx);
+static void nonstop_child_ctx_init(pid_t target, pid_t child,
+                                   struct nonstop_child_ctx *ctx);
 
 int injector_inject_in_cloned_thread(injector_t *injector, const char *path, void **handle_out)
 {
@@ -386,6 +472,11 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
                                  CLONE_VM,
                                  injector->data, (long)0, (long)0);
     if (rv != 0) {
+        /* Same DEFERRED LEAK as the identical path in injector_invoke_nonstop():
+         * a target that dies during this remote clone can leave a CLONE_VM
+         * helper whose pid never reached us, so nothing below can terminate or
+         * reap it. See the note there for why a safely-gated /proc scan would
+         * fix it and why it is deferred. */
         return rv;
     }
     if (retval == -1) {
@@ -400,9 +491,10 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
      * child itself: without an explicit wait4 every call leaves one zombie in
      * the target for the rest of its life. Reap it on every exit path below. */
     const pid_t child = (pid_t)retval;
-    /* Identity stamp for nonstop_cleanup_child()'s local-signal fallback; see
+    /* Identity context for nonstop_cleanup_child()'s local-signal fallback; see
      * the same call in injector_invoke_nonstop(). */
-    const unsigned long long child_starttime = nonstop_child_stamp(child);
+    struct nonstop_child_ctx child_ctx;
+    nonstop_child_ctx_init(injector->pid, child, &child_ctx);
     const struct timespec ts = {0, 100000000}; /* 0.1 second */
     void *handle;
     int cnt = 0;
@@ -411,7 +503,7 @@ retry:
     nanosleep(&ts, NULL);
     rv = injector__read(injector, injector->data, &handle, sizeof(handle));
     if (rv != 0) {
-        nonstop_cleanup_child(injector, child, 0, child_starttime);
+        nonstop_cleanup_child(injector, child, 0, &child_ctx);
         return rv;
     }
     if (handle == invalid_handle) {
@@ -421,7 +513,7 @@ retry:
         }
         injector__set_errmsg("dlopen doesn't return in %d seconds.", max_retry_cnt / 10);
         /* dlopen never returned: the child is stuck, so kill it as well. */
-        nonstop_cleanup_child(injector, child, 0, child_starttime);
+        nonstop_cleanup_child(injector, child, 0, &child_ctx);
         return INJERR_ERROR_IN_TARGET;
     }
     if (handle_out != NULL) {
@@ -441,10 +533,10 @@ retry:
         }
         /* Reap only AFTER the dlerror text has been copied out of the shared
          * page: killing the child first could truncate that message. */
-        nonstop_cleanup_child(injector, child, 0, child_starttime);
+        nonstop_cleanup_child(injector, child, 0, &child_ctx);
         return INJERR_ERROR_IN_TARGET;
     }
-    nonstop_cleanup_child(injector, child, 0, child_starttime);
+    nonstop_cleanup_child(injector, child, 0, &child_ctx);
     return 0;
 }
 #endif
@@ -560,6 +652,24 @@ int injector_detach(injector_t *injector)
      * a caller reading injector_last_error() before detach sees the error. */
     injector__set_current(NULL);
 
+    /* NIT 7: on a desynchronised handle this munmap is refused by
+     * kick_then_wait_sigtrap() before it touches the target, so the mapping -
+     * remote_mem_size() = 2 pages of data/shellcode plus the 2 MB stack, i.e.
+     * 2 MB + 8 KB on a 4 KB-page host - stays in the target until the target
+     * exits. The refusal is right for new work and wrong-looking for teardown,
+     * but teardown has no safe route either, so the leak is unavoidable rather
+     * than merely tolerated:
+     *   - there is no non-executing primitive that can unmap another process's
+     *     memory (process_vm_writev writes it, process_madvise only advises),
+     *     so a remote munmap syscall is the ONLY way to give the region back;
+     *   - a remote syscall has to patch the `0f 05 cc` trampoline into libc's
+     *     e_entry and re-stop the target to remove it again, and this handle is
+     *     marked desynchronised precisely because it can no longer guarantee
+     *     that re-stop. Attempting it would trade a bounded 2 MB + 8 KB leak
+     *     for a chance of leaving an int3 in a live process's entry point -
+     *     the corruption injector__code_is_trampoline() now refuses to adopt.
+     * It is not silent: injector_detach() returns the desync error below, so a
+     * caller is never told the target was cleaned up when it was not. */
     if (injector->mmapped) {
         int r = injector__call_syscall(injector, NULL, injector->sys_munmap, injector->data,
                                        remote_mem_size(injector), (long)0, (long)0, (long)0, (long)0);
@@ -1101,6 +1211,56 @@ static int injector_invoke_ptrace(injector_t *inj, const char *path, const char 
     return 0;
 }
 
+/* Read `pid`'s thread-group leader ("Tgid:" in /proc/<pid>/status). Returns 0
+ * and sets *tgid_out on success, -1 otherwise, and leaves *tgid_out untouched on
+ * failure so a caller's fallback value survives. errno is not meaningful on
+ * return; callers that are mid-report save and restore it themselves.
+ *
+ * /proc resolves a non-leader THREAD's directory by direct lookup even though
+ * the /proc root only enumerates group leaders - measured on Linux 6.8:
+ * /proc/<tid>/{stat,status,ns/pid} all open, and kill(tid, 0) answers for a live
+ * thread - so this works for a tid as well as for a pid. That is the whole
+ * point: PPid, and the lifetime of the address space a CLONE_VM helper pins or a
+ * trampoline is patched into, are properties of the GROUP, not of the one thread
+ * a caller happened to attach to.
+ *
+ * Shared with remote_call.c's desync table, which needs the same answer and
+ * cannot get it any other way: once a thread has exited there is no /proc entry
+ * left to read its Tgid from, so it has to be captured while the task lives.
+ * Declared locally at its call site there, the way ptrace.c declares
+ * injector__remote_call_reset(). */
+int injector__read_tgid(pid_t pid, pid_t *tgid_out)
+{
+    char path[64], line[256];
+    FILE *f;
+
+    if (pid <= 0 || tgid_out == NULL) {
+        return -1;
+    }
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+    f = fopen(path, "r");
+    if (f == NULL) {
+        return -1;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *end;
+        long v;
+
+        if (strncmp(line, "Tgid:", 5) != 0) {
+            continue;
+        }
+        v = strtol(line + 5, &end, 10);
+        fclose(f);
+        if (end == line + 5 || v <= 0) {
+            return -1;
+        }
+        *tgid_out = (pid_t)v;
+        return 0;
+    }
+    fclose(f);
+    return -1;
+}
+
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
 /* x86_64 syscall numbers, used to clean up the NONSTOP helper child from
  * inside the target. The nonstop delivery path is x86_64-only (see the
@@ -1146,17 +1306,30 @@ static int nonstop_pidns_shared(pid_t target)
  * (typically because the target died), the helper is usually gone too and the
  * kernel is free to hand its pid to an unrelated process. Signalling that would
  * kill an innocent victim, so the local fallback has to prove identity first.
- * The helper is a clone() child of the target's main thread, so its PPid is the
- * target and stays the target until the target dies; a recycled pid has a
- * different parent. */
+ * The helper is a clone() child of the thread we are driving, so its PPid is
+ * that thread's TGID - the target process - and stays that until the whole
+ * thread group dies; a recycled pid has a different parent. MINOR 2: PPid is
+ * never a non-leader thread's TID (the kernel reports task_tgid_nr_ns of the
+ * real parent), so identity has to be checked against the group, not against
+ * the pid the caller happened to attach to. */
 struct nonstop_proc_id {
     char state;                     /* field 3 of /proc/pid/stat */
     long ppid;                      /* field 4 */
     unsigned long long starttime;   /* field 22: the kernel's per-process stamp */
 };
 
-/* Read the identity fields of a process. Returns 0 on success, -1 if it is gone
- * or /proc is unparseable (which the caller must treat as "not ours"). */
+/* Read the identity fields of a process.
+ *   0   success
+ *  -1   the process is PROVABLY GONE: /proc/<pid>/stat does not exist. Only
+ *       ENOENT counts - a hidepid /proc (EACCES) or an exhausted fd table
+ *       (EMFILE) also fails to open, and answering "gone" for a process that is
+ *       merely invisible is the unsafe direction, the same reason
+ *       remote_call.c's desync_pid_gone() uses kill(pid, 0) rather than
+ *       access("/proc/<pid>").
+ *  -2   /proc answered but the content could not be parsed (short read, a comm
+ *       field without a closing ')', a non-numeric field). The process may well
+ *       be alive; callers must treat this as UNKNOWN, never as gone, and a
+ *       caller proving identity must treat it as "not ours". */
 static int nonstop_read_id(pid_t pid, struct nonstop_proc_id *out)
 {
     char path[64], buf[1024];
@@ -1166,12 +1339,12 @@ static int nonstop_read_id(pid_t pid, struct nonstop_proc_id *out)
     int field;
 
     if (pid <= 0 || out == NULL) {
-        return -1;
+        return -2;                              /* caller bug: nothing is known */
     }
     snprintf(path, sizeof(path), "/proc/%d/stat", (int)pid);
     f = fopen(path, "r");
     if (f == NULL) {
-        return -1;
+        return (errno == ENOENT) ? -1 : -2;     /* gone, vs. merely unreadable */
     }
     n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
@@ -1183,12 +1356,12 @@ static int nonstop_read_id(pid_t pid, struct nonstop_proc_id *out)
      * long enough to do that is unreadable and brittle. */
     after_comm = strrchr(buf, ')');
     if (after_comm == NULL) {
-        return -1;
+        return -2;
     }
     p = after_comm + 1;
     while (*p == ' ') { p++; }
     if (*p == '\0') {
-        return -1;
+        return -2;
     }
     out->state = *p++;
     out->ppid = 0;
@@ -1199,11 +1372,11 @@ static int nonstop_read_id(pid_t pid, struct nonstop_proc_id *out)
 
         while (*p == ' ') { p++; }
         if (*p == '\0') {
-            return -1;
+            return -2;
         }
         v = strtoull(p, &end, 10);
         if (end == p) {
-            return -1;
+            return -2;
         }
         p = end;
         if (field == 4) {
@@ -1213,45 +1386,178 @@ static int nonstop_read_id(pid_t pid, struct nonstop_proc_id *out)
             return 0;
         }
     }
-    return -1;
+    return -2;
 }
 
-/* The kernel start time of a freshly cloned helper, recorded while it is
- * certainly ours. 0 when it cannot be read - which is the case whenever the
- * helper lives in another pid namespace (no /proc entry here), and that
- * deliberately disables the local-signal fallback in nonstop_cleanup_child():
- * cross-namespace there is no safe way to identify the process wearing a pid. */
-static unsigned long long nonstop_child_stamp(pid_t child)
+/* The kernel start time (field 22 of /proc/<pid>/stat) of a process we own or
+ * are about to signal. 0 when it cannot be read. */
+static unsigned long long nonstop_proc_stamp(pid_t pid)
 {
     struct nonstop_proc_id id;
 
-    if (nonstop_read_id(child, &id) != 0) {
+    if (nonstop_read_id(pid, &id) != 0) {
         return 0;
     }
     return id.starttime;
 }
 
-/* Is `child` still the helper we cloned, rather than somebody else wearing a
- * recycled pid? `want_starttime` is the stamp recorded right after clone(); 0
- * means it could not be recorded (different pid namespace), and then this always
- * answers no - the caller must not signal locally in that case anyway.
+static void nonstop_child_ctx_init(pid_t target, pid_t child, struct nonstop_child_ctx *ctx)
+{
+    pid_t tgid = 0;
+
+    ctx->target = target;
+    /* MINOR 2: resolve the thread group HERE, while the target is certainly
+     * alive and its /proc entry certainly readable. Later - which is when the
+     * answer is needed - the target is typically dead and nothing can say which
+     * group a vanished pid belonged to. Falling back to `target` keeps the
+     * pre-fix anchor when /proc will not answer, rather than disabling the
+     * fallback altogether.
+     *
+     * The cost of that fallback, stated rather than left implicit: if `target`
+     * is a NON-LEADER thread's tid and read_tgid failed (a hidepid /proc, or a
+     * race with the thread exiting), then target_tgid is a tid, and that one
+     * thread exiting makes nonstop_target_is_gone() report the whole target
+     * gone while its process still lives. nonstop_child_is_ours() then rests on
+     * the start stamp plus the namespace gate alone, without ppid confirmation
+     * - the same residual documented at the stamp comparison below, reached by a
+     * narrower route. Killing is still correct in that case (the helper is ours
+     * and cleanup means to terminate it); what widens is only the window in
+     * which a recycled pid wearing a matching stamp could be mistaken for it.
+     * Rejected alternative: refusing the fallback when the tgid is unknown
+     * trades that for a guaranteed helper leak, which is the bug being fixed.
+     * injector__read_tgid() reads the same /proc/<pid>/stat field the stamp
+     * reader does, so if it failed the stamp very likely failed too and
+     * child_starttime == 0 already disables the whole fallback. */
+    if (injector__read_tgid(target, &tgid) != 0 || tgid <= 0) {
+        tgid = target;
+    }
+    ctx->target_tgid = tgid;
+    ctx->child_starttime = nonstop_proc_stamp(child);
+    ctx->target_starttime = nonstop_proc_stamp(tgid);
+    ctx->pidns_shared = nonstop_pidns_shared(target);
+}
+
+/* Is the target gone? Only answerable when its stamp was captured while it was
+ * alive; otherwise stay strict and say no. A zombie counts as gone: exit_notify()
+ * has already reparented its children (so the helper's PPid is no longer the
+ * target) and exit_mm() has already dropped the target's own mm reference, so it
+ * can neither reap nor vouch for the helper any more.
  *
- * PPid alone is not enough: the helper is a child of the target, and so is any
+ * MINOR 2: "gone" is asked of the THREAD GROUP (ctx->target_tgid), not of the
+ * pid the caller attached to. A non-leader thread can exit while its process
+ * lives, and that is the wrong answer here in both directions: /proc/<tid>
+ * disappearing with it used to read as "no /proc entry at all" -> gone, i.e. the
+ * fallback concluded the helper had been reparented when in fact its parent was
+ * alive and could still reap it. What actually has to be gone before the helper
+ * may be signalled locally is the process - the thing that owns the mm the
+ * helper pins and the thing its PPid names - and a thread's death says nothing
+ * about that. Probing the group leader is also what makes the answer stable:
+ * exit_notify() reparents a dying thread's children to another live thread of
+ * the SAME group, and PPid is the reaper's TGID, so the helper's PPid does not
+ * change at all when one thread exits. */
+static int nonstop_target_is_gone(const struct nonstop_child_ctx *ctx)
+{
+    struct nonstop_proc_id tid;
+    int rr;
+
+    if (ctx->target_tgid <= 0 || ctx->target_starttime == 0) {
+        return 0;
+    }
+    rr = nonstop_read_id(ctx->target_tgid, &tid);
+    if (rr == -1) {
+        return 1;                               /* /proc/<tgid> is absent: gone */
+    }
+    if (rr != 0) {
+        /* /proc answered but could not be parsed, or could not be opened for a
+         * reason other than ENOENT. Once PPid fails to match this is the only
+         * gate left before the fallback signals a pid locally, and treating
+         * "cannot tell" as "gone" is the unsafe direction: stay strict. */
+        return 0;
+    }
+    if (tid.starttime != ctx->target_starttime) {
+        return 1;                               /* recycled: OUR target is gone */
+    }
+    return tid.state == 'Z';
+}
+
+/* Is `child` still the helper we cloned, rather than somebody else wearing a
+ * recycled pid? Called only when the remote kill could not be performed, i.e.
+ * typically because the target just died, so `child`'s pid may already have
+ * been handed to an unrelated process.
+ *
+ * The anchor is starttime, recorded while the helper was certainly ours: for a
+ * stranger to be signalled, the kernel would have to recycle the very same pid
+ * number AND start the new process in the very same clock tick, which is what
+ * makes it safe to kill on that alone. PPid is a second, weaker anchor and is
+ * NOT sufficient by itself - the helper is a child of the target, and so is any
  * process the target forks afterwards, so a target that forks steadily can hand
- * the recycled pid to a new child of its own and PPid would match again. The
- * kernel never reuses starttime for a recycled pid, so requiring both closes
- * that window. */
-static int nonstop_child_is_ours(pid_t child, pid_t target, unsigned long long want_starttime)
+ * the recycled pid to a new child of its own and PPid would match again.
+ *
+ * NIT 8, stated explicitly because MAJOR 1 below turned the two anchors into an
+ * alternative rather than a conjunction: starttime is field 22 of
+ * /proc/<pid>/stat, in USER_HZ ticks, so on a 100 Hz host it only separates
+ * processes that started more than 10 ms apart and two processes CAN share it.
+ * The residual risk is nonetheless negligible, for three reasons that hold
+ * together:
+ *   - the number is not reusable at all until the helper has exited AND been
+ *     reaped - by the target, or by init/a subreaper once the target died. A
+ *     running or zombie helper still owns its pid, and the target is
+ *     ptrace-stopped and cannot reap on its own (which is why
+ *     nonstop_remote_reap() exists), so for most of this cleanup there is
+ *     nothing to recycle into;
+ *   - once it IS free, Linux hands pids out cyclically over the whole idr, so
+ *     the same number is not offered again until pid_max other allocations have
+ *     gone by: 32768 at the legacy minimum, 4194304 on this class of host
+ *     (measured: /proc/sys/kernel/pid_max = 4194304, CLK_TCK = 100). Coming
+ *     back round to it inside one 10 ms tick would need a sustained 3.3M
+ *     forks/s at the minimum and 419M forks/s at the measured value;
+ *   - every other gate still applies: the pid namespace must have been proven
+ *     shared at clone time, and either PPid must name our target's thread group
+ *     or that group must be provably gone.
+ * The alternative to killing on that evidence is not "be safer": it is a
+ * CLONE_VM helper that outlives its target and pins its mm_struct forever. A
+ * startcode/endcode or /proc/<cand>/mem cookie anchor would be strictly
+ * stronger but is not needed to make this decision, and both can fail to be
+ * readable for a process we do not trace - failing closed on them would
+ * re-open exactly the leak MAJOR 1 closed.
+ *
+ * MAJOR 1: PPid must not be *required*, either. When the target dies - the
+ * normal outcome of a timeout or a crash during injector_invoke_nonstop() - the
+ * helper is reparented before the target's /proc entry disappears, so
+ * `ppid == target` is false BY CONSTRUCTION, and requiring it disabled the
+ * fallback in precisely the case it exists for: the helper survived, and since
+ * it shares the target's mm via CLONE_VM it pinned that mm (and the stack
+ * injector_detach() munmaps) for good. So accept a reparented helper, but only
+ * once the target is provably gone - a LIVE target whose child wears a different
+ * parent is a stranger and is still refused. */
+static int nonstop_child_is_ours(pid_t child, const struct nonstop_child_ctx *ctx)
 {
     struct nonstop_proc_id id;
 
-    if (target <= 0 || want_starttime == 0) {
+    if (child <= 0 || ctx->child_starttime == 0) {
         return 0;
     }
     if (nonstop_read_id(child, &id) != 0) {
-        return 0;
+        return 0;                               /* gone, or not provably ours */
     }
-    return id.state != 'Z' && id.ppid == (long)target && id.starttime == want_starttime;
+    if (id.starttime != ctx->child_starttime) {
+        return 0;                               /* recycled pid: a stranger */
+    }
+    if (id.state == 'Z') {
+        return 0;                               /* dead; SIGKILL would be a no-op */
+    }
+    /* MINOR 2: PPid is the parent's TGID, so comparing it with `target` alone
+     * could never match a non-leader-thread attach, and with that thread still
+     * alive nonstop_target_is_gone() answers no as well - the helper was left
+     * running for every tid attach, which is precisely the leak MAJOR 1 was
+     * written to close. `target_tgid` is the anchor; the `== target` disjunct
+     * only carries weight when the TGID could not be read at clone time and
+     * target_tgid fell back to target. */
+    if (ctx->target > 0 &&
+        (id.ppid == (long)ctx->target_tgid || id.ppid == (long)ctx->target)) {
+        return 1;                               /* the ordinary live-target case */
+    }
+    return nonstop_target_is_gone(ctx);
 }
 
 /* kill(2) executed BY THE TARGET, the one process for which `child` is
@@ -1323,12 +1629,11 @@ static int nonstop_remote_reap(injector_t *inj, pid_t child, int *reaped)
  * SIGKILL always follows so the child cannot outlive the call on any path.
  * Best effort: failures here must not mask the caller's error code. */
 static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful,
-                                  unsigned long long child_starttime)
+                                  const struct nonstop_child_ctx *ctx)
 {
     const struct timespec ts = {0, 20 * 1000 * 1000}; /* 20ms */
     char saved_errmsg[sizeof(inj->errmsg)];
     char saved_errmsg_set = inj->errmsg_set;
-    const int local_pids_usable = nonstop_pidns_shared(inj->pid);
     int alive = 0;
     int reaped = 0;
     int unreachable = 0;
@@ -1378,11 +1683,14 @@ static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful,
         unreachable++;
         /* Last resort, and a narrow one: the remote kill could not be performed
          * at all (target dead or desynced). Signalling locally is only safe when
-         * the pid namespace matches AND /proc still shows this pid as the
-         * target's own child - otherwise the number may already have been
-         * recycled and we would SIGKILL an unrelated process. */
-        if (local_pids_usable &&
-            nonstop_child_is_ours(child, inj->pid, child_starttime)) {
+         * the pid namespace was known to match - decided at clone time, because
+         * by now the target's /proc/<pid>/ns/pid may be gone (MAJOR 1) - AND
+         * /proc still shows the pid wearing the helper's own start stamp, still
+         * as the target's child or provably reparented because the target died.
+         * Otherwise the number may already have been recycled and we would
+         * SIGKILL an unrelated process. This is the ONLY path that keeps a
+         * CLONE_VM helper from outliving a dead target and pinning its mm. */
+        if (ctx->pidns_shared && nonstop_child_is_ours(child, ctx)) {
             kill(child, SIGKILL);
         }
     }
@@ -1492,6 +1800,45 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
                                  (long)(CLONE_VM | SIGCHLD), (long)inj->data,
                                  (long)0, (long)0);
     if (rv != 0) {
+        /* DEFERRED LEAK - deferred for scope, NOT because it cannot be fixed
+         * safely. If the target died *during* this remote clone, clone() may
+         * already have created the helper before its pid could reach us, so
+         * `child` below is never known and nothing on any later path can
+         * terminate or reap it. The helper shares the target's mm via CLONE_VM,
+         * so it pins that whole mm_struct (our 2 MB + 8 KB region included) for
+         * as long as it lives, keeps running on a stack that injector_detach()'s
+         * munmap unmaps underneath it, and is reparented to init. Reproduced
+         * both before and after the BLOCKER 1/2 fixes.
+         *
+         * A /proc scan CAN identify such a helper, and this note must not claim
+         * that it cannot be done safely. The obvious gates are all available at
+         * this point: PPid == the target's thread-group id, so only a child of
+         * our own target is a candidate; starttime strictly LATER than a stamp
+         * taken immediately before this call, so nothing that already existed can
+         * match; pidns_shared, so the number names the same process here as it
+         * does in the target; and a cookie written into inj->data before the
+         * clone and read back from /proc/<cand>/mem. That is already a stronger
+         * identity test than nonstop_child_is_ours() applies to a helper whose
+         * pid IS known.
+         *
+         * Those four are necessary but NOT sufficient, and a note claiming
+         * otherwise would be wrong: an ordinary fork() child the target happened
+         * to create in the same window satisfies every one of them - same PPid,
+         * a later starttime, the same namespace, and a COW copy of the data page
+         * that reads the cookie back just as happily. What actually singles the
+         * helper out is that it SHARES the target's mm rather than inheriting a
+         * copy, so a sound scan needs a same-mm discriminator on top: kcmp(2)
+         * with KCMP_VM, or an active handshake (a nonce only a process sharing
+         * the mm can answer). Both are awkward exactly when they are needed -
+         * the target is dead, so there is no surviving process to kcmp against
+         * except another helper - which is a design problem to solve, not a
+         * reason to signal on the four gates alone.
+         *
+         * It is not implemented because it is a new mechanism (a /proc walk, a
+         * cookie protocol through the shared data page, and that discriminator)
+         * and this change set is confined to the reviewed findings - not because
+         * a safe version does not exist. Until it is, this path leaks one helper
+         * per occurrence. */
         if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
         return rv;
     }
@@ -1508,10 +1855,13 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
      * and reaped before this function returns, on every path. */
     const pid_t child = (pid_t)clone_ret;
     int rc;
-    /* Stamp the helper's identity now, while it is certainly ours: if a remote
-     * kill later fails and cleanup has to consider signalling the pid locally,
-     * nonstop_child_is_ours() needs something a recycled pid cannot fake. */
-    const unsigned long long child_starttime = nonstop_child_stamp(child);
+    /* Record the helper's identity now, while it is certainly ours and the
+     * target is certainly alive: if a remote kill later fails and cleanup has
+     * to consider signalling the pid locally, nonstop_child_is_ours() needs
+     * something a recycled pid cannot fake, and nonstop_pidns_shared() needs a
+     * target that still has a /proc entry to compare namespaces against. */
+    struct nonstop_child_ctx child_ctx;
+    nonstop_child_ctx_init(inj->pid, child, &child_ctx);
 
     /* Main thread stays ptrace-stopped. The clone child (CLONE_VM, separate
      * process sharing the address space) runs the invoke shellcode. Poll the
@@ -1593,7 +1943,7 @@ cleanup:
     nonstop_cleanup_child(inj, child,
                           rc == INJERR_TIMEOUT &&
                           inj->timeout_action == INJECTOR_TIMEOUT_LEAVE,
-                          child_starttime);
+                          &child_ctx);
     return rc;
 }
 #endif

@@ -73,6 +73,11 @@
 #define BREAKINST_ARM 0xe7f001f0 /* in linux-source-tree/arch/arm/kernel/ptrace.c */
 #define BREAKINST_ARM64 0xd4200000 /* asm("brk #0") */
 
+/* The TRAMP_* x86 trampoline byte macros live in injector_internal.h, next to
+ * code_t and arch_t, because three parties have to agree on them: the two
+ * writers below, injector__code_is_trampoline(), and
+ * tests/unit/test_trampoline.c. */
+
 #ifdef __mips__
 #define REG_V0 2
 #define REG_A0 4
@@ -332,10 +337,10 @@ int injector__call_syscall(const injector_t *injector, intptr_t *retval, long sy
     case ARCH_X86_64:
     case ARCH_X86_64_X32:
         /* setup instructions */
-        code.u8[0] = 0x0f;
-        code.u8[1] = 0x05; /* 0f 05 : syscall */
-        code.u8[2] = 0xcc; /* cc    : int3    */
-        memset(&code.u8[3], 0x90, sizeof(long) - 3); /* fill the rests with `nop` */
+        code.u8[0] = TRAMP_SYSCALL64_B0;
+        code.u8[1] = TRAMP_SYSCALL64_B1; /* 0f 05 : syscall */
+        code.u8[2] = TRAMP_INT3;         /* cc    : int3    */
+        memset(&code.u8[TRAMP_LEN], TRAMP_NOP, sizeof(long) - TRAMP_LEN); /* fill the rests with `nop` */
         code_size = sizeof(long);
         /* setup registers */
         regs.rip = injector->code_addr;
@@ -352,10 +357,10 @@ int injector__call_syscall(const injector_t *injector, intptr_t *retval, long sy
 #if defined(__x86_64__) || defined(__i386__)
     case ARCH_I386:
         /* setup instructions */
-        code.u8[0] = 0xcd;
-        code.u8[1] = 0x80; /* cd 80 : int $80 */
-        code.u8[2] = 0xcc; /* cc    : int3    */
-        memset(&code.u8[3], 0x90, sizeof(long) - 3); /* fill the rests with `nop` */
+        code.u8[0] = TRAMP_SYSCALL32_B0;
+        code.u8[1] = TRAMP_SYSCALL32_B1; /* cd 80 : int $80 */
+        code.u8[2] = TRAMP_INT3;         /* cc    : int3    */
+        memset(&code.u8[TRAMP_LEN], TRAMP_NOP, sizeof(long) - TRAMP_LEN); /* fill the rests with `nop` */
         code_size = sizeof(long);
         /* setup registers */
         regs.eip = injector->code_addr;
@@ -614,10 +619,10 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
     case ARCH_X86_64:
     case ARCH_X86_64_X32:
         /* setup instructions */
-        code.u8[0] = 0xff;
-        code.u8[1] = 0xd0; /* ff d0 : callq *%rax */
-        code.u8[2] = 0xcc; /* cc    : int3        */
-        memset(&code.u8[3], 0x90, sizeof(long) - 3); /* fill the rests with `nop` */
+        code.u8[0] = TRAMP_CALLFUNC_B0;
+        code.u8[1] = TRAMP_CALLFUNC_B1; /* ff d0 : callq *%rax */
+        code.u8[2] = TRAMP_INT3;        /* cc    : int3        */
+        memset(&code.u8[TRAMP_LEN], TRAMP_NOP, sizeof(long) - TRAMP_LEN); /* fill the rests with `nop` */
         code_size = sizeof(long);
         /* setup registers */
         regs.rip = injector->code_addr;
@@ -637,10 +642,10 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
 #if defined(__x86_64__) || defined(__i386__)
     case ARCH_I386:
         /* setup instructions */
-        code.u8[0] = 0xff;
-        code.u8[1] = 0xd0; /* ff d0 : call *%eax */
-        code.u8[2] = 0xcc; /* cc    : int3       */
-        memset(&code.u8[3], 0x90, sizeof(long) - 3); /* fill the rests with `nop` */
+        code.u8[0] = TRAMP_CALLFUNC_B0;
+        code.u8[1] = TRAMP_CALLFUNC_B1; /* ff d0 : call *%eax */
+        code.u8[2] = TRAMP_INT3;        /* cc    : int3       */
+        memset(&code.u8[TRAMP_LEN], TRAMP_NOP, sizeof(long) - TRAMP_LEN); /* fill the rests with `nop` */
         code_size = sizeof(long);
         /* setup registers */
         regs.eip = injector->code_addr;
@@ -825,6 +830,152 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
 }
 
 /* ------------------------------------------------------------------------
+ * Recognising our own trampoline.
+ *
+ * injector__attach_internal() reads sizeof(code_t) bytes at injector->code_addr
+ * (libc's e_entry) and keeps them as `backup_code`, i.e. as the target's
+ * ORIGINAL code that every later restore writes back. A handle that
+ * desynchronised can leave the trampoline installed there, so on a fresh attach
+ * that read would capture OUR bytes and present them as the target's: every
+ * later "restore" would then re-install an `int3` into libc's entry point and
+ * the target would die at its next call, silently and unrecoverably, because
+ * the original bytes are exactly what is missing. The bytes read at attach time
+ * are therefore matched against what the two writers above emit, and the attach
+ * is refused on a hit.
+ *
+ * How wide the match is, per architecture - it is NOT uniform, and a clean
+ * target must never be refused by mistake:
+ *   - x86 (both writers): exact and full-width over all of code_t, including the
+ *     `nop` padding, which no compiler emits after an `int3` in the middle of a
+ *     function prologue. Unambiguous.
+ *   - arm64, arm, powerpc, riscv: both words the writer emits, i.e. the whole
+ *     trampoline. Unambiguous.
+ *   - arm EABI thumb on an LP64 host: the two emitted halfwords. The writer also
+ *     pads u16[2..3] with `mov r8, r8` there; that padding is not compared, but
+ *     the breakinst plus the svc/blx halfword is already decisive without it.
+ *   - mips: three of the four words. The syscall writer puts the syscall NUMBER
+ *     in u32[1], so that word cannot be matched at all; u32[0] plus `syscall`
+ *     plus `break` is what is compared instead.
+ * This is detect-and-refuse ONLY: nothing here may repair or overwrite the
+ * target, and the `default:` branch answers "not ours" rather than guessing for
+ * an architecture this build has no writer for.
+ *
+ * Each branch reuses the corresponding writer's own preprocessor guard and word
+ * layout, and the byte patterns themselves are the TRAMP_* / BREAKINST_* /
+ * REG_* macros the writers emit, so the two cannot drift apart silently - on
+ * x86 that is now true by construction rather than by diligence, and
+ * tests/unit/test_trampoline.c asserts the detector against those macros so a
+ * detector-only edit is a red build rather than a false negative in the field.
+ * The remaining manual coupling is the per-arch guard and word layout; keep
+ * those in step with injector__call_syscall() and
+ * injector__call_function_va_list() above.
+ * ---------------------------------------------------------------------- */
+#if defined(__x86_64__) || defined(__i386__)
+/* Both x86 writers pad their 3-byte trampoline with `nop` up to sizeof(long),
+ * which on x86 is sizeof(code_t), so the whole word must look like that. */
+static int x86_trampoline_is_nop_padded(const code_t *code)
+{
+    size_t i;
+    for (i = TRAMP_LEN; i < sizeof(code_t); i++) {
+        if (code->u8[i] != TRAMP_NOP) {
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif
+
+int injector__code_is_trampoline(const injector_t *injector, const code_t *code)
+{
+    switch (injector->arch) {
+#if defined(__x86_64__) && defined(__LP64__)
+    case ARCH_X86_64:
+    case ARCH_X86_64_X32:
+        /* `0f 05 cc` = syscall; int3     (injector__call_syscall)
+         * `ff d0 cc` = callq *%rax; int3 (injector__call_function_va_list) */
+        if (code->u8[2] == TRAMP_INT3 &&
+            ((code->u8[0] == TRAMP_SYSCALL64_B0 &&
+              code->u8[1] == TRAMP_SYSCALL64_B1) ||
+             (code->u8[0] == TRAMP_CALLFUNC_B0 &&
+              code->u8[1] == TRAMP_CALLFUNC_B1))) {
+            return x86_trampoline_is_nop_padded(code);
+        }
+        return 0;
+#endif
+#if defined(__x86_64__) || defined(__i386__)
+    case ARCH_I386:
+        /* `cd 80 cc` = int $0x80; int3   (injector__call_syscall)
+         * `ff d0 cc` = call *%eax; int3  (injector__call_function_va_list) */
+        if (code->u8[2] == TRAMP_INT3 &&
+            ((code->u8[0] == TRAMP_SYSCALL32_B0 &&
+              code->u8[1] == TRAMP_SYSCALL32_B1) ||
+             (code->u8[0] == TRAMP_CALLFUNC_B0 &&
+              code->u8[1] == TRAMP_CALLFUNC_B1))) {
+            return x86_trampoline_is_nop_padded(code);
+        }
+        return 0;
+#endif
+#if defined(__aarch64__)
+    case ARCH_ARM64:
+        /* `svc #0; brk #0` or `blr x6; brk #0` */
+        return code->u32[1] == (uint32_t)BREAKINST_ARM64 &&
+               (code->u32[0] == 0xd4000001u || code->u32[0] == 0xd63f00c0u);
+#endif
+#if defined(__aarch64__) || defined(__arm__)
+    case ARCH_ARM_EABI_THUMB:
+        /* `svc #0` or `blx r4`, each followed by the thumb breakinst */
+        return code->u16[1] == (uint16_t)BREAKINST_THUMB &&
+               (code->u16[0] == 0xdf00u || code->u16[0] == 0x47a0u);
+    case ARCH_ARM_EABI:
+        /* `svc #0; <arm breakinst>` or `blx r4; <arm breakinst>` */
+        return code->u32[1] == (uint32_t)BREAKINST_ARM &&
+               (code->u32[0] == 0xef000000u || code->u32[0] == 0xe12fff34u);
+#endif
+#if defined(__mips__)
+    case ARCH_MIPS_64:
+    case ARCH_MIPS_N32:
+    case ARCH_MIPS_O32:
+        /* syscall: `or $a3,$t4,$zero; addiu $v0,$zero,N; syscall; break`. Word
+         * 1 carries the syscall number and cannot be matched, so words 0, 2 and
+         * 3 are the anchor. function: `jalr $t9; or $a3,$t4,$zero; break; nop`,
+         * where word 1 is fixed but word 0 already identifies it. */
+        if (code->u32[0] == (uint32_t)(0x00000025 | (REG_A3 << 11) | (REG_T4 << 21))) {
+            return code->u32[2] == 0x0000000cu && code->u32[3] == 0x0000000du;
+        }
+        return code->u32[0] == (uint32_t)(0x00000009 | (REG_RA << 11) | (REG_T9 << 21)) &&
+               code->u32[2] == 0x0000000du;
+#endif
+#if defined(__powerpc__)
+#ifdef __LP64__
+    case ARCH_POWERPC_64:
+#endif
+    case ARCH_POWERPC:
+        /* `sc; trap` or `bctrl; trap` */
+        return code->u32[1] == 0x7fe00008u &&
+               (code->u32[0] == 0x44000002u || code->u32[0] == 0x4e800421u);
+#endif
+#if defined(__riscv)
+#ifdef __LP64__
+    case ARCH_RISCV_64:
+#endif
+    case ARCH_RISCV_32:
+        /* `ecall; ebreak` or `jalr t1; ebreak` */
+        return code->u32[1] == 0x00100073u &&
+               (code->u32[0] == 0x00000073u ||
+                code->u32[0] == (uint32_t)(0x00000067 | (REG_RA << 7) | (REG_T1 << 15)));
+#endif
+    default:
+        /* An architecture this build has no trampoline writer for. */
+        return 0;
+    }
+}
+
+/* injector.c: read the thread-group leader ("Tgid:" in /proc/<pid>/status) of
+ * `pid`, which may be a non-leader thread. Declared at its call site rather than
+ * in injector_internal.h, the way injector__detach_process()'s translation unit
+ * declares injector__remote_call_reset() below. */
+
+/* ------------------------------------------------------------------------
  * Per-handle waitpid protocol state.
  *
  * kick_then_wait_sigtrap() drives the tracee through a strict protocol: every
@@ -846,51 +997,195 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
 #define STOP_GRACE_MS         2000L
 #define STOP_GRACE_EXTEND_MS  8000L
 
-#define DESYNC_SLOTS 8
+/* 40 rather than the 8 this table started with: markers accumulate for every
+ * DISTINCT pid a thread has desynced, including handles it detached long ago,
+ * so a thread that works through many targets fills the table without ever
+ * holding many handles at once. desync_reclaim_dead() below stops dead ones
+ * from counting at all. The cost is 2 * DESYNC_SLOTS pid_t of TLS per thread -
+ * 320 bytes, since MINOR 4 added a parallel desync_tgids[] - which is a cheap
+ * margin.
+ *
+ * MINOR 7, and the rule this table now lives by: a marker for a LIVE pid is
+ * NEVER evicted. Age-eviction - what 48328e2 introduced - dropped the oldest
+ * marker as soon as a ninth distinct pid desynced in a thread, and the evicted
+ * handle was then treated as usable: it went on to re-patch a trampoline whose
+ * original bytes were already lost, i.e. it silently corrupted a live target.
+ * Dropping the NEW marker instead is no better, it just moves the corruption to
+ * the handle that desynced last.
+ *
+ * So when the table genuinely runs out, nothing is evicted: the marker is not
+ * stored and `desync_lossy` latches, which makes injector__handle_is_desynced()
+ * refuse EVERY handle in the thread. Loud, permanent and recoverable (detach the
+ * handles you are done with and drive the rest from fresh threads) - unlike a
+ * clobbered text section. It also cannot be undone by a later reset(), because
+ * the pid that lost its marker is unknown and no later event can prove it safe.
+ *
+ * Three releases keep that state out of reach in practice, so latching takes 40
+ * DISTINCT PIDS marked and still not provably dead, in one thread, at the moment
+ * a 41st is marked. Note what that is NOT: it is not 40 handles attached at the
+ * same instant. injector__detach_process() releases the FP slot
+ * unconditionally but drops this marker only once PTRACE_DETACH has SUCCEEDED,
+ * and a desynced target usually answers DETACH with ESRCH - so the handle is
+ * gone while its marker stays. Attaching to 40 live targets one after another
+ * in a single thread, each desyncing, fills the table just as dead. That is
+ * still far past the one-handle-per-thread model util.c's
+ * injector__set_current() already assumes, and the markers are reclaimed as
+ * their pids die, but the bound is on live marked pids, not on concurrency:
+ *   - injector__detach_process() drops the marker once PTRACE_DETACH succeeds,
+ *     so a slot is held only while a handle is actually attached (a detached
+ *     handle can make no remote call, and a re-attach clears the mark anyway) -
+ *     or, when DETACH failed, until that pid dies: NIT 6, because a pid that is
+ *     still traced may still carry a trampoline, so its marker has to outlive
+ *     the handle injector_detach() is about to free;
+ *   - desync_reclaim_dead() drops markers whose pid is provably gone;
+ *   - injector__remote_call_reset() drops it on a fresh attach to that pid. */
+#define DESYNC_SLOTS 40
 static __thread pid_t desync_pids[DESYNC_SLOTS];
-/* Mark order, so an overflow can evict the OLDEST entry. Mirrors the LRU
- * counter the fp_slot table in ptrace.c uses. */
-static __thread unsigned int desync_seq[DESYNC_SLOTS];
-static __thread unsigned int desync_clock;
+/* Thread-group leader of each marked pid, captured when the marker was
+ * stored; 0 when /proc could not answer. See desync_pid_gone(). */
+static __thread pid_t desync_tgids[DESYNC_SLOTS];
+/* Latched when a marker did not fit. Never cleared - see above. */
+static __thread int desync_lossy;
 
-int injector__handle_is_desynced(pid_t pid)
+static int desync_find(pid_t pid)
 {
     int i;
     for (i = 0; i < DESYNC_SLOTS; i++) {
         if (desync_pids[i] == pid) {
-            return 1;
+            return i;
         }
     }
-    return 0;
+    return -1;
+}
+
+static int desync_free_slot(void)
+{
+    int i;
+    for (i = 0; i < DESYNC_SLOTS; i++) {
+        if (desync_pids[i] == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Is the process wearing `pid` - meaning its whole THREAD GROUP - definitely
+ * GONE? Only a definite answer may release a slot, so this asks with
+ * kill(pid, 0) and reads ESRCH. Signal 0 delivers nothing - it only runs the
+ * existence and permission checks - and EPERM therefore still means "alive, we
+ * may just not touch it". That is why it is sound where access("/proc/<pid>")
+ * is not: a hidepid /proc, or any other reason a live process is invisible
+ * there, would have read as death and dropped a live handle's marker.
+ *
+ * MINOR 4: `pid` is whatever the caller attached to, which may be a non-leader
+ * THREAD. A thread can exit while its thread group - and the mm that holds the
+ * patched text section - lives on, and kill(tid, 0) answers ESRCH for it as
+ * soon as it does. Reading that as "gone" released a marker for a process that
+ * may still be carrying our trampoline, i.e. it handed back a handle that
+ * would go on to re-patch bytes whose original was already lost: the same
+ * corruption class the attach-time guard above exists to stop. So the group
+ * leader recorded at mark time is probed too and BOTH must be gone. `tgid <= 1`
+ * means the leader was not recorded, because /proc/<pid>/status was unreadable
+ * when the marker was stored - in practice the task was already gone or dying.
+ * Note how narrow what that costs is: the group probe is only skipped once
+ * kill(pid, 0) has ALREADY answered ESRCH, so a task that is alive but hides its
+ * /proc entry (hidepid, a permission error) never reaches this branch - it is
+ * answered "not gone" by kill(pid, 0) first. The residual case is a thread whose
+ * /proc entry was unreadable at mark time and whose whole group is somehow still
+ * alive; there is no anchor left for it, so the pre-fix pid-only answer is kept
+ * rather than pinning the slot forever.
+ *
+ * NIT 5: pid <= 1 is never probed at all, not even with signal 0 - nothing in
+ * this library may touch pid 1 in any form - but answering "gone" here is NOT
+ * "the safe direction" and must not be read as one. It RELEASES a marker, so
+ * for a live pid it would hand back a handle whose waitpid protocol is out of
+ * sync, which is precisely the failure this table exists to prevent. What makes
+ * the branch tolerable is that it is unreachable: every entry is an
+ * injector->pid, injector__handle_mark_desynced() below ignores pid == 0, and
+ * injector__attach_internal() refuses pid <= 1 before a handle can exist at
+ * all. It stays only so that a bug which somehow stored pid 1 can never cause
+ * a signal to be sent to it. */
+static int desync_pid_gone(pid_t pid, pid_t tgid)
+{
+    int saved_errno = errno;   /* callers rely on errno surviving a mark */
+    int gone;
+
+    if (pid <= 1) {
+        return 1;
+    }
+    gone = (kill(pid, 0) != 0 && errno == ESRCH);
+    if (gone && tgid > 1 && tgid != pid) {
+        errno = 0;
+        gone = (kill(tgid, 0) != 0 && errno == ESRCH);
+    }
+    errno = saved_errno;
+    return gone;
+}
+
+/* Release slots held by pids that are definitely gone; return a free slot, or -1
+ * when every slot holds a live pid. A dead pid's marker is worthless: no handle
+ * can consult it again, and a recycled pid always arrives through a fresh
+ * attach, which calls injector__remote_call_reset() and clears it. This is what
+ * keeps the table self-cleaning for the common case - one thread working through
+ * many short-lived targets - so that it never has to choose a victim among
+ * handles that are still attached. */
+static int desync_reclaim_dead(void)
+{
+    int i, slot = -1;
+
+    for (i = 0; i < DESYNC_SLOTS; i++) {
+        if (desync_pids[i] == 0) {
+            if (slot < 0) { slot = i; }
+        } else if (desync_pid_gone(desync_pids[i], desync_tgids[i])) {
+            desync_pids[i] = 0;
+            desync_tgids[i] = 0;
+            if (slot < 0) { slot = i; }
+        }
+    }
+    return slot;
+}
+
+int injector__handle_is_desynced(pid_t pid)
+{
+    if (desync_find(pid) >= 0) {
+        return 1;
+    }
+    /* Fail closed: desync_lossy means some earlier marker did not fit, so this
+     * thread cannot say WHICH of its handles are out of sync. Answering "not
+     * desynced" is what age-eviction amounted to, and it let the unmarked
+     * handle re-patch a trampoline whose original bytes were already gone. */
+    return desync_lossy;
 }
 
 void injector__handle_mark_desynced(pid_t pid)
 {
-    int i;
-    int victim = 0;
+    pid_t tgid = 0;
+    int saved_errno = errno;   /* callers rely on errno surviving a mark */
+    int slot;
 
-    if (pid == 0 || injector__handle_is_desynced(pid)) {
+    /* desync_find(), not injector__handle_is_desynced(): once desync_lossy is
+     * latched the latter answers yes for everything, and this function would
+     * then never record anything again. */
+    if (pid == 0 || desync_find(pid) >= 0) {
         return;
     }
-    for (i = 0; i < DESYNC_SLOTS; i++) {
-        if (desync_pids[i] == 0) {
-            victim = i;
-            goto store;
-        }
-        if (desync_seq[i] < desync_seq[victim]) {
-            victim = i;
-        }
+    slot = desync_free_slot();
+    if (slot < 0) {
+        slot = desync_reclaim_dead();
     }
-    /* Table full: drop an entry rather than lose this one, and drop the OLDEST.
-     * Always clobbering slot 0 discarded one specific live handle's marker as
-     * soon as a ninth pid desynced; round-robin was better but could still
-     * evict the newest entry (injector__remote_call_reset() frees slot k, the
-     * next mark refills k, and a cursor sitting on k then overwrites that
-     * brand-new marker). Overflow stays lossy by design - the table is bounded
-     * and lock-free - but it now costs whichever pid has been desynced longest. */
-store:
-    desync_pids[victim] = pid;
-    desync_seq[victim] = ++desync_clock;
+    if (slot < 0) {
+        desync_lossy = 1;   /* every slot holds a LIVE pid: refuse, never evict */
+        return;
+    }
+    /* MINOR 4: record the thread-group leader now, while the task still has a
+     * /proc entry. By the time desync_reclaim_dead() asks whether this marker
+     * can be released, `pid` may already be a dead thread and nothing else can
+     * say which group it belonged to. Best effort: errno is restored because
+     * the callers of this function are in the middle of reporting one. */
+    (void)injector__read_tgid(pid, &tgid);
+    errno = saved_errno;
+    desync_pids[slot] = pid;
+    desync_tgids[slot] = (tgid > 1) ? tgid : 0;
 }
 
 /* Called by injector__attach_process(): a new attach re-establishes the
@@ -901,9 +1196,12 @@ void injector__remote_call_reset(pid_t pid)
     for (i = 0; i < DESYNC_SLOTS; i++) {
         if (desync_pids[i] == pid) {
             desync_pids[i] = 0;
-            desync_seq[i] = 0;
+            desync_tgids[i] = 0;
         }
     }
+    /* desync_lossy is deliberately NOT cleared here: a fresh protocol for THIS
+     * pid says nothing about the handle whose marker was lost, and clearing it
+     * would make that handle - still desynced, still live - look usable again. */
 }
 
 /* ------------------------------------------------------------------------
@@ -1395,8 +1693,17 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
     long backoff_ns = POLL_MIN_NS;
 
     if (injector__handle_is_desynced(injector->pid)) {
-        injector__set_errmsg("remote call refused: an earlier call on this handle timed out and could not leave pid %d stopped, so the ptrace/waitpid protocol is out of sync. Detach and attach again.",
-                             injector->pid);
+        if (desync_find(injector->pid) < 0) {
+            /* MINOR 7: refused because desync_lossy latched - this thread
+             * desynced more handles than the table holds and no live marker was
+             * evicted to make room - not because this handle is itself known to
+             * be out of sync. Say which of the two it is, and what to do. */
+            injector__set_errmsg("remote call refused: this thread desynced more handles than injector can track (all %d slots were held by live pids when the table overflowed), and no marker was evicted to make room, so it can no longer say which of its handles are out of sync - pid %d is refused along with every other handle in this thread. Detach the handles you are done with and drive the rest from fresh threads.",
+                                 DESYNC_SLOTS, injector->pid);
+        } else {
+            injector__set_errmsg("remote call refused: an earlier call on this handle timed out and could not leave pid %d stopped, so the ptrace/waitpid protocol is out of sync. Detach and attach again - but if that re-attach is itself refused with 'still carrying an injector trampoline', the trampoline could not be removed and is still patched into the target's libc, so its original bytes are gone and the target cannot be repaired automatically; do not keep retrying it.",
+                                 injector->pid);
+        }
         return INJERR_WAIT_TRACEE;
     }
 

@@ -84,7 +84,18 @@ CHECK_TARGETS = \
 all:
 	SUFFIX= $(MAKE) build
 
+# Every per-arch rule below runs `cd $(SRC_DIR) && $(MAKE) clean && $(MAKE)`
+# with that arch's CC, so the archive left behind in $(SRC_DIR) belongs to the
+# LAST arch built - x32 on any host where gcc-multilib provides
+# /usr/lib/gcc/x86_64-linux-gnu/*/x32/libgcc.a, which includes the CI runners.
+# Everything that links natively afterwards (`make unit`, `cd cmd && make`, the
+# language bindings) then dies with
+#   ld: i386:x64-32 architecture of input file `libinjector.a(elf.o)' is
+#       incompatible with i386:x86-64 output
+# and the failure looks like a broken unit test rather than a stale artifact.
+# Rebuild for the host at the end so `make cross` leaves a usable tree.
 cross: $(BUILD_TARGETS)
+	cd $(SRC_DIR) && $(MAKE) clean && $(MAKE)
 
 x86_64:
 	@echo "=============== build: x86_64 ==============="; \

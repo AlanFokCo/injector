@@ -197,12 +197,19 @@ typedef unsigned long user_reg_t;
 typedef unsigned long long user_reg_t;
 #elif defined(__i386__)
 typedef long user_reg_t;
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) && defined(__ILP32__)
 /* x32: __x86_64__ is defined but __LP64__ is not (x32 is ILP32), so none of
  * the branches above match even though user_regs_struct is the 64-bit one and
  * the `#define eax rax` block at the top of this file makes regs.eax an
  * unsigned long long. Without this branch user_reg_t would be a 32-bit
- * `unsigned long` and `reg_return = &regs.eax` fails -Werror on `make x32`. */
+ * `unsigned long` and `reg_return = &regs.eax` fails -Werror on `make x32`.
+ *
+ * The test must be __ILP32__, not bare __x86_64__: musl declares
+ * user_regs_struct with `unsigned long` fields, so on musl/x86_64 (LP64,
+ * MUSL_LIBC defined) the __LP64__ branch above is skipped on purpose and this
+ * one has to be skipped too, letting the #else below pick `unsigned long`.
+ * A bare __x86_64__ here silently broke the Alpine/musl build with
+ * -Werror=incompatible-pointer-types on every `reg_return = &regs.<reg>`. */
 typedef unsigned long long user_reg_t;
 #else
 typedef unsigned long user_reg_t;
@@ -841,6 +848,10 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
 
 #define DESYNC_SLOTS 8
 static __thread pid_t desync_pids[DESYNC_SLOTS];
+/* Mark order, so an overflow can evict the OLDEST entry. Mirrors the LRU
+ * counter the fp_slot table in ptrace.c uses. */
+static __thread unsigned int desync_seq[DESYNC_SLOTS];
+static __thread unsigned int desync_clock;
 
 int injector__handle_is_desynced(pid_t pid)
 {
@@ -856,16 +867,30 @@ int injector__handle_is_desynced(pid_t pid)
 void injector__handle_mark_desynced(pid_t pid)
 {
     int i;
+    int victim = 0;
+
     if (pid == 0 || injector__handle_is_desynced(pid)) {
         return;
     }
     for (i = 0; i < DESYNC_SLOTS; i++) {
         if (desync_pids[i] == 0) {
-            desync_pids[i] = pid;
-            return;
+            victim = i;
+            goto store;
+        }
+        if (desync_seq[i] < desync_seq[victim]) {
+            victim = i;
         }
     }
-    desync_pids[0] = pid; /* table full: drop an entry rather than lose this one */
+    /* Table full: drop an entry rather than lose this one, and drop the OLDEST.
+     * Always clobbering slot 0 discarded one specific live handle's marker as
+     * soon as a ninth pid desynced; round-robin was better but could still
+     * evict the newest entry (injector__remote_call_reset() frees slot k, the
+     * next mark refills k, and a cursor sitting on k then overwrites that
+     * brand-new marker). Overflow stays lossy by design - the table is bounded
+     * and lock-free - but it now costs whichever pid has been desynced longest. */
+store:
+    desync_pids[victim] = pid;
+    desync_seq[victim] = ++desync_clock;
 }
 
 /* Called by injector__attach_process(): a new attach re-establishes the
@@ -876,6 +901,7 @@ void injector__remote_call_reset(pid_t pid)
     for (i = 0; i < DESYNC_SLOTS; i++) {
         if (desync_pids[i] == pid) {
             desync_pids[i] = 0;
+            desync_seq[i] = 0;
         }
     }
 }

@@ -395,6 +395,22 @@ typedef struct {
  *          or execute code in the target. Safe to call on an attached handle.
  *          A .so is listed once (adjacent mappings r-xp/r--p/rw-p collapsed);
  *          a non-contiguously mapped library may appear more than once.
+ *          The library filter matches the WHOLE path as it appears in
+ *          \c /proc/PID/maps, not just the basename: a file-backed mapping is
+ *          listed when its path contains \c .so either at the very end or
+ *          immediately followed by a dot (\c libfoo.so, \c libc.so.6,
+ *          \c ld-linux-x86-64.so.2). Two consequences worth knowing: a
+ *          directory component ending in \c .so or \c .so.N also qualifies, so
+ *          an ordinary file such as \c /opt/libfoo.so.1/helper IS listed,
+ *          whereas \c /opt/foo.so/bar is NOT, because there \c .so is followed
+ *          by a slash. The main executable is therefore usually not listed, but
+ *          that follows from its path rather than from a guarantee, so do not
+ *          rely on it. Anonymous mappings are never listed, and bracketed
+ *          pseudo-paths such as \c [vdso] or \c [heap] do not match. Deleted
+ *          libraries are listed under their real name (the kernel's
+ *          " (deleted)" suffix is stripped before matching). Use
+ *          \ref injector_resolve_symbol or read \c /proc/PID/maps yourself if
+ *          you need a mapping this filter excludes.
  */
 long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap);
 

@@ -138,6 +138,7 @@ int main(int argc, char **argv)
     intptr_t run_args[INJECTOR_MAX_INVOKE_ARGS];
     int run_argc = 0;
     injector_delivery_t delivery = INJECTOR_DELIVERY_AUTO;
+    int delivery_given = 0;
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     int cloned_thread = 0;
 #endif
@@ -195,6 +196,7 @@ int main(int argc, char **argv)
             run_spec = optarg;
             break;
         case 'd':
+            delivery_given = 1;
             if (strcmp(optarg, "auto") == 0) delivery = INJECTOR_DELIVERY_AUTO;
             else if (strcmp(optarg, "nonstop") == 0) delivery = INJECTOR_DELIVERY_NONSTOP;
             else if (strcmp(optarg, "ptrace") == 0) delivery = INJECTOR_DELIVERY_PTRACE;
@@ -293,7 +295,17 @@ int main(int argc, char **argv)
     injector_t *injector;
     injector_opts_t opts = INJECTOR_OPTS_INIT;
     opts.call_timeout_ms = timeout_ms;
-    opts.delivery = delivery;   /* --delivery used to be ignored on this path */
+    /* --delivery picks the delivery mode of a one-shot *invoke*. A plain
+     * inject always runs in the target's ptrace-stopped main thread: neither
+     * injector_inject() nor injector_inject_in_cloned_thread() reads
+     * opts.delivery (only injector_invoke() does). Store it anyway so the
+     * handle is consistent, but tell the user instead of quietly accepting an
+     * option that cannot have any effect on this path. */
+    opts.delivery = delivery;
+    if (delivery_given) {
+        fprintf(stderr, "note: --delivery only affects --run (one-shot invoke); "
+                        "it has no effect on a plain inject\n");
+    }
     if (injector_attach_with_opts(&injector, pid, &opts) != 0) {
         fprintf(stderr, "attach failed: %s\n", injector_last_error(NULL));
         return 1;

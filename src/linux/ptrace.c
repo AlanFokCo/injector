@@ -160,6 +160,27 @@ int injector__detach_process(const injector_t *injector)
      * gets the dead one's FP/vector state restored into it. */
     fp_slot_release(injector->pid);
     PTRACE_OR_RETURN(PTRACE_DETACH, injector, 0, 0);
+    /* NIT 6: the "waitpid protocol out of sync" mark is dropped only now that
+     * PTRACE_DETACH has SUCCEEDED - deliberately unlike the FP slot above, which
+     * must be released first and unconditionally. The ordering matters in the one
+     * case that counts: when DETACH fails the target is still traced by us and
+     * may still be carrying a trampoline, and the marker is the only record of
+     * that. Clearing it before the DETACH - or regardless of its result - would
+     * unmark a live, still-traced, possibly still-patched pid whose handle
+     * injector_detach() is about to free, and remote_call.c would then hand that
+     * pid back as usable. Keeping the marker on a failed detach costs one slot
+     * until the pid dies (desync_reclaim_dead) or is re-attached
+     * (injector__attach_process above), which is exactly what the slot is for.
+     *
+     * Otherwise the reasoning that made it safe to drop at all still holds: a
+     * detached handle can make no remote call, a re-attach clears the mark
+     * anyway, and this only runs when injector->attached is set - a second
+     * PTRACE_ATTACH on an already-traced pid fails, and the attach error path
+     * never reaches here - so it cannot clear the mark of another LIVE handle
+     * on the same pid. injector__attach_process() above has no matching
+     * ordering problem: it resets only after PTRACE_ATTACH returned 0, so a
+     * failed attach leaves the table untouched. */
+    injector__remote_call_reset(injector->pid);
     return 0;
 }
 
@@ -195,16 +216,39 @@ int injector__detach_process(const injector_t *injector)
  * model that util.c's injector__set_current() and remote_call.c's desync_pids
  * table already use.  Per-thread storage means concurrent handles in different
  * threads cannot race on the table (no torn entries, no cross-thread eviction
- * of a LIVE handle's slot) without any locking; FP_SLOTS concurrent handles
- * *per thread* are supported and an overflow evicts that thread's least
- * recently used slot.  The slots themselves are not heap-allocated (the only
+ * of a LIVE handle's slot) without any locking; at most FP_SLOTS handles can
+ * be attached *per thread* at the same time. The FP_SLOTS+1'th attach in one
+ * thread fails cleanly (injector__get_regs() reports INJERR_OTHER/EMFILE before
+ * any register is touched, and the attach unwinds through PTRACE_DETACH) rather
+ * than evicting a slot: an evicted slot belongs to a handle that is STILL
+ * attached, and that handle would then (a) skip its FP restore in
+ * injector__set_regs() and (b) re-save whatever its next injector__get_regs()
+ * finds - which, after a remote call hijacked the thread, is the CALLEE's
+ * FP/vector state. Restoring that copy corrupts the target permanently, so the
+ * table is deliberately allowed to run out. The remedy is injector_detach() on
+ * one of the thread's handles, or one thread per handle.
+ *
+ * A handle must also be DETACHED on the thread that ATTACHED it. The slots are
+ * thread-local, so fp_slot_release() clears the slot in the *detaching* thread's
+ * copy only: detach from another thread and the attaching thread keeps a slot
+ * occupied by a pid it no longer holds, with nothing left to ever free it. After
+ * FP_SLOTS such handles that thread refuses every further attach with EMFILE,
+ * and the message - correctly, but unhelpfully - points at the handles it can
+ * still see. The one-handle-per-thread model (util.c's injector__set_current(),
+ * remote_call.c's desync table) already requires attach and detach to pair up on
+ * one thread; a leaked FP slot is the second reason. Saying so in
+ * include/injector.h and README.md would reach users better than a comment in
+ * here, but both files are outside this change's write scope.
+ * The slots themselves are not heap-allocated (the only
  * malloc is the one-off size probe in regset_probe(), freed before it
  * returns), so there is nothing to free:
  * the TLS block for a thread is released by the runtime when the thread exits,
  * and fp_slot_release() clears a slot as soon as its handle detaches.
- * (The slots are only reachable through attach/get_regs/set_regs/detach, all of
- * which run on the thread owning the handle, so the first access - and hence
- * the TLS allocation - always happens on the thread that uses it.)
+ * (The slots are only reachable through attach/get_regs/set_regs/detach. The
+ * first access - and hence the TLS allocation - happens on the thread that
+ * attaches, and get_regs/set_regs necessarily run on that same thread because a
+ * handle is driven by one thread at a time. detach is *required* to run there as
+ * well, for the reason given above: it is what frees the slot.)
  * ---------------------------------------------------------------------- */
 #define FP_SLOTS      4
 #define FP_STATE_SIZE 1024   /* NT_FPREGSET: the x86 fxsave area is 512 bytes */
@@ -220,13 +264,23 @@ int injector__detach_process(const injector_t *injector)
  * probe doubles them, so this holds; assert it, because getting it wrong means
  * concluding "the target has no FP state", saving nothing, restoring nothing,
  * and leaving its vector registers as the remote call left them. */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
 _Static_assert(FP_STATE_SIZE % 16 == 0 && XSTATE_SIZE % 16 == 0,
                "FP_STATE_SIZE and XSTATE_SIZE must stay multiples of 16 - see the "
                "EIO ambiguity documented in regset_probe()");
+#else
+/* Same check for a compiler without C11's _Static_assert. src/linux/Makefile
+ * only *appends* to CFLAGS, so a caller- or environment-supplied -std=gnu99
+ * survives and lands here; GCC and Clang accept _Static_assert as an extension
+ * in that mode (measured: gcc 13.3, -std=gnu99 and -std=c99 both build the
+ * C11 spelling), a strict C99 compiler does not. A negative array size is the
+ * portable spelling of "this must be false". */
+typedef char injector_fp_sizes_must_stay_multiples_of_16[
+    (FP_STATE_SIZE % 16 == 0 && XSTATE_SIZE % 16 == 0) ? 1 : -1];
+#endif
 
 struct fp_slot {
-    pid_t pid;            /* 0: free slot */
-    unsigned int seq;     /* LRU counter */
+    pid_t pid;            /* 0: free slot; !=0: an attached handle owns it */
     size_t fp_len;        /* valid bytes in fp[]; 0: regset unavailable */
     size_t xs_len;        /* valid bytes in xs[]; 0: regset unavailable */
     size_t oversize;      /* >0: a regset needs this many bytes, see below */
@@ -236,7 +290,6 @@ struct fp_slot {
 };
 
 static __thread fp_slot_t fp_slots[FP_SLOTS];
-static __thread unsigned int fp_slot_seq;
 
 static fp_slot_t *fp_slot_find(pid_t pid)
 {
@@ -249,32 +302,35 @@ static fp_slot_t *fp_slot_find(pid_t pid)
     return NULL;
 }
 
+/* Find the slot for `pid`, or take a FREE one for it. Returns NULL when all
+ * FP_SLOTS slots are held by other, still-attached handles.
+ *
+ * Deliberately no least-recently-used eviction: a non-free slot always belongs
+ * to a handle that is attached right now (fp_slot_release() runs in
+ * injector__detach_process(), and injector__attach_process() drops a stale slot
+ * left behind by a recycled pid). Stealing it would leave that handle unable to
+ * restore its target's FP/vector state - see the block comment above. Callers
+ * must treat NULL as "refuse this operation", never as "proceed without FP". */
 static fp_slot_t *fp_slot_acquire(pid_t pid)
 {
     fp_slot_t *s = fp_slot_find(pid);
     int i;
 
     if (s != NULL) {
-        s->seq = ++fp_slot_seq;
         return s;
     }
-    s = &fp_slots[0];
     for (i = 0; i < FP_SLOTS; i++) {
         if (fp_slots[i].pid == 0) {
             s = &fp_slots[i];
-            break;
-        }
-        if (fp_slots[i].seq < s->seq) {
-            s = &fp_slots[i];
+            s->pid = pid;
+            s->fp_len = 0;
+            s->xs_len = 0;
+            s->oversize = 0;
+            s->oversize_ntype = 0;
+            return s;
         }
     }
-    s->pid = pid;
-    s->seq = ++fp_slot_seq;
-    s->fp_len = 0;
-    s->xs_len = 0;
-    s->oversize = 0;
-    s->oversize_ntype = 0;
-    return s;
+    return NULL;
 }
 
 static void fp_slot_release(pid_t pid)
@@ -461,7 +517,30 @@ int injector__get_regs(const injector_t *injector, struct user_regs_struct *regs
      * result registers of a remote call) must not overwrite it. */
     if (fp_slot_find(injector->pid) == NULL) {
         fp_slot_t *s = fp_slot_acquire(injector->pid);
-        int fr = fp_state_save(injector->pid, s);
+        int fr;
+        if (s == NULL) {
+            /* This thread already holds FP_SLOTS attached handles. Refuse BEFORE
+             * any register is read or written, exactly like the oversize case
+             * below, so the caller's error_exit unwinds the attach with
+             * PTRACE_DETACH and leaves no stopped orphan behind. Hijacking the
+             * thread without a slot to save its FP state into would corrupt the
+             * target the first time a remote call's result-registers get_regs
+             * re-saved the callee's FP state for it.
+             * INJERR_OTHER + EMFILE: nothing here is the TARGET's capability
+             * (so not UNSUPPORTED_TARGET) and no allocation failed (so not
+             * NO_MEMORY); EMFILE is the standard "too many open handles of this
+             * kind in this process" errno, and the message names the remedy. */
+            injector__set_errmsg("cannot save the FP/vector state of pid %d: this thread already "
+                                 "holds %d attached injector handles and all %d FP-state slots are "
+                                 "in use by them; refusing to hijack its registers, because a "
+                                 "handle without a saved FP/vector copy cannot restore them after "
+                                 "a remote call. Detach one of this thread's handles first "
+                                 "(injector_detach), or drive each handle from its own thread",
+                                 (int)injector->pid, FP_SLOTS, FP_SLOTS);
+            errno = EMFILE;
+            return INJERR_OTHER;
+        }
+        fr = fp_state_save(injector->pid, s);
         if (fr != REGSET_SAVED) {
             /* Either the target has an extended FPU state we cannot store, or we
              * could not read the state it does have. In both cases it could never
@@ -474,13 +553,21 @@ int injector__get_regs(const injector_t *injector, struct user_regs_struct *regs
             int rv;
             if (fr == REGSET_OVERSIZE) {
                 why = E2BIG;
-                injector__set_errmsg("pid %d has a %zu-byte regset (NT_%s) that does not fit "
-                                     "injector's %zu-byte save buffer; refusing to hijack its "
-                                     "registers (rebuild with a larger XSTATE_SIZE/FP_STATE_SIZE)",
-                                     (int)injector->pid, s->oversize,
+                /* s->oversize is a LOWER bound, not the exact size: regset_probe()
+                 * reads into a buffer of 2*dstsz and the kernel clamps the reported
+                 * length to it, so all we know is "at least this many". Say so, and
+                 * do not promise that one particular rebuild size is enough. */
+                injector__set_errmsg("pid %d has a regset (NT_%s) of at least %zu bytes that does "
+                                     "not fit injector's %zu-byte save buffer; refusing to hijack "
+                                     "its registers (rebuild with a larger XSTATE_SIZE/FP_STATE_SIZE "
+                                     "- at least %zu bytes, and possibly more, since the probe "
+                                     "stops at twice the buffer size)",
+                                     (int)injector->pid,
                                      s->oversize_ntype == NT_X86_XSTATE ? "X86_XSTATE" : "FPREGSET",
+                                     s->oversize,
                                      s->oversize_ntype == NT_X86_XSTATE ? (size_t)XSTATE_SIZE
-                                                                        : (size_t)FP_STATE_SIZE);
+                                                                        : (size_t)FP_STATE_SIZE,
+                                     s->oversize);
             } else {
                 injector__set_errmsg("cannot save the FP/vector state of pid %d (NT_%s): %s; "
                                      "refusing to hijack its registers, because without a saved "
@@ -520,23 +607,75 @@ int injector__set_regs(const injector_t *injector, const struct user_regs_struct
     fp_slot_t *s = fp_slot_find(injector->pid);
     int fp_errno;
 
+    /* MINOR 3: mirror injector__get_regs()' refusal instead of writing the
+     * integer registers and then silently skipping the FP/XSTATE restore. No
+     * slot means there is no saved copy to write back, so returning success
+     * here would leave the target's floating-point and vector state as whatever
+     * the callee put there - the exact silent corruption the get_regs refusal
+     * exists to prevent. Refuse BEFORE anything is written, so the target keeps
+     * every register it currently has rather than a half-restored set.
+     *
+     * How reachable is a NULL slot here, honestly? Not at all under the
+     * documented one-handle-per-thread model: the slot is acquired by
+     * injector__get_regs() during the attach, in the very thread that
+     * PTRACE_ATTACH made the tracer, and PTRACE_SETREGS only succeeds from that
+     * same thread; nothing releases the slot in between. fp_slot_release() has
+     * exactly two callers: injector__detach_process(), which injector_detach()
+     * runs only AFTER this handle's last remote call, and get_regs' own refusal
+     * paths, which a handle that got this far has already passed. So this is a
+     * guard, not a live-bug fix - but a necessary one,
+     * because the slots are __thread and a handle driven from a DIFFERENT
+     * thread than the one that attached does find no slot.
+     *
+     * Measured for that cross-thread case (attach in thread A, injector_detach()
+     * from thread B, Linux 6.8): before this guard the caller got rv=-3
+     * INJERR_NO_PROCESS with "PTRACE_SETREGS error: No such process", because
+     * SETREGS from a non-tracer thread fails ESRCH and PTRACE_OR_RETURN returned
+     * first - so the silent FP skip did not actually happen there either, and
+     * what the caller saw was a confusing error that named neither the FP state
+     * nor the real cause. With the guard it gets rv=-1 INJERR_OTHER and a
+     * message that says exactly what is missing and why nothing was written.
+     * Note that in that scenario the target is NOT left detached and runnable -
+     * PTRACE_DETACH from the non-tracer thread fails ESRCH too, so it stays
+     * traced and stopped (TracerPid non-zero, state 't'). That is a pre-existing
+     * property of driving a handle from the wrong thread, unchanged by this
+     * guard and not something it can fix; handles must be driven by the thread
+     * that attached them.
+     *
+     * Where a same-thread NULL slot ever did occur, the caller is
+     * kick_then_wait_sigtrap(), which calls set_regs() BEFORE writing the
+     * trampoline: nothing is patched, the tracee is still stopped, and the
+     * error unwinds the handle through injector_detach() -> PTRACE_DETACH, so
+     * the target is left detached and runnable. cleanup_restore_full() also
+     * calls this and reports a failure in *regs_rv (which makes
+     * cleanup_remote_call() mark the handle desynchronised) rather than
+     * claiming the registers came back. */
+    if (s == NULL) {
+        injector__set_errmsg("cannot restore the FP/vector state of pid %d: this thread holds no "
+                             "FP-state slot for it, so there is no saved copy to write back; "
+                             "refusing to set its registers, because an integer-only restore "
+                             "would leave the target's floating-point and vector state clobbered",
+                             (int)injector->pid);
+        errno = EMFILE;
+        return INJERR_OTHER;
+    }
+
 #ifdef USE_REGSET
     struct iovec iovec = { (void*)regs, sizeof(*regs) };
     PTRACE_OR_RETURN(PTRACE_SETREGSET, injector, NT_PRSTATUS, (long)&iovec);
 #else
     PTRACE_OR_RETURN(PTRACE_SETREGS, injector, 0, (long)regs);
 #endif
-    if (s != NULL) {
-        fp_errno = fp_state_restore(injector->pid, s);
-        if (fp_errno != 0) {
-            /* The integer registers are back but the FP/vector state is not:
-             * that is a real restore failure, not something to swallow. */
-            injector__set_errmsg("failed to restore the FPU/vector state of pid %d: %s",
-                                 injector->pid, strerror(fp_errno));
-            errno = fp_errno;
-            return (fp_errno == ESRCH) ? INJERR_NO_PROCESS :
-                   (fp_errno == EPERM) ? INJERR_PERMISSION : INJERR_OTHER;
-        }
+    /* `s` is non-NULL here: the refusal above is the only other way out. */
+    fp_errno = fp_state_restore(injector->pid, s);
+    if (fp_errno != 0) {
+        /* The integer registers are back but the FP/vector state is not:
+         * that is a real restore failure, not something to swallow. */
+        injector__set_errmsg("failed to restore the FPU/vector state of pid %d: %s",
+                             injector->pid, strerror(fp_errno));
+        errno = fp_errno;
+        return (fp_errno == ESRCH) ? INJERR_NO_PROCESS :
+               (fp_errno == EPERM) ? INJERR_PERMISSION : INJERR_OTHER;
     }
     return 0;
 }

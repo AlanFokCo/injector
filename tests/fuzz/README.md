@@ -33,9 +33,21 @@ fixed. Files are named
 
 so that `make regress` feeds each one to the fuzzer that actually covers that
 entry point (`elf__*` to `fuzz_elf`, `proc__*` to `fuzz_proc`). If a reproducer
-ever starts crashing again, `make regress` fails and CI goes red. Note that
-`make regress` also fails when the corpus is *empty*, so a bad rename cannot
-silently turn the target into a no-op.
+ever starts crashing again, `make regress` fails and CI goes red.
+
+Nothing in here is allowed to pass vacuously:
+
+* `regress` counts and reports each target separately (`elf: N replayed,
+  proc: M replayed`). `elf: 0` is a hard failure. `proc: 0` is currently
+  expected - no defect has ever been found in the maps parser - so it prints an
+  explicit `NOTE:` saying the parser is covered only by the `make fuzz` seed
+  corpus, rather than claiming a regression pass it did not perform.
+* A file in `crashes/` that matches *neither* prefix is a hard failure, so a bad
+  rename (or a stray artifact committed without one) can never silently drop a
+  reproducer out of the replay set.
+* A missing `clang` is a hard failure, not a skip: `exit 77` used to look like a
+  skip but make treats any non-zero status as an error, so the target said
+  "skipping" and then went red with a bare `Error 77`.
 
 | reproducer | defect it pins |
 |------------|----------------|

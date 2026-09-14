@@ -4,7 +4,9 @@ These cover defects that used to crash the interpreter outright, so they are
 written to run without a real target process wherever possible.
 """
 import ctypes
+import errno
 import os
+import pickle
 import sys
 import warnings
 
@@ -83,6 +85,60 @@ def test_error_classes_are_catchable_as_builtins():
             pass
         else:
             raise AssertionError("code %s was not catchable as %s" % (code, cls))
+
+
+def test_specific_error_instances_keep_their_class():
+    """`type(e)` must be the class that was constructed - never a builtin.
+
+    OSError.__new__ rewrites the instance type when it is called with 2-3
+    positional arguments whose first one is a known errno: `OSError(errno.EACCES,
+    "x")` hands back a builtins.PermissionError. The specific errors mix in that
+    builtin family, so without the `__new__` pin in InjectorError a caller
+    constructing one with a real errno could get the *builtin* class back - which
+    `except InjectorError:` does not catch, turning a handled error into an
+    unhandled one.
+    """
+    from injector._errors import INJERR_PERMISSION
+
+    classes = (
+        injector.InjectorError, injector.NoProcessError, injector.PermissionError,
+        injector.TimeoutError, injector.FileNotFoundError,
+        injector.FunctionMissingError,
+    )
+    # the unambiguous aliases are the same objects, so the loop covers them too
+    assert (injector.InjectorNoProcessError, injector.InjectorPermissionError,
+            injector.InjectorTimeoutError, injector.InjectorFileNotFoundError,
+            injector.InjectorFunctionMissingError) == (
+        injector.NoProcessError, injector.PermissionError, injector.TimeoutError,
+        injector.FileNotFoundError, injector.FunctionMissingError)
+
+    # Negative INJERR_* codes are what check() raises with; the positive POSIX
+    # errnos are the ones the OSError errno map would act on.
+    codes = (INJERR_PERMISSION, errno.EACCES, errno.ENOENT, errno.ETIMEDOUT)
+    for cls in classes:
+        for code in codes:
+            e = cls(code, "boom")
+            assert type(e) is cls, "%s(%d, ...) produced %s.%s" % (
+                cls.__name__, code, type(e).__module__, type(e).__name__)
+            assert isinstance(e, injector.InjectorError), cls
+            assert str(e) == "[%d] boom" % code, (cls.__name__, str(e))
+            if issubclass(cls, OSError):
+                assert isinstance(e, OSError), cls
+            # both hierarchies must catch it, which is the whole point of the pin
+            for caught_as in ((injector.InjectorError,)
+                              + ((OSError,) if issubclass(cls, OSError) else ())):
+                try:
+                    raise cls(code, "boom")
+                except caught_as:
+                    pass
+                else:
+                    raise AssertionError("%s(%d, ...) was not catchable as %s" % (
+                        cls.__name__, code, caught_as.__name__))
+            # and it must survive a pickle round trip (multiprocessing / logging)
+            # still being the same class, so the far side can catch it
+            back = pickle.loads(pickle.dumps(cls(code, "boom")))
+            assert type(back) is cls, (cls.__name__, type(back))
+            assert isinstance(back, injector.InjectorError), cls
 
 
 def test_public_names_are_exported():

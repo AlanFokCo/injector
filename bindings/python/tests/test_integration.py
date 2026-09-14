@@ -14,6 +14,48 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import injector
 
 
+# --- skip policy -------------------------------------------------------------
+# This file is the only end-to-end coverage of the hardcoded ctypes layouts
+# against the real C ABI, so "the tests/ artefacts are not built" must not be
+# allowed to look like success: the two places that used to `print("SKIP: ...")`
+# and `return` left CI green with zero coverage. Failing loudly is now the
+# default; INJECTOR_ALLOW_SKIP=1 opts back into skipping, and the runner at the
+# bottom counts and prints the skips either way.
+_ALLOW_SKIP_ENV = "INJECTOR_ALLOW_SKIP"
+
+
+def _under_pytest():
+    """pytest exports PYTEST_CURRENT_TEST only *while* a test is running, not
+    during import, so this has to be asked at call time."""
+    return "PYTEST_CURRENT_TEST" in os.environ
+
+
+class Skipped(Exception):
+    """Raised by _require_built() when INJECTOR_ALLOW_SKIP=1 lets a test bail
+    out. The runner below catches it and counts it; pytest is handled with
+    pytest.skip() instead, so the run reports a skip rather than an error."""
+
+
+def _require_built(*paths):
+    """Assert every build artefact exists, or skip - never silently return."""
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if not missing:
+        return
+    reason = ("missing build artefact(s): %s - run `cd tests && make build` "
+              "first (or set %s=1 to allow this test to be skipped)"
+              % (", ".join(missing), _ALLOW_SKIP_ENV))
+    if os.environ.get(_ALLOW_SKIP_ENV) == "1":
+        if _under_pytest():
+            try:
+                import pytest
+            except ImportError:
+                pass
+            else:
+                pytest.skip(reason)   # reported as a skip, not an error
+        raise Skipped(reason)         # counted by the runner at the bottom
+    raise RuntimeError(reason)
+
+
 def _wait_for_libc(pid, timeout=10.0):
     """Do not attach inside the target's execve window: /proc/<pid>/maps is
     transitional there and libc is not visible yet."""
@@ -87,9 +129,12 @@ def test_close_releases_the_target():
         with open("/proc/%d/status" % proc.pid) as f:
             state = [l for l in f if l.startswith("State:")][0].split()[1]
         assert state in ("S", "R"), "target left in state %s (still stopped?)" % state
-        tracer = [l for l in open("/proc/%d/status" % proc.pid) if l.startswith("TracerPid:")]
-        if tracer:
-            assert tracer[0].split()[1] == "0", "target is still being traced"
+        with open("/proc/%d/status" % proc.pid) as f:
+            tracer = [l for l in f if l.startswith("TracerPid:")]
+        # Not `if tracer:` - /proc/<pid>/status always carries TracerPid, so an
+        # empty list means the assertion below was silently skipped, not passed.
+        assert len(tracer) == 1, "no TracerPid line in /proc/%d/status" % proc.pid
+        assert tracer[0].split()[1] == "0", "target is still being traced"
     finally:
         proc.kill()
         proc.wait()
@@ -105,9 +150,7 @@ def test_run_one_shot():
                                              "..", "..", "..", "tests"))
     target = os.path.join(tests_dir, "test-target")
     lib = os.path.join(tests_dir, "test-library.so")
-    if not (os.path.isfile(target) and os.path.isfile(lib)):
-        print("SKIP: run `cd tests && make build` first")
-        return
+    _require_built(target, lib)
     proc = subprocess.Popen([target])
     try:
         _wait_for_libc(proc.pid)
@@ -137,9 +180,7 @@ def test_resolve_symbol_in_executable():
     tests_dir = os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              "..", "..", "..", "tests"))
     target = os.path.join(tests_dir, "test-target")
-    if not os.path.isfile(target):
-        print("SKIP: run `cd tests && make build` first")
-        return
+    _require_built(target)
     proc = subprocess.Popen([target])
     try:
         _wait_for_libc(proc.pid)
@@ -173,7 +214,23 @@ def test_resolve_symbol_in_executable():
 
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    passed, skipped = 0, []
     for fn in fns:
-        fn()
+        try:
+            fn()
+        except Skipped as exc:
+            skipped.append(fn.__name__)
+            print("SKIP:", fn.__name__, "-", exc)
+            continue
+        passed += 1
         print("PASS:", fn.__name__)
-    print("ALL PASSED (%d tests)" % len(fns))
+    print("skips: %d" % len(skipped))
+    if passed == 0:
+        # All-skipped is a failure, not a green run: this file is the only
+        # end-to-end check of the hardcoded ctypes layouts against the real C
+        # ABI, so %s=1 turning every test into a skip must not exit 0.
+        print("no integration test actually ran (%d skipped) - refusing to "
+              "report success: build the tests/ artefacts and drop %s=1"
+              % (len(skipped), _ALLOW_SKIP_ENV))
+        sys.exit(1)
+    print("ALL PASSED (%d tests)" % passed)

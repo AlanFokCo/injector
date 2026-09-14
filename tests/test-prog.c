@@ -32,6 +32,7 @@
 #include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>     /* FD_CLOEXEC: report a failed execl() to the parent */
 #include <limits.h>
 #include "../include/injector.h"
 
@@ -55,15 +56,104 @@ struct process {
     int is_musl;
 };
 
+/* Start the target and WAIT for proof that it actually started.
+ *
+ * fork() succeeding says nothing about execl(): the child used to exit(2)
+ * silently and the harness went on to print "target process started." and then
+ * inject into a pid that no longer existed, so a missing or misnamed fixture
+ * showed up as a confusing failure several steps later (or, worse, as a test
+ * that could not fail). The pipe is O_CLOEXEC, so a successful exec closes it
+ * and read() returns 0; a failed exec writes errno back first.
+ * Returns 0 on success, -1 (with a message printed) if the target did not start. */
 static int process_start(process_t *proc, char *test_target)
 {
-    proc->pid = fork();
+    int fds[2];
+    int child_errno = 0;
+    ssize_t r;
+
+    /* pipe() + F_SETFD rather than pipe2(): pipe2 is GNU/BSD-only and this file
+     * is built without _GNU_SOURCE on every arch pair in tests/Makefile. The two
+     * calls must also be checked separately - when pipe() itself fails
+     * (EMFILE/ENFILE on a loaded runner) it leaves fds[] untouched, so closing
+     * fds[0]/fds[1] would close two arbitrary descriptors that belong to us. */
+    if (pipe(fds) != 0) {
+        printf("ERROR: cannot create the exec-status pipe: %s\n", strerror(errno));
+        return -1;
+    }
+    if (fcntl(fds[1], F_SETFD, FD_CLOEXEC) != 0) {
+        printf("ERROR: cannot set FD_CLOEXEC on the exec-status pipe: %s\n",
+               strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
     proc->waited = 0;
+    proc->pid = fork();
     if (proc->pid == 0) {
+        close(fds[0]);
         execl(test_target, test_target, NULL);
+        child_errno = errno;
+        /* best effort: if even this fails the parent sees EOF and reports the
+         * target as not started, which is still better than a silent corpse. */
+        (void)!write(fds[1], &child_errno, sizeof(child_errno));
         exit(2);
     }
-    return 0;
+    if (proc->pid < 0) {
+        printf("ERROR: fork failed: %s\n", strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
+        return -1;
+    }
+    close(fds[1]);
+    /* Retry EINTR: this harness installs a SIGALRM handler, and a signal
+     * arriving mid-read would otherwise be reported as "the child never
+     * confirmed its exec" even when it exec'd perfectly. */
+    do {
+        r = read(fds[0], &child_errno, sizeof(child_errno));
+    } while (r < 0 && errno == EINTR);
+    close(fds[0]);
+    /* Four distinct outcomes, and only the first one is success. Treating every
+     * non-positive-length read alike would let an EINTR/EAGAIN/EIO on the status
+     * pipe (r < 0) masquerade as "the child exec'd", i.e. the harness would go on
+     * to inject into a pid it never proved was alive - the exact silent-corpse
+     * failure this pipe was added to prevent. */
+    if (r == 0) {
+        /* EOF: the O_CLOEXEC write end was closed by a successful exec. */
+        return 0;
+    }
+    if (r < 0) {
+        printf("ERROR: cannot read the exec status of '%s': %s\n",
+               test_target, strerror(errno));
+        /* The child's state is unknown - it may have exec'd before the pipe
+         * failed. It is ours and the test cannot continue without it, so kill it
+         * instead of blocking in waitpid() on a possibly live target, and instead
+         * of leaving a stray test-target running: a leftover would make a later
+         * --self-find match somebody else's process. */
+        kill(proc->pid, SIGKILL);
+        waitpid(proc->pid, NULL, 0);
+        proc->pid = 0;
+        return -1;
+    }
+    if (r < (ssize_t)sizeof(child_errno)) {
+        /* Short read: child_errno is only partly filled, so it must NOT be
+         * interpreted - strerror() of a half-written int would name an errno the
+         * child never reported. All we can honestly say is that the target's
+         * startup was not confirmed. */
+        printf("ERROR: cannot confirm that '%s' started: the exec-status pipe "
+               "returned a short read (%zd of %zu bytes), so the child's errno "
+               "was never received\n",
+               test_target, r, sizeof(child_errno));
+        kill(proc->pid, SIGKILL);   /* see the read-error path above */
+        waitpid(proc->pid, NULL, 0);
+        proc->pid = 0;
+        return -1;
+    }
+    /* r == sizeof(child_errno): the child reported a failed execl(). */
+    printf("ERROR: cannot start '%s': %s (was it built? `cd tests && make cross`)\n",
+           test_target, strerror(child_errno));
+    waitpid(proc->pid, NULL, 0);
+    proc->pid = 0;
+    return -1;
 }
 
 static volatile sig_atomic_t caught_sigalarm;
@@ -504,11 +594,36 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     if (self_find) {
-        pid_t found = injector_find_process("test-target");
-        printf("self-find: injector_find_process(\"test-target\") = %d (target pid %d)\n", (int)found, (int)proc.pid);
+        /* Search for the name we actually started. The target binary carries the
+         * arch suffix (test-target-x86_64, test-target-i386, ...) while the bare
+         * `./test-prog` build starts plain test-target, and
+         * injector_find_process() matches the basename of /proc/PID/exe exactly:
+         * hardcoding "test-target" here made this test unable to pass for every
+         * suffixed invocation, i.e. for every arch pair CI runs. */
+        const char *target_name = strrchr(test_target, '/');
+        pid_t found;
+        target_name = target_name ? target_name + 1 : test_target;
+        found = injector_find_process(target_name);
+        printf("self-find: injector_find_process(\"%s\") = %d (target pid %d)\n",
+               target_name, (int)found, (int)proc.pid);
         fflush(stdout);
-        if (found <= 0 || found != proc.pid) {
-            printf("ERROR: self-find did not locate the running test-target.\n");
+        if (found != proc.pid) {
+            /* Distinguish the two ways this can fail: injector_find_process()
+             * returns the FIRST /proc entry whose exe basename matches, so a
+             * second test-target left over from a previous run (or a parallel
+             * test in another directory) makes it return that pid instead.
+             * Saying only "did not locate" sent the next person hunting for a
+             * bug in the scan rather than in the test environment. */
+            if (found <= 0) {
+                printf("ERROR: self-find did not locate the running target "
+                       "(no /proc/*/exe basename matched).\n");
+            } else {
+                printf("ERROR: self-find matched a DIFFERENT test-target: pid %d, "
+                       "but our target is pid %d. Another test-target is still "
+                       "running (a leftover or a parallel test); injector_find_process "
+                       "returns the first match, so this test needs to be the only "
+                       "one running.\n", (int)found, (int)proc.pid);
+            }
             goto cleanup;
         }
         printf("SUCCESS: self-find located the running test-target.\n");

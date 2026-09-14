@@ -2,6 +2,25 @@ name: tests
 on:
   push:
   pull_request:
+  # Run on demand: `gh workflow run tests --ref master`.
+  #
+  # This repository is a fork, and GitHub does not start push/pull_request
+  # workflows on a fork until somebody with admin rights clicks "I understand my
+  # workflows, go ahead and enable them" on the Actions tab - a toggle that is
+  # only reachable from the web UI, not from the REST API (the API already
+  # reports actions/permissions enabled=true).
+  #
+  # workflow_dispatch is kept as a FALLBACK path: it is BELIEVED not to be gated
+  # on that per-event toggle, which is why it stays available rather than the
+  # suite silently never executing anywhere. Believed, not verified - a dispatch
+  # API call returned HTTP 422 "no workflow_dispatch trigger", which only proves
+  # the trigger was missing from this file. It says nothing about whether the
+  # web-UI gate above would let a dispatch through, so the premise this fallback
+  # rests on is still an assumption.
+  #
+  # As of this commit zero workflow runs have been observed on this fork, so
+  # nothing in this file is proven to have executed on a real runner yet.
+  workflow_dispatch:
 
 jobs:
   tests_on_ubuntu_x86_64:
@@ -202,9 +221,47 @@ jobs:
         # Deliberately NOT probing pid 1 here. A live `--pid 1 --run ...`
         # probe is only safe if the attach-path guard is present and correct,
         # and if that guard ever regressed this very step would panic the
-        # runner ("Attempted to kill init!"). The guard is covered by the unit
-        # tests instead, which assert on the validation path directly.
+        # runner ("Attempted to kill init!").
+        #
+        # Be precise about what does and does not cover that guard, because an
+        # earlier version of this comment claimed the unit tests cover it. They
+        # do not, and cannot: no test in this repo attaches to pid 1 (see the
+        # note at the top of tests/unit/test_guards.c), and a test that "proved"
+        # the guard by ptracing init would risk the panic above on every run.
+        # What the unit tests DO assert is narrower, and this comment used to
+        # overstate it: test_guards.c's test_nonpositive_pid_rejected checks that
+        # injector_target_info(0/-1) fails and that injector_can_attach(0/-1)
+        # answers "cannot" - the pid <= 0 validation path of the entry points
+        # that do not attach. NO test asserts that injector_attach() itself
+        # refuses pid 1, because the only way to assert that is to call attach(1).
+        # So attach's pid <= 1 guard is verified by inspection, and by the fact
+        # that nothing in this suite ever attaches to pid 1 - not by a passing
+        # test, and this comment is the record of that split.
         exit $fail
+    # The manual flag-variant steps above (--cloned-thread, --invoke, --timeout,
+    # --mem, --list, --self-find) remain the PRIMARY functional coverage: they
+    # are what pins a failure to one API and one arch pair.
+    #
+    # This step exists to exercise the accounting that tests/Makefile's `check`
+    # target wraps around them - the arch-probe RUN / SKIP / ERROR bookkeeping
+    # and its summary - plus the pairs the manual list omits: `default ->
+    # default`, `x86_64 -> x32`, `x32 -> i386`, and the arm pairs (not built
+    # here, so they SKIP for that reason). `x86_64 -> i386` and `i386 -> i386`
+    # are already covered by manual steps above and are known to work on an
+    # equivalent Ubuntu x86_64 host, so re-running them here is confirmation
+    # rather than new coverage.
+    #
+    # x32 pairs are EXPECTED to SKIP on kernels without CONFIG_X86_X32_ABI - an
+    # x32 fixture links fine wherever gcc-multilib is installed, but execve
+    # fails with ENOEXEC. That is by design, not a failure: `check` only errors
+    # when zero pairs ran, and its summary states both counts.
+    #
+    # Deliberately the last step of this job: if it goes red, the manual steps
+    # above have already localized the failure, so the red run stays
+    # attributable. Plain `run:`, so a non-zero rc fails the job.
+    - name: arch-pair accounting (make check)
+      run: |
+        cd tests && make check
 
   fuzz_regression:
     name: Fuzz regression + short fuzzing (ASan/UBSan)

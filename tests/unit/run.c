@@ -23,6 +23,7 @@ int test_failed_attach_nulls_the_handle(void);
 int test_nonpositive_pid_rejected(void);
 int test_proc_zero_length_buffer(void);
 int test_proc_long_path_still_detects_deleted(void);
+int test_trampoline_detector_matches_the_writers(void);
 int main(void) {
     MU_RUN_TEST(test_dummy);
     MU_RUN_TEST(test_error_after_failed_attach);
@@ -41,6 +42,7 @@ int main(void) {
     MU_RUN_TEST(test_nonpositive_pid_rejected);
     MU_RUN_TEST(test_proc_zero_length_buffer);
     MU_RUN_TEST(test_proc_long_path_still_detects_deleted);
+    MU_RUN_TEST(test_trampoline_detector_matches_the_writers);
     /* The "unit: N run, M failed" prefix is parsed by tooling - keep it and
      * only append to it. */
     fprintf(stderr, "unit: %d run, %d failed, %d skipped\n",

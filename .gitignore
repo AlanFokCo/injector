@@ -1,5 +1,11 @@
 *~
 *.o
+# macOS: Finder metadata, AppleDouble copies (these land in crashes/ too, where
+# tests/fuzz/Makefile's stray-file gate now also catches them), and clang's
+# debug-symbol bundles from a local `make regress`.
+.DS_Store
+._*
+*.dSYM/
 *.so
 *.so.*
 /src/linux/*.a
@@ -8,6 +14,8 @@
 /tests/test-prog-*
 /tests/test-target
 /tests/test-target-*
+/tests/arch-probe
+/tests/arch-probe-*
 /tests/unit/run
 /bindings/rust/target/
 __pycache__/

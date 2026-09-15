@@ -117,17 +117,56 @@ int injector_attach(injector_t **injector, injector_pid_t pid);
 int injector_attach_with_opts(injector_t **out, pid_t pid, const injector_opts_t *opts);
 
 /*!
- * \brief Thread safety
+ * \brief Thread safety and thread AFFINITY (Linux)
  * An \c injector_t handle is not safe for concurrent use from multiple threads.
  * Use a handle from a single thread or serialize access. The per-handle error
  * buffer is read via \ref injector_last_error; the thread-local fallback (read
  * via \ref injector_error) is intended only for the no-handle attach-failure case.
+ *
+ * \par Affinity is stronger than "serialize access"
+ * On Linux a handle must be driven by the SAME thread that attached it, not
+ * merely by one thread at a time. \c ptrace(2) tracer ownership is per-THREAD,
+ * not per-process: \c PTRACE_ATTACH makes the calling task the tracer, and from
+ * any other thread of this process the kernel answers
+ * \c PTRACE_GETREGS/SETREGS/POKETEXT/DETACH for that target with \c ESRCH, as
+ * if it were not traced at all. Measured on Linux 6.8/x86_64: attach in thread A,
+ * then from thread B both \c PTRACE_GETREGS and \c PTRACE_DETACH fail \c ESRCH
+ * while the target keeps reporting \c State: \c t and \c TracerPid: (A's tid).
+ *
+ * Every operation that would issue a ptrace request from another thread is
+ * therefore refused BEFORE anything is sent to the target, with \c INJERR_OTHER
+ * and a message naming both tids. Nothing is corrupted and the target is
+ * untouched - but it also cannot be detached from there, because no ptrace
+ * request moves a tracee to a different tracer. The kernel does release the
+ * target when the tracer THREAD exits (measured: it returned to \c State: \c S
+ * with \c TracerPid: \c 0), which is the recovery if the owning thread can no
+ * longer be used. Note that \ref injector_detach destroys the handle whether or
+ * not the detach succeeded, so a cross-thread detach leaves the target stopped
+ * and traced with no handle left to detach it with.
+ *
+ * \par Applies to
+ * \ref injector_detach, \ref injector_inject, \ref injector_uninject,
+ * \ref injector_uninject_all, \ref injector_call,
+ * \ref injector_remote_func_addr, \ref injector_remote_call,
+ * \ref injector_remote_vcall, \ref injector_invoke, \ref injector_run (which
+ * attaches, invokes and detaches, so all of it must run on one thread),
+ * \ref injector_inject_in_cloned_thread, and the \c PEEKTEXT/POKETEXT fallback
+ * of \ref injector_read_mem / \ref injector_write_mem. The \c process_vm_readv
+ * and \c process_vm_writev fast path of those two is not ptrace-scoped and does
+ * work from another thread, which is why the refusal is reported at the fallback
+ * rather than at their entry point.
  */
 
 /*!
  * \brief Detach from the attached process and destroy the specified handle.
  * \param[in]   injector the injector handle to destroy
  * \return               zero on success. Otherwise, error code
+ * \remarks Thread affinity: must be called from the thread that attached. From
+ *          any other thread \c PTRACE_DETACH fails \c ESRCH, so this returns
+ *          \c INJERR_OTHER having done nothing to the target - and the handle is
+ *          destroyed anyway, leaving the target stopped and traced until the
+ *          thread that attached detaches it or exits. See the affinity note at
+ *          \ref injector_attach.
  */
 int injector_detach(injector_t *injector);
 
@@ -193,6 +232,9 @@ pid_t injector_find_process(const char *name);
  * If the lock type is reentrant, the status guarded by the lock may become inconsistent.
  * As far as I checked, \c dlopen() internally calls \c malloc() requiring non-reentrant
  * locks. \c dlopen() also uses a reentrant lock to guard information about loaded files.
+ * \remarks Thread affinity: drive this handle from the thread that attached it.
+ *          A remote call from another thread is refused before anything is
+ *          written to the target (\c INJERR_OTHER, both tids named).
  */
 int injector_inject(injector_t *injector, const char *path, void **handle);
 
@@ -203,6 +245,8 @@ int injector_inject(injector_t *injector, const char *path, void **handle);
  * \return               zero on success. Otherwise, error code
  * \remarks This fearute isn't supported for musl-libc processes.
  *     See [Functional differences from glibc](https://wiki.musl-libc.org/functional-differences-from-glibc.html#Unloading_libraries).
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_uninject(injector_t *injector, void *handle);
 
@@ -221,6 +265,8 @@ int injector_uninject(injector_t *injector, void *handle);
  *   If the function in the target process internally calls non-[async-signal-safe]((https://man7.org/linux/man-pages/man7/signal-safety.7.html))
  *   functions, it may stop the target process or cause unexpected behaviour.
  * \sa injector_remote_func_addr(), injector_remote_call(), injector_remote_vcall()
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_call(injector_t *injector, void *handle, const char* name);
 #endif
@@ -278,6 +324,8 @@ const char *injector_last_error(injector_t *injector);
  * }
  * printf("The return value of foo_func(1, 2, 3) is %ld.\n", retval);
  * \endcode
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_remote_func_addr(injector_t *injector, void *handle, const char* name, size_t *func_addr_out);
 
@@ -296,6 +344,8 @@ int injector_remote_func_addr(injector_t *injector, void *handle, const char* na
  *   If the function in the target process internally calls non-[async-signal-safe]((https://man7.org/linux/man-pages/man7/signal-safety.7.html))
  *   functions, it may stop the target process or cause unexpected behaviour.
  * \sa injector_remote_func_addr(), injector_remote_vcall()
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_addr, ...);
 
@@ -314,6 +364,8 @@ int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_add
  *   If the function in the target process internally calls non-[async-signal-safe]((https://man7.org/linux/man-pages/man7/signal-safety.7.html))
  *   functions, it may stop the target process or cause unexpected behaviour.
  * \sa injector_remote_func_addr(), injector_remote_call()
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_remote_vcall(injector_t *injector, intptr_t *retval, size_t func_addr, va_list ap);
 
@@ -328,6 +380,8 @@ eturn               zero on success. Otherwise, error code
  * 
 emarks Uses process_vm_readv with a ptrace single-step fallback.
  * \sa injector_write_mem(), injector_resolve_symbol()
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_read_mem(injector_t *inj, uintptr_t addr, void *buf, size_t len);
 
@@ -345,6 +399,8 @@ emarks Gate: the handle must be attached via \c injector_attach_with_opts
  *          with \c opts.enable_write_mem = 1. Uses process_vm_writev with a
  *          ptrace single-step fallback.
  * \sa injector_read_mem(), injector_resolve_symbol()
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_write_mem(injector_t *inj, uintptr_t addr, const void *buf, size_t len);
 
@@ -395,6 +451,22 @@ typedef struct {
  *          or execute code in the target. Safe to call on an attached handle.
  *          A .so is listed once (adjacent mappings r-xp/r--p/rw-p collapsed);
  *          a non-contiguously mapped library may appear more than once.
+ *          The library filter matches the WHOLE path as it appears in
+ *          \c /proc/PID/maps, not just the basename: a file-backed mapping is
+ *          listed when its path contains \c .so either at the very end or
+ *          immediately followed by a dot (\c libfoo.so, \c libc.so.6,
+ *          \c ld-linux-x86-64.so.2). Two consequences worth knowing: a
+ *          directory component ending in \c .so or \c .so.N also qualifies, so
+ *          an ordinary file such as \c /opt/libfoo.so.1/helper IS listed,
+ *          whereas \c /opt/foo.so/bar is NOT, because there \c .so is followed
+ *          by a slash. The main executable is therefore usually not listed, but
+ *          that follows from its path rather than from a guarantee, so do not
+ *          rely on it. Anonymous mappings are never listed, and bracketed
+ *          pseudo-paths such as \c [vdso] or \c [heap] do not match. Deleted
+ *          libraries are listed under their real name (the kernel's
+ *          " (deleted)" suffix is stripped before matching). Use
+ *          \ref injector_resolve_symbol or read \c /proc/PID/maps yourself if
+ *          you need a mapping this filter excludes.
  */
 long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap);
 
@@ -406,6 +478,8 @@ long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap);
  * \remarks Refuses musl-libc targets (\c INJERR_UNSUPPORTED_TARGET), as
  *          \ref injector_uninject does. Only handles whose out-param the
  *          caller kept (non-NULL \c handle) at inject time are tracked.
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_uninject_all(injector_t *inj);
 
@@ -434,6 +508,8 @@ typedef struct {
  *                     (if \c out).
  * \remarks Uses the nonstop (clone-based) path on x86_64 when delivery mode
  *          is \c NONSTOP or \c AUTO; falls back to ptrace otherwise.
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_invoke(injector_t *inj, const char *path, const char *symbol,
                     const intptr_t *args, int argc,
@@ -450,6 +526,8 @@ int injector_invoke(injector_t *inj, const char *path, const char *symbol,
  * \param[in]  opts    attach options, or \c NULL for defaults
  * \param[out] out     destination result, or \c NULL to skip capturing it
  * \return             zero on success.
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_run(pid_t pid, const char *lib, const char *symbol,
                  const intptr_t *args, int argc,
@@ -468,6 +546,8 @@ int injector_run(pid_t pid, const char *lib, const char *symbol,
  * This calls `dlopen()` in a thread created by \c [clone()](https://man7.org/linux/man-pages/man2/clone.2.html). Note that no wonder there are unexpected
  * pitfalls because some resources allocated in \c [pthread_create()](https://man7.org/linux/man-pages/man3/pthread_create.3.html) lack in the \c clone()-ed thread.
  * Use it at your own risk.
+ * \remarks Thread affinity: drive this handle from the thread that attached
+ *          it; see the affinity note at \ref injector_attach.
  */
 int injector_inject_in_cloned_thread(injector_t *injector, const char *path, void **handle);
 #endif

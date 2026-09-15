@@ -38,6 +38,8 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>  /* SYS_kcmp, SYS_gettid */
+#include <sys/uio.h>    /* process_vm_readv, for the orphaned-helper scan */
 #include <time.h>
 #include <unistd.h>
 #include <limits.h>
@@ -98,6 +100,14 @@ static inline size_t remote_mem_size(injector_t *injector) {
  * call site rather than in injector_internal.h, the way ptrace.c declares
  * injector__remote_call_reset(). */
 
+/* ptrace.c: this thread's kernel tid, and the per-handle thread-affinity gate
+ * that refuses a ptrace request issued from a thread other than the one that
+ * attached (see the "Thread affinity" block there). Same declaration-at-the-
+ * call-site convention, because injector_internal.h is not this change's to
+ * edit. */
+pid_t injector__current_tid(void);
+int injector__owner_thread_check(const injector_t *injector, const char *op);
+
 int injector__attach_internal(injector_t **injector_out, pid_t pid, const injector_opts_t *o)
 {
     injector_t *injector;
@@ -143,6 +153,15 @@ int injector__attach_internal(injector_t **injector_out, pid_t pid, const inject
         goto error_exit;
     }
     injector->attached = 1;
+    /* PTRACE_ATTACH just made THIS thread - not this process - the tracer, and
+     * the kernel answers every later ptrace request for the target with ESRCH
+     * from any other thread. Record the owner now so the gate in ptrace.c can
+     * refuse a cross-thread operation up front and name both tids, instead of
+     * letting it fail deep inside a remote call with a message about a process
+     * that exists. 0 (tid unreadable) disables the gate rather than guessing.
+     * The waitpid below must also run here: the tracee is a child of the
+     * attaching task, so waitpid() from another thread fails ECHILD. */
+    injector->owner_tid = injector__current_tid();
 
     do {
         rv = waitpid(pid, &status, 0);
@@ -412,6 +431,34 @@ static void nonstop_cleanup_child(injector_t *inj, pid_t child, int graceful,
 static void nonstop_child_ctx_init(pid_t target, pid_t child,
                                    struct nonstop_child_ctx *ctx);
 
+/* The orphaned-helper scan's scratch: { nonce, settid } in the LAST 16 bytes of
+ * the data page we allocate in the target. The rest of that page belongs to the
+ * shellcode arg struct, its file_path and the appended symbol name, so both
+ * clone sites reserve these bytes in their length checks. Defined up here
+ * because injector_inject_in_cloned_thread() below uses it and C needs the
+ * declaration first; the mechanism and its measurements are documented at the
+ * implementation, next to injector__nonstop_orphan_kill(). */
+#define NONSTOP_SCRATCH_BYTES 16
+
+static size_t nonstop_scratch_addr(const injector_t *inj)
+{
+    return inj->data + inj->data_size - NONSTOP_SCRATCH_BYTES;
+}
+
+/* Defined with the orphan scan below; nonstop_pidns_shared() with the NONSTOP
+ * delivery code, which is why it is forward-declared here too. */
+static int nonstop_pidns_shared(pid_t target);
+static unsigned long long nonstop_boot_ticks(void);
+static unsigned long long nonstop_make_nonce(void);
+static int nonstop_arm_scratch(injector_t *inj, unsigned long long nonce);
+int injector__nonstop_orphan_kill(injector_t *inj, pid_t target, pid_t target_tgid,
+                                  unsigned long long t0_ticks, int pidns_shared,
+                                  unsigned long long nonce, pid_t *found_out,
+                                  char *note, size_t note_len);
+static void nonstop_orphan_report(injector_t *inj, pid_t target_tgid,
+                                  unsigned long long t0_ticks, int pidns_shared,
+                                  unsigned long long nonce);
+
 int injector_inject_in_cloned_thread(injector_t *injector, const char *path, void **handle_out)
 {
     void *data;
@@ -422,6 +469,10 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
     size_t pathlen;
     int rv;
     intptr_t retval;
+    /* Orphaned-helper scan context, captured immediately before the clone. */
+    unsigned long long scan_t0 = 0, scan_nonce = 0;
+    int scan_pidns = 0;
+    pid_t scan_tgid = 0;
 
     INJECTOR_CHECK_HANDLE(injector);
     injector__set_current(injector);
@@ -444,7 +495,10 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
     }
     pathlen = strlen(abspath) + 1;
 
-    if (file_path_offset + pathlen > injector->data_size) {
+    /* NONSTOP_SCRATCH_BYTES at the end of the page belong to the orphaned-helper
+     * scan (see nonstop_scratch_addr), so a path that would reach them is
+     * refused rather than silently overwriting them. */
+    if (file_path_offset + pathlen > injector->data_size - NONSTOP_SCRATCH_BYTES) {
         injector__set_errmsg("too long path name: %s", path);
         return INJERR_FILE_NOT_FOUND;
     }
@@ -466,17 +520,42 @@ int injector_inject_in_cloned_thread(injector_t *injector, const char *path, voi
     if (rv != 0) {
         return rv;
     }
+    /* Arm the orphan scan and take its reference stamp while the target is
+     * certainly alive: t0 must precede the clone, and pidns_shared can only be
+     * decided against a target that still has a /proc/<pid>/ns/pid to compare. */
+    scan_t0 = nonstop_boot_ticks();
+    scan_nonce = nonstop_make_nonce();
+    scan_pidns = nonstop_pidns_shared(injector->pid);
+    /* Leave scan_tgid at 0 when the thread-group leader cannot be read: 0 means
+     * UNKNOWN, and the scan declines its kcmp path on unknown. Guessing our own
+     * pid here would leave the real leader eligible, and the leader is the one
+     * CLONE_VM sharer that always exists, is /proc-visible, always matches
+     * kcmp(KCMP_VM) against the target, and is NOT the pid we attached to when
+     * we attached to a thread - i.e. the guess can make the scan SIGKILL the
+     * target's own process. See injector__nonstop_orphan_kill(). */
+    if (injector__read_tgid(injector->pid, &scan_tgid) != 0 || scan_tgid <= 1) {
+        scan_tgid = 0;
+    }
+    if (nonstop_arm_scratch(injector, scan_nonce) != 0) {
+        scan_nonce = 0;   /* not armed: the scan may then only use kcmp */
+    }
     rv = injector__call_function(injector, &retval, injector->clone_addr,
                                  injector->shellcode, injector->stack + injector->stack_size - 4096,
                                  //CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID,
-                                 CLONE_VM,
-                                 injector->data, (long)0, (long)0);
+                                 /* CLONE_PARENT_SETTID makes the KERNEL store the child's pid at
+                                  * ptid - our scratch, in the mm the child is about to share -
+                                  * inside copy_process(), i.e. before the target can die and take
+                                  * the pid with it. See injector__nonstop_orphan_kill(). */
+                                 CLONE_VM | CLONE_PARENT_SETTID,
+                                 injector->data,
+                                 (long)(nonstop_scratch_addr(injector) + sizeof(uint64_t)), (long)0);
     if (rv != 0) {
-        /* Same DEFERRED LEAK as the identical path in injector_invoke_nonstop():
-         * a target that dies during this remote clone can leave a CLONE_VM
-         * helper whose pid never reached us, so nothing below can terminate or
-         * reap it. See the note there for why a safely-gated /proc scan would
-         * fix it and why it is deferred. */
+        /* The clone may have created the helper before the target died, so its
+         * pid never reached us and nothing below can terminate or reap it. Find
+         * it by the mm it shares - or, once the target is gone, by the pid the
+         * kernel recorded in that shared mm - and kill it only on a unique
+         * match. Best effort: the caller's own error stays the headline. */
+        nonstop_orphan_report(injector, scan_tgid, scan_t0, scan_pidns, scan_nonce);
         return rv;
     }
     if (retval == -1) {
@@ -1730,6 +1809,575 @@ done:
     inj->errmsg_set = saved_errmsg_set;
 }
 
+/* =========================================================================
+ * An orphaned CLONE_VM helper: finding and killing one whose pid never
+ * reached us.
+ *
+ * injector_invoke_nonstop() (and injector_inject_in_cloned_thread()) run
+ * clone(CLONE_VM) INSIDE the target. The helper's pid is that clone()'s return
+ * value, which only reaches us through the remote call's result registers - so
+ * if the target dies during the call, the pid is lost while the helper may
+ * already exist. It then outlives the target, is reparented to init, and pins
+ * the target's whole mm_struct (our 2 MB + 8 KB region included) for as long as
+ * it lives, on a stack injector_detach() munmaps. That was the DEFERRED LEAK;
+ * this is the fix.
+ *
+ * --- Why kcmp(2) is the right discriminator, and why it is not enough ------
+ *
+ * The candidates are enumerable (/proc) and cheaply pre-filtered, but the
+ * obvious gates do not identify the helper: an ordinary fork() child the target
+ * created in the same window has the same parent, a start stamp in the same
+ * window, the same namespace, and - because fork() copies the address space -
+ * the same bytes at every address we could probe, including any cookie we wrote
+ * before the clone. What singles the helper out is that it SHARES the target's
+ * mm_struct instead of inheriting a copy of it, and kcmp(2) with KCMP_VM
+ * compares exactly that: the two tasks' mm POINTERS, not their contents.
+ * Measured on Linux 6.8/x86_64 as root, with a target T, a plain fork child F
+ * and a clone(CLONE_VM) helper H:
+ *      kcmp(H,T,KCMP_VM) = 0      kcmp(F,T,KCMP_VM) = 1
+ *      kcmp(P,T,KCMP_VM) = 1      kcmp(T,T,KCMP_VM) = 0
+ * so the helper matches, the fork child does not, and neither does the caller.
+ *
+ * Two properties of that measurement shape the code below:
+ *
+ *  1. kcmp needs a reference WITH AN mm. exit_mm() sets task->mm = NULL, and
+ *     KCMP_VM compares the raw pointers, so a dead reference matches nothing:
+ *     kcmp(H, zombie T) = 1 (NOT 0) and kcmp(H, reaped T) = -1/ESRCH. But the
+ *     failure that loses the pid is precisely the target's death, and
+ *     kick_then_wait_sigtrap() reaps it (waitpid returns WIFEXITED/WIFSIGNALED)
+ *     before this code runs. kcmp therefore cannot serve the case it is needed
+ *     for most, and a note claiming otherwise would be wrong.
+ *  2. Two mm-LESS tasks compare EQUAL (kcmp(zombie, zombie) = 0, and every
+ *     kernel thread has mm == NULL too). A zombie candidate against a zombie
+ *     target would be a false match, so candidates in state Z/X are skipped and
+ *     kcmp is only used when the target itself still has an mm.
+ *
+ * --- The post-mortem discriminator: let the kernel record the pid ----------
+ *
+ * Since the target's mm outlives it only in the helper, the pid has to be
+ * written into that shared mm BEFORE the target can die, by something that does
+ * not depend on the target reporting back. clone(CLONE_PARENT_SETTID) does
+ * exactly that: the kernel stores the child's pid at `ptid` in the parent's
+ * (= shared) address space inside copy_process(), before clone() returns to the
+ * target's userspace. We point ptid at a 16-byte scratch at the END of the data
+ * page we own in the target, next to a per-invoke nonce:
+ *
+ *      data + data_size - 16 : uint64 nonce   (written by us, pre-clone)
+ *      data + data_size -  8 : int64  pid     (written by the KERNEL at clone)
+ *
+ * and then read both back from /proc/<cand>/mem. The identity test is not "the
+ * cookie is there" - a fork child has it too - but **the recorded pid equals the
+ * candidate's OWN pid**. That is self-verifying and needs no reference process:
+ *   - the helper: shares the mm, so it reads the nonce and its own pid -> match;
+ *   - a fork child created BEFORE the clone: reads nonce + 0 -> no match;
+ *   - a fork child created AFTER the clone: reads nonce + the HELPER's pid,
+ *     which is not its own -> no match (this is the false positive that made the
+ *     four obvious gates insufficient, and it is why the value is compared
+ *     against the candidate rather than merely read back);
+ *   - an unrelated process: that address is not mapped in it, or holds other
+ *     bytes; /proc/<cand>/mem either fails or the nonce does not match.
+ *
+ * --- Gates, and what happens when they cannot all be met -------------------
+ *
+ * A candidate must pass ALL of: not the caller (pid/tid/tgid), not the target or
+ * its thread-group leader, not a zombie (no mm - see 2. above), start stamp >=
+ * t0 taken before the clone, and exactly one of the two discriminators. Note
+ * ">=" and not ">": starttime is field 22 of /proc/<pid>/stat in USER_HZ ticks,
+ * and on this host CLK_TCK is 100, i.e. 10 ms of granularity - a target, its
+ * fork child and its helper created within one tick all reported the SAME stamp
+ * 44389374 in the measurement above, so a strict ">" would miss the very helper
+ * the scan exists for. The stamp is a coarse pre-filter; the sound gate is the
+ * discriminator.
+ *
+ * The helper is killed only on a UNIQUE match. Zero matches or more than one
+ * kills nothing and says so in `note`. kcmp is unavailable or refused
+ * (ENOSYS without CONFIG_CHECKPOINT_RESTORE, EPERM, EINVAL) -> decline. The
+ * target has no mm and the scratch could not be armed, or the pid namespace is
+ * not shared -> decline. Every decline leaks one helper rather than risking an
+ * unrelated process, which is the trade the rest of this file makes everywhere.
+ *
+ * RESIDUAL LIMITS, stated rather than papered over:
+ *   - CLONE_PARENT_SETTID stores the child's pid as numbered in the CHILD's pid
+ *     namespace. With a target in a nested namespace that number is not the one
+ *     /proc shows us, so the settid path requires pidns_shared (decided before
+ *     the clone, while the target is alive and its /proc/<pid>/ns/pid can still
+ *     be compared) and declines without it. kcmp is namespace-agnostic: both
+ *     pids it is given are ours.
+ *   - a helper that already EXITED leaves nothing to kill and no mm pinned
+ *     (exit_mm() dropped the reference), which is the desired end state, not a
+ *     missed one;
+ *   - the scan reads /proc, so a hidepid mount or a candidate whose address
+ *     space cannot be read means "cannot tell" and declines;
+ *   - the invoke shellcode copies dlerror()'s text into the data page at
+ *     file_path without a length bound of its own. A message long enough to
+ *     reach the last 16 bytes of the page would clobber the armed scratch, and
+ *     the scan would then decline. That is the safe direction (a leak, never a
+ *     wrong kill), and it needs a ~4 KB dlerror string;
+ *   - cost: one /proc walk plus a kcmp or a 16-byte read per candidate.
+ *     Measured on the test host (Linux 6.8, 1331 processes in /proc at the
+ *     time) the scan takes ~6 ms: a failing invoke went from 0.4 ms to 6-7 ms.
+ *     It runs only on that path, never on a successful invoke.
+ *
+ * The two clocks the start-stamp gate compares were checked against each other
+ * rather than assumed equal: /proc/uptime's first field and field 22 of
+ * /proc/<pid>/stat are both CLOCK_BOOTTIME based, and a stamp taken immediately
+ * before a clone was <= the clone child's field 22 in every one of the trials
+ * behind the numbers quoted above.
+ * ====================================================================== */
+
+/* enum kcmp_type from linux/kcmp.h: KCMP_FILE=0, KCMP_VM=1, KCMP_FILES=2, ...
+ * Spelled out rather than included: the header is a kernel uapi one that not
+ * every toolchain in the build matrix ships (musl, -m32, -mx32), and the
+ * ordering is ABI, not a kernel implementation detail. */
+#define NONSTOP_KCMP_VM 1
+
+/* "Now" in the units /proc/<pid>/stat field 22 uses: USER_HZ ticks since boot.
+ * /proc/uptime's first field and field 22 are both CLOCK_BOOTTIME based, so
+ * multiplying by CLK_TCK makes the two directly comparable. 0 = unreadable,
+ * which disables the stamp gate's contribution (the caller then has no t0). */
+static unsigned long long nonstop_boot_ticks(void)
+{
+    double up = 0.0;
+    long hz;
+    FILE *f = fopen("/proc/uptime", "r");
+
+    if (f == NULL) {
+        return 0;
+    }
+    if (fscanf(f, "%lf", &up) != 1) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) {
+        hz = 100;
+    }
+    return (unsigned long long)(up * (double)hz);
+}
+
+/* Per-invoke marker for the scratch. This is an identity MARKER, not a secret:
+ * its job is to tell "a page we armed" from "whatever happens to be at that
+ * address in a stranger", not to resist a hostile target (which can already do
+ * worse than hide a helper). Never 0, because 0 is what an unarmed or zeroed
+ * scratch holds. */
+static unsigned long long nonstop_make_nonce(void)
+{
+    static __thread unsigned long long counter;
+    struct timespec ts;
+    unsigned long long n;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    counter++;
+    n = ((unsigned long long)ts.tv_sec << 24) ^ (unsigned long long)ts.tv_nsec
+        ^ ((unsigned long long)(uintptr_t)getpid() << 32)
+        ^ (counter * 0x9E3779B97F4A7C15ULL);
+    return (n != 0) ? n : 0xA5A5F00DCAFE1234ULL;
+}
+
+/* kcmp(2) with KCMP_VM. 0 = the two tasks share one mm_struct, 1 = they do not,
+ * negative errno = the comparison could not be made at all. Callers must keep
+ * those apart: "different" and "unknown" lead to opposite decisions. */
+static int nonstop_kcmp_vm(pid_t a, pid_t b)
+{
+#ifdef SYS_kcmp
+    long r;
+
+    if (a <= 0 || b <= 0) {
+        return -EINVAL;
+    }
+    errno = 0;
+    r = syscall(SYS_kcmp, (long)a, (long)b, (long)NONSTOP_KCMP_VM, 0L, 0L);
+    if (r < 0) {
+        return (errno != 0) ? -errno : -EINVAL;
+    }
+    return (r == 0) ? 0 : 1;
+#else
+    /* No syscall number in this toolchain's headers: the discriminator is
+     * unavailable, which the caller reports rather than guessing without. */
+    (void)a; (void)b;
+    return -ENOSYS;
+#endif
+}
+
+/* Write { nonce, 0 } into the target's scratch BEFORE the clone, so the settid
+ * slot cannot hold a previous invoke's pid (a dead helper's number is
+ * recyclable) and the nonce cannot be mistaken for stale page content.
+ * 0 = armed, -1 = could not be (which disables the settid discriminator). */
+static int nonstop_arm_scratch(injector_t *inj, unsigned long long nonce)
+{
+    unsigned char buf[NONSTOP_SCRATCH_BYTES];
+    int64_t zero = 0;
+
+    memcpy(buf, &nonce, sizeof(nonce));
+    memcpy(buf + sizeof(nonce), &zero, sizeof(zero));
+    return injector__write(inj, nonstop_scratch_addr(inj), buf, sizeof(buf));
+}
+
+/* Read the scratch back out of a CANDIDATE's address space. Only a process that
+ * shares (or COW-inherited) the target's mm has anything at that address, so a
+ * failed read is itself evidence: "not a sharer of that mm".
+ *
+ * process_vm_readv() rather than pread() on /proc/<cand>/mem because the offset
+ * is a target VIRTUAL address, which does not fit a 32-bit off_t and this file
+ * also builds for -m32/-mx32 (where the path is unreachable - NONSTOP delivery
+ * is refused for any target but ARCH_X86_64 - but must still compile) and
+ * against musl, which does not expose pread64/off64_t under _GNU_SOURCE alone.
+ * The scratch is the last 16 bytes of a page-aligned page, so it can never
+ * straddle two mappings, which is the one thing that would make a single-iovec
+ * process_vm_readv fail on a valid range. Needs the same ptrace_may_access()
+ * that reading /proc/<cand>/mem would. */
+static int nonstop_read_scratch(pid_t cand, size_t addr, unsigned long long *nonce,
+                                long long *settid)
+{
+    unsigned char buf[NONSTOP_SCRATCH_BYTES];
+    struct iovec liov, riov;
+    ssize_t n;
+
+    liov.iov_base = buf;
+    liov.iov_len = sizeof(buf);
+    riov.iov_base = (void *)(uintptr_t)addr;
+    riov.iov_len = sizeof(buf);
+    n = process_vm_readv(cand, &liov, 1, &riov, 1, 0);
+    if (n != (ssize_t)sizeof(buf)) {
+        return -1;
+    }
+    memcpy(nonce, buf, sizeof(*nonce));
+    memcpy(settid, buf + sizeof(*nonce), sizeof(*settid));
+    return 0;
+}
+
+/* Find and SIGKILL a CLONE_VM helper of `target` whose pid was lost with the
+ * target. See the block above for the two discriminators and every gate.
+ *
+ * Returns  1 = a UNIQUE helper was identified and killed (*found_out is its pid)
+ *          0 = nothing matched, so nothing was killed
+ *         -1 = declined (ambiguous match, or no usable discriminator): leaked
+ * `note` always receives a one-line reason suitable for a caller-visible
+ * message. Non-static for the same reason injector__handle_mark_desynced() and
+ * injector__handle_is_desynced() are: the zero-match, unique-match and
+ * multi-match branches cannot be reached deterministically through the public
+ * API (they need two mm-sharers, or none, at a chosen instant), so the A/B
+ * harness drives them directly. It is not part of the public ABI. */
+int injector__nonstop_orphan_kill(injector_t *inj, pid_t target, pid_t target_tgid,
+                                  unsigned long long t0_ticks, int pidns_shared,
+                                  unsigned long long nonce, pid_t *found_out,
+                                  char *note, size_t note_len)
+{
+    struct nonstop_proc_id tid;
+    const char *ref_why;
+    int target_rr;
+    pid_t self = getpid();
+    pid_t self_tid = injector__current_tid();
+    size_t scratch = nonstop_scratch_addr(inj);
+    int target_has_mm = 0;
+    int use_kcmp = 0;
+    int use_settid = 0;
+    int kcmp_probe = -ENOENT;   /* not attempted: the target has no mm to compare against */
+    int matches = 0;
+    int kcmp_errors = 0;
+    int scanned = 0;
+    int vetoed = 0;
+    pid_t match = 0;
+    DIR *d;
+    struct dirent *ent;
+
+    if (found_out != NULL) {
+        *found_out = 0;
+    }
+    if (note_len > 0 && note != NULL) {
+        note[0] = '\0';
+    }
+#define NONSTOP_NOTE(...) do { if (note != NULL && note_len > 0) snprintf(note, note_len, __VA_ARGS__); } while (0)
+
+    /* Is the target still a valid kcmp reference? Only a task with an mm is:
+     * a zombie's is NULL (measured kcmp(helper, zombie) = 1) and a reaped one
+     * is ESRCH. */
+    target_rr = (target > 1) ? nonstop_read_id(target, &tid) : -1;
+    if (target_rr == 0) {
+        target_has_mm = (tid.state != 'Z' && tid.state != 'X');
+    }
+    /* Why kcmp is or is not the discriminator, in words a caller can act on:
+     * the difference between "a zombie" and "already reaped" is the difference
+     * between exit_mm() having NULLed task->mm and the task being gone from the
+     * pid table, and both make kcmp(KCMP_VM) useless as a reference. */
+    ref_why = (target_rr == 0 && target_has_mm) ? "the target still has an mm" :
+              (target_rr == 0) ? "the target is a zombie, and exit_mm() has already NULLed its mm" :
+              (target_rr == -1) ? "the target is already reaped, so kcmp on it is ESRCH" :
+              "the target's state could not be read";
+    if (target_has_mm && target_tgid > 1) {
+        kcmp_probe = nonstop_kcmp_vm((self_tid > 0) ? self_tid : self, target);
+        if (kcmp_probe == 0 || kcmp_probe == 1) {
+            use_kcmp = 1;
+        }
+    }
+    if (!use_kcmp) {
+        /* Post-mortem: the recorded pid + nonce, read back from the candidate. */
+        use_settid = (nonce != 0 && pidns_shared);
+    }
+    if (!use_kcmp && !use_settid) {
+        /* Neither discriminator is available. Leak rather than guess: every
+         * branch below names what is missing and why the weaker gates are not
+         * enough on their own (see the block above this function). */
+        const char *why_kcmp;
+        const char *why_settid;
+
+        if (target <= 1) {
+            why_kcmp = "there is no usable reference pid, so kcmp(KCMP_VM) has nothing to "
+                       "compare against";
+        } else if (target_tgid <= 1) {
+            why_kcmp = "the target's thread-group leader could not be read, so it cannot be "
+                       "excluded from the candidate set - and the leader always shares the "
+                       "target's mm, so kcmp(KCMP_VM) would match the target's OWN process";
+        } else if (!target_has_mm) {
+            why_kcmp = "the target no longer has an mm (zombie or reaped), so kcmp(KCMP_VM) cannot "
+                       "match it - exit_mm() NULLs task->mm, measured as kcmp(helper, zombie) = 1 "
+                       "not 0, and a reaped pid is ESRCH";
+        } else if (kcmp_probe == -ENOSYS) {
+            why_kcmp = "kcmp(2) is not implemented here (ENOSYS: a kernel without "
+                       "CONFIG_CHECKPOINT_RESTORE), so there is no mm-pointer comparison to make";
+        } else if (kcmp_probe == -EPERM) {
+            why_kcmp = "kcmp(2) was refused (EPERM), so the mm comparison is not permitted";
+        } else if (kcmp_probe == -EINVAL) {
+            why_kcmp = "kcmp(2) rejected the comparison (EINVAL)";
+        } else {
+            why_kcmp = "kcmp(2) could not compare this process with the target";
+        }
+        why_settid = (nonce == 0)
+            ? "and the pre-clone scratch could not be armed, so there is no recorded pid to match "
+              "either"
+            : "and the target is in a different pid namespace, where CLONE_PARENT_SETTID records a "
+              "pid number that this /proc does not use";
+        NONSTOP_NOTE("declined, nothing killed: %s %s. If a helper was created it is leaked, which "
+                     "is deliberate - the gates that ARE available (parent, start stamp, namespace, "
+                     "a cookie read back through COW) also match an ordinary fork() child of the "
+                     "target, and killing that would be worse",
+                     why_kcmp, why_settid);
+        return -1;
+    }
+
+    if (t0_ticks == 0) {
+        /* The pre-clone start stamp is what keeps every CLONE_VM sharer that
+         * already existed out of the candidate set - above all the target's own
+         * thread-group leader, which matches kcmp(KCMP_VM) by definition. With
+         * it missing the only gate left is "shares the target's mm", so a unique
+         * match could be the target itself. nonstop_boot_ticks() returns 0 when
+         * /proc/uptime cannot be read (EMFILE, EINTR). Decline rather than scan
+         * with a safety gate silently switched off. */
+        NONSTOP_NOTE("declined, nothing killed: the pre-clone start-time reference could not be "
+                     "read from /proc/uptime, so the gate that excludes CLONE_VM sharers which "
+                     "already existed - including the target's own thread-group leader, which "
+                     "always matches kcmp(KCMP_VM) - is unavailable, and killing the target "
+                     "itself would be worse than leaking our helper");
+        return -1;
+    }
+
+    d = opendir("/proc");
+    if (d == NULL) {
+        NONSTOP_NOTE("declined, nothing killed: /proc could not be opened (%s)", strerror(errno));
+        return -1;
+    }
+    while ((ent = readdir(d)) != NULL) {
+        unsigned long long n2;
+        long long settid2;
+        long v;
+        char *endp;
+        pid_t cand;
+        int rr;
+
+        if (ent->d_name[0] < '1' || ent->d_name[0] > '9') {
+            continue;                       /* not a pid directory */
+        }
+        errno = 0;
+        v = strtol(ent->d_name, &endp, 10);
+        if (errno != 0 || endp == ent->d_name || *endp != '\0' || v <= 1) {
+            continue;                       /* and never pid 1, whatever it wears */
+        }
+        cand = (pid_t)v;
+        if (cand == self || cand == self_tid || cand == target ||
+            (target_tgid > 1 && cand == target_tgid)) {
+            continue;                       /* us, or the target itself */
+        }
+        rr = nonstop_read_id(cand, &tid);
+        if (rr != 0) {
+            continue;                       /* gone, or /proc would not parse */
+        }
+        if (tid.state == 'Z' || tid.state == 'X') {
+            continue;   /* no mm: nothing to unpin, and two mm-less tasks kcmp-match */
+        }
+        if (t0_ticks != 0 && tid.starttime < t0_ticks) {
+            continue;                       /* already existed before the clone */
+        }
+        scanned++;
+        if (use_kcmp) {
+            int r = nonstop_kcmp_vm(cand, target);
+            if (r != 0) {
+                if (r < 0) {
+                    kcmp_errors++;
+                }
+                continue;                   /* a different mm, or an unreadable pair */
+            }
+            /* kcmp(KCMP_VM) == 0 proves only "shares the target's mm", which is
+             * equally true of any CLONE_VM child the TARGET spawns on its own -
+             * vfork(), posix_spawn(), system(), popen(). Such a child is a
+             * /proc-visible thread-group leader, is not a zombie, and starts at
+             * or after t0, so it clears every gate above; if our helper was
+             * never created, or has already exited, that child is the UNIQUE
+             * match and gets SIGKILLed - killing a subprocess the target
+             * legitimately spawned, which nothing else in this library does.
+             *
+             * The armed scratch vetoes it, and is available precisely in this
+             * case, because a target alive enough to kcmp is alive enough to
+             * read: CLONE_PARENT_SETTID made the kernel write OUR helper's pid
+             * into the shared page, so the true helper reads back settid equal
+             * to its own pid while an unrelated mm-sharer reads the same bytes
+             * and sees someone else's pid (or 0, if no helper was ever created).
+             * Deliberately NOT applied when the scratch is unreadable or the
+             * nonce does not match (not armed, or clobbered): there kcmp is all
+             * we have, and declining would reopen the leak this scan closes. */
+            if (nonce != 0 && pidns_shared &&
+                nonstop_read_scratch(cand, scratch, &n2, &settid2) == 0 &&
+                n2 == nonce && settid2 != (long long)cand) {
+                vetoed++;
+                continue;       /* shares the target's mm, but is not OUR helper */
+            }
+        } else {
+            if (nonstop_read_scratch(cand, scratch, &n2, &settid2) != 0) {
+                continue;                   /* not mapped there: not a sharer of the target's mm */
+            }
+            if (n2 != nonce || settid2 != (long long)cand) {
+                continue;   /* COW copy of a fork child, or a stranger's bytes */
+            }
+        }
+        matches++;
+        match = cand;
+        if (matches > 1) {
+            break;                          /* ambiguous: stop looking, kill nothing */
+        }
+    }
+    closedir(d);
+
+    if (matches > 1) {
+        NONSTOP_NOTE("declined, nothing killed: %d processes match the %s discriminator "
+                     "(at least %d scanned before the scan was abandoned), so the helper is "
+                     "not uniquely identified - one of them is "
+                     "an unrelated CLONE_VM sharer of the target's mm and killing the wrong one "
+                     "is worse than leaking ours",
+                     matches, use_kcmp ? "kcmp(KCMP_VM)" : "recorded-pid", scanned);
+        return -1;
+    }
+    if (matches == 0) {
+        NONSTOP_NOTE("no match, nothing killed: no process other than the target and the caller "
+                     "shares its mm and started at or after the clone (%d candidate(s) scanned "
+                     "with the %s discriminator, %d vetoed by the recorded-pid check, %s%s%s), so "
+                     "either the clone never created the helper or it has already exited and "
+                     "released the mm",
+                     scanned, use_kcmp ? "kcmp(KCMP_VM)" : "recorded-pid", vetoed, ref_why,
+                     kcmp_errors > 0 ? "; " : "",
+                     kcmp_errors > 0 ? "kcmp itself failed for some candidates" : "");
+        return 0;
+    }
+    if (match <= 1) {                       /* unreachable: `v <= 1` is skipped above */
+        NONSTOP_NOTE("declined, nothing killed: the only match is pid %d", (int)match);
+        return -1;
+    }
+    if (kill(match, SIGKILL) != 0) {
+        int e = errno;
+        NONSTOP_NOTE("identified pid %d as the orphaned helper (%s discriminator) but "
+                     "kill(SIGKILL) failed: %s - it is still alive and still pins the target's mm",
+                     (int)match, use_kcmp ? "kcmp(KCMP_VM)" : "recorded-pid", strerror(e));
+        return -1;
+    }
+    if (found_out != NULL) {
+        *found_out = match;
+    }
+    NONSTOP_NOTE("killed pid %d, the unique process sharing the target's mm and started at or "
+                 "after the clone (%s discriminator, %d candidate(s) scanned, %s); its mm "
+                 "reference is released by exit_mm() whether or not it has been reaped yet",
+                 (int)match, use_kcmp ? "kcmp(KCMP_VM)" : "recorded-pid", scanned, ref_why);
+    return 1;
+#undef NONSTOP_NOTE
+}
+
+/* injector__set_errmsg() is deliberately STICKY (util.c: "prevent the error
+ * message from being overwritten"), so reporting the scan's verdict with a
+ * second set_errmsg() would be a silent no-op and the caller would never learn
+ * whether a helper was killed, missed or refused. Append to the handle's own
+ * buffer instead, keeping the primary failure first: that is the message a
+ * caller debugging a dead target needs, and the scan's verdict is a suffix to
+ * it, not a replacement. If the primary already fills the buffer the suffix is
+ * dropped rather than truncating the primary. When nothing has been recorded
+ * yet (which cannot happen on these paths - the failed remote call always
+ * sets one, and injector_invoke() sets current_inj to this handle - but the
+ * branch is cheap) fall back to set_errmsg(), which then succeeds. */
+static void nonstop_report_errmsg(injector_t *inj, const char *suffix,
+                                  const char *compact)
+{
+    size_t len, slen;
+
+    if (inj == NULL) {
+        return;
+    }
+    if (inj->errmsg_set) {
+        len = strlen(inj->errmsg);
+        slen = strlen(suffix);
+        if (len + slen + 1 <= sizeof(inj->errmsg)) {
+            memcpy(inj->errmsg + len, suffix, slen + 1);
+            return;
+        }
+        /* The primary message and the scan's full reason do not both fit
+         * errmsg[512]: a remote-call timeout or a desync report already runs to
+         * ~300 chars, and the longest verdict - the decline, which interpolates
+         * why_kcmp and why_settid - is several hundred more. Dropping the suffix
+         * entirely, which is what this function used to do, loses the one fact a
+         * caller debugging a leaked helper (or a process it did not expect to
+         * die) actually needs, so fall back to `compact`: outcome plus pid. */
+        slen = strlen(compact);
+        if (len + slen + 1 <= sizeof(inj->errmsg)) {
+            memcpy(inj->errmsg + len, compact, slen + 1);
+        }
+        return;
+    }
+    injector__set_errmsg("%s", suffix);
+}
+
+/* Run the orphan scan after a clone remote call failed, and report what it
+ * decided. Called from both clone sites, so both report identically. */
+static void nonstop_orphan_report(injector_t *inj, pid_t target_tgid,
+                                  unsigned long long t0_ticks, int pidns_shared,
+                                  unsigned long long nonce)
+{
+    /* Sized for the worst case, which is the decline note: its literal text is
+     * ~270 chars and it interpolates why_kcmp (<=181) and why_settid (<=123).
+     * note[192] truncated EVERY verdict mid-sentence, keeping the "killed /
+     * no match / declined" prefix and losing the actionable reason. */
+    char note[768];
+    char suffix[1024];
+    char compact[96];
+    pid_t orphan = 0;
+    int killed;
+    int saved_errno = errno;
+
+    note[0] = '\0';
+    killed = injector__nonstop_orphan_kill(inj, inj->pid, target_tgid, t0_ticks,
+                                           pidns_shared, nonce, &orphan,
+                                           note, sizeof(note));
+    /* "killed"/"no match"/"declined" are all in `note` already; the return value
+     * only decides whether the caller also needs the leaked-helper warning. */
+    snprintf(suffix, sizeof(suffix), " | orphaned CLONE_VM helper: %s%s", note,
+             killed == 1 ? "" : " - if the clone ran before the target died, one helper "
+                                "may still be alive and pinning its mm");
+    snprintf(compact, sizeof(compact), " | orphaned CLONE_VM helper: %s pid %d",
+             killed == 1 ? "killed" : (killed == 0 ? "not found, leaked" : "declined, leaked"),
+             (int)orphan);
+    nonstop_report_errmsg(inj, suffix, compact);
+    /* opendir/readdir/process_vm_readv/kill/strerror all write errno, and this
+     * runs on the caller's FAILURE path, where errno still belongs to the remote
+     * call that just failed. A caller inspecting errno after a failed invoke must
+     * see that, not the scan's ENOENT or ESRCH. */
+    errno = saved_errno;
+}
+
 static int injector_invoke_nonstop(injector_t *inj, const char *path, const char *symbol,
                                    const intptr_t *args, int argc,
                                    injector_result_t *out)
@@ -1740,6 +2388,10 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
     injector_shellcode_invoke_arg_t *arg;
     int rv;
     intptr_t clone_ret;
+    /* Orphaned-helper scan context, captured immediately before the clone. */
+    unsigned long long scan_t0 = 0, scan_nonce = 0;
+    int scan_pidns = 0;
+    pid_t scan_tgid = 0;
 
     if (inj->arch != ARCH_X86_64) {
         injector__set_errmsg("NONSTOP delivery requires x86_64");
@@ -1757,7 +2409,10 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
 
     const size_t hdr = offsetof(injector_shellcode_invoke_arg_t, file_path);
     size_t func_name_off = hdr + pathlen;
-    if (func_name_off + symlen > inj->data_size) {
+    /* NONSTOP_SCRATCH_BYTES at the end of the page belong to the orphaned-helper
+     * scan (see nonstop_scratch_addr), so a path + symbol that would reach them
+     * is refused rather than silently overwriting them. */
+    if (func_name_off + symlen > inj->data_size - NONSTOP_SCRATCH_BYTES) {
         injector__set_errmsg("path + symbol too long for data page");
         if (out) snprintf(out->errmsg, sizeof(out->errmsg), "%s", "path + symbol too long");
         return INJERR_FILE_NOT_FOUND;
@@ -1789,56 +2444,60 @@ static int injector_invoke_nonstop(injector_t *inj, const char *path, const char
         return rv;
     }
 
+    /* Arm the orphan scan and take its reference stamp while the target is
+     * certainly alive: t0 must precede the clone, and pidns_shared can only be
+     * decided against a target that still has a /proc/<pid>/ns/pid to compare. */
+    scan_t0 = nonstop_boot_ticks();
+    scan_nonce = nonstop_make_nonce();
+    scan_pidns = nonstop_pidns_shared(inj->pid);
+    /* Leave scan_tgid at 0 when the thread-group leader cannot be read: 0 means
+     * UNKNOWN, and the scan declines its kcmp path on unknown. Guessing our own
+     * pid here would leave the real leader eligible, and the leader is the one
+     * CLONE_VM sharer that always exists, is /proc-visible, always matches
+     * kcmp(KCMP_VM) against the target, and is NOT the pid we attached to when
+     * we attached to a thread - i.e. the guess can make the scan SIGKILL the
+     * target's own process. See injector__nonstop_orphan_kill(). */
+    if (injector__read_tgid(inj->pid, &scan_tgid) != 0 || scan_tgid <= 1) {
+        scan_tgid = 0;
+    }
+    if (nonstop_arm_scratch(inj, scan_nonce) != 0) {
+        scan_nonce = 0;   /* not armed: the scan may then only use kcmp */
+    }
     /* BLOCKER 1: SIGCHLD is the clone exit_signal (low byte of the flags).
      * Without it the kernel makes the child unwaitable -- wait4() in the
      * target returns ECHILD even while the child is a zombie -- so a killed
      * or exited helper would stay in the target's process table forever.
-     * With it, nonstop_cleanup_child() below can reap the child remotely. */
+     * With it, nonstop_cleanup_child() below can reap the child remotely.
+     * CLONE_PARENT_SETTID additionally makes the kernel record the child's pid
+     * into our scratch inside that shared mm, during copy_process() and so
+     * before the target can die: that record is the only thing that can still
+     * name the helper once the target is gone. See
+     * injector__nonstop_orphan_kill(). */
     rv = injector__call_function(inj, &clone_ret, (long)inj->clone_addr,
                                  (long)inj->shellcode_invoke,
                                  (long)(inj->stack + inj->stack_size - 4096),
-                                 (long)(CLONE_VM | SIGCHLD), (long)inj->data,
-                                 (long)0, (long)0);
+                                 (long)(CLONE_VM | SIGCHLD | CLONE_PARENT_SETTID), (long)inj->data,
+                                 (long)(nonstop_scratch_addr(inj) + sizeof(uint64_t)), (long)0);
     if (rv != 0) {
-        /* DEFERRED LEAK - deferred for scope, NOT because it cannot be fixed
-         * safely. If the target died *during* this remote clone, clone() may
-         * already have created the helper before its pid could reach us, so
-         * `child` below is never known and nothing on any later path can
-         * terminate or reap it. The helper shares the target's mm via CLONE_VM,
-         * so it pins that whole mm_struct (our 2 MB + 8 KB region included) for
-         * as long as it lives, keeps running on a stack that injector_detach()'s
-         * munmap unmaps underneath it, and is reparented to init. Reproduced
-         * both before and after the BLOCKER 1/2 fixes.
+        /* The target died (or desynced) DURING this remote clone, so clone() may
+         * already have created the helper before its pid could reach us through
+         * the result registers: `child` below is never known and nothing on any
+         * later path can terminate or reap it. That helper shares the target's
+         * mm via CLONE_VM, so it pins that whole mm_struct (our 2 MB + 8 KB
+         * region included) for as long as it lives, keeps running on a stack
+         * injector_detach()'s munmap unmaps underneath it, and is reparented to
+         * init. This was the DEFERRED LEAK; it is now closed by finding the
+         * helper through the mm it shares.
          *
-         * A /proc scan CAN identify such a helper, and this note must not claim
-         * that it cannot be done safely. The obvious gates are all available at
-         * this point: PPid == the target's thread-group id, so only a child of
-         * our own target is a candidate; starttime strictly LATER than a stamp
-         * taken immediately before this call, so nothing that already existed can
-         * match; pidns_shared, so the number names the same process here as it
-         * does in the target; and a cookie written into inj->data before the
-         * clone and read back from /proc/<cand>/mem. That is already a stronger
-         * identity test than nonstop_child_is_ours() applies to a helper whose
-         * pid IS known.
-         *
-         * Those four are necessary but NOT sufficient, and a note claiming
-         * otherwise would be wrong: an ordinary fork() child the target happened
-         * to create in the same window satisfies every one of them - same PPid,
-         * a later starttime, the same namespace, and a COW copy of the data page
-         * that reads the cookie back just as happily. What actually singles the
-         * helper out is that it SHARES the target's mm rather than inheriting a
-         * copy, so a sound scan needs a same-mm discriminator on top: kcmp(2)
-         * with KCMP_VM, or an active handshake (a nonce only a process sharing
-         * the mm can answer). Both are awkward exactly when they are needed -
-         * the target is dead, so there is no surviving process to kcmp against
-         * except another helper - which is a design problem to solve, not a
-         * reason to signal on the four gates alone.
-         *
-         * It is not implemented because it is a new mechanism (a /proc walk, a
-         * cookie protocol through the shared data page, and that discriminator)
-         * and this change set is confined to the reviewed findings - not because
-         * a safe version does not exist. Until it is, this path leaks one helper
-         * per occurrence. */
+         * Two discriminators, because the obvious gates are not enough and the
+         * strongest one needs a live reference - the measurements, the fork()
+         * false positive they exclude, the CLONE_PARENT_SETTID record that makes
+         * the post-mortem case work, and every residual limit are documented at
+         * injector__nonstop_orphan_kill() above. What the caller sees is the
+         * primary failure with the scan's verdict appended, including the honest
+         * "declined, nothing killed" when the helper could not be identified
+         * uniquely. */
+        nonstop_orphan_report(inj, scan_tgid, scan_t0, scan_pidns, scan_nonce);
         if (out) { const char *e = injector_last_error(inj); snprintf(out->errmsg, sizeof(out->errmsg), "%s", e ? e : ""); }
         return rv;
     }

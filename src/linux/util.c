@@ -95,7 +95,16 @@ const char *injector__arch2name(arch_t arch)
     case ARCH_X86_64:
         return "x86_64";
     case ARCH_X86_64_X32:
-        return "x86_64 x32-ABI";
+        /* The case stays so this switch remains exhaustive over arch_t, and
+         * because remote_call.c still names the enum in its defence-in-depth
+         * refusal (see injector__arch_is_unsupported() in elf.c). The string is
+         * user-visible diagnostics, so it states the unsupported status rather
+         * than merely naming the ABI: this build refuses EM_X86_64 +
+         * ELFCLASS32 before arch is ever assigned, so nothing in a working
+         * build produces ARCH_X86_64_X32. Seeing this name means a
+         * classification bug, and it must not read like a target we inject
+         * into. */
+        return "x86_64 x32-ABI (unsupported)";
     case ARCH_I386:
         return "i386";
     case ARCH_ARM64:

@@ -14,9 +14,15 @@ ifneq ($(wildcard /usr/bin/x86_64-linux-gnu-gcc),)
   ifneq ($(wildcard /usr/lib/gcc/x86_64-linux-gnu/*/32/libgcc.a),)
     BUILD_TARGETS += i386
   endif
-  ifneq ($(wildcard /usr/lib/gcc/x86_64-linux-gnu/*/x32/libgcc.a),)
-    BUILD_TARGETS += x32
-  endif
+  # There is deliberately NO x32 target here. This project ships x86_64 (LP64)
+  # and i386 runtimes only; the x32 ABI is detected and REFUSED by the library
+  # (see injector__arch_is_unsupported() in $(SRC_DIR)/elf.c) rather than
+  # injected into. Building x32 fixtures would mean shipping a code path that
+  # cannot be executed anywhere we can test - execve'ing an x32 binary needs a
+  # kernel with CONFIG_X86_X32_ABI, which neither this host nor GitHub's runners
+  # has - so every x32 pair in `check` could only ever SKIP, and an untestable
+  # path that patches a live process is worse than no path at all. Do not
+  # re-add this without a kernel that can actually run the result.
 endif
 
 ifneq ($(wildcard /usr/bin/aarch64-linux-gnu-gcc),)
@@ -70,9 +76,7 @@ endif
 CHECK_TARGETS = \
   "x86_64 x86_64" \
   "x86_64 i386" \
-  "x86_64 x32" \
   "i386 i386" \
-  "x32 i386" \
   "arm64 arm64" \
   "arm64 armhf" \
   "arm64 armel" \
@@ -86,8 +90,8 @@ all:
 
 # Every per-arch rule below runs `cd $(SRC_DIR) && $(MAKE) clean && $(MAKE)`
 # with that arch's CC, so the archive left behind in $(SRC_DIR) belongs to the
-# LAST arch built - x32 on any host where gcc-multilib provides
-# /usr/lib/gcc/x86_64-linux-gnu/*/x32/libgcc.a, which includes the CI runners.
+# LAST arch built - i386 on any host where gcc-multilib provides
+# /usr/lib/gcc/x86_64-linux-gnu/*/32/libgcc.a, which includes the CI runners.
 # Everything that links natively afterwards (`make unit`, `cd cmd && make`, the
 # language bindings) then dies with
 #   ld: i386:x64-32 architecture of input file `libinjector.a(elf.o)' is
@@ -104,10 +108,6 @@ x86_64:
 i386:
 	@echo "=============== build: i386 ==============="; \
 	CC='cc -m32' SUFFIX=-i386 $(MAKE) build
-
-x32:
-	@echo "=============== build: x32 ==============="; \
-	CC='cc -mx32' SUFFIX=-x32 $(MAKE) build
 
 arm64:
 	@echo "=============== build: arm64 ==============="; \
@@ -168,10 +168,11 @@ build: test-prog$(SUFFIX)$(EXE_EXT) test-target$(SUFFIX)$(EXE_EXT) test-library$
 # "this host cannot execute that arch" apart from "that test failed", which the
 # two other options both get wrong: running the fixture and seeing whether it
 # dies is unreliable (test-prog exits 1 on its own for many legitimate reasons),
-# and assuming anything that linked will also exec is simply false - an x32
-# binary links fine wherever gcc-multilib is installed, but execve fails with
-# ENOEXEC on a kernel built without CONFIG_X86_X32_ABI, and every
-# cross-compiled arch is in the same boat.
+# and assuming anything that linked will also exec is simply false - every
+# cross-compiled arch links fine wherever its toolchain is installed, but
+# execve fails with ENOEXEC because the host kernel has no binfmt for it. (x32
+# used to be the example here; it is no longer built at all, for the reason
+# given at BUILD_TARGETS above.)
 #
 # It hangs off FORCE so that every `build` recompiles it. A rule with no
 # prerequisite is up to date as soon as the file exists, so a tree that switched
@@ -279,8 +280,8 @@ check: all
 	   fi; \
 	   if test "$$ap" != "$$at" && ! ./"$$at" >/dev/null 2>&1; then \
 	     echo "SKIP: $$prog -> $$target (this host cannot execute $$target binaries:"; \
-	     echo "      $$at is built for that arch, but execve fails - a cross-compiled"; \
-	     echo "      arch, or e.g. x32 on a kernel without CONFIG_X86_X32_ABI)"; \
+	     echo "      $$at is built for that arch, but execve fails with ENOEXEC:"; \
+	     echo "      the host kernel has no binfmt handler for a cross-compiled arch)"; \
 	     skipped=$$((skipped+1)); continue; \
 	   fi; \
 	   echo "=============== injector: $$prog, target: $$target ==============="; \
@@ -311,42 +312,151 @@ check: all
 	 fi
 
 UNIT_TESTS = unit/run
-UNIT_OBJS = unit/run.o unit/test_errmsg.o unit/test_opts.o unit/test_elf.o unit/test_proc.o unit/test_init.o unit/test_guards.o unit/test_trampoline.o
+UNIT_OBJS = unit/run.o unit/test_errmsg.o unit/test_opts.o unit/test_elf.o unit/test_proc.o unit/test_init.o unit/test_guards.o unit/test_trampoline.o unit/test_x32_refused.o unit/test_handles.o unit/test_orphan_scan.o
 
-unit: $(UNIT_TESTS) $(UNIT_OBJS)
+# Number of MU_RUN_TEST registration lines in unit/run.c, pinned so that
+# DELETING one is as loud as never adding one. Bump it in the same commit that
+# legitimately adds or removes a test; unit/registration-check below says so.
+UNIT_RUN_TEST_COUNT = 21
+
+# Nothing else in this file links UNIT_OBJS to the registrations in unit/run.c,
+# and that gap is a silent green in both directions. A unit/test_*.c added to
+# UNIT_OBJS but never registered still links - its test_* symbol is simply
+# unreferenced, and a static archive is only searched for symbols somebody
+# needs - so it compiles, gets archived into unit/run, and never executes.
+# Deleting a MU_RUN_TEST line does the same thing by omission. Either way the
+# suite runs, prints its summary and exits 0.
+#
+# So `unit` first proves three things and fails the build if any is false:
+#   1. every unit/test_*.c on disk has its .o in UNIT_OBJS (a file nobody lists
+#      is compiled by nobody);
+#   2. every top-level `int test_*(void)` DEFINED in those files is registered
+#      with MU_RUN_TEST in unit/run.c - definitions only, so run.c's extern
+#      prototypes cannot satisfy the check for a test that has no body here;
+#      both greps anchor on a line that STARTS with MU_RUN_TEST( so that a
+#      comment in run.c mentioning the macro cannot register a test by
+#      accident;
+#   3. unit/run.c has exactly $(UNIT_RUN_TEST_COUNT) MU_RUN_TEST lines, which is
+#      what makes (2) bite when a registration is removed rather than merely
+#      never added.
+# This is a prerequisite of `unit`, not a step inside its recipe, so a failure
+# here stops the build before the test binary is executed and reported on. It is
+# phony: it re-checks on every run, which is the point, and it costs one grep
+# pass over the dozen or so small files in unit/.
+.PHONY: unit/registration-check
+unit/registration-check:
+	@fail=0; seen=0; \
+	 for f in unit/test_*.c; do \
+	   if ! test -e "$$f"; then \
+	     echo "ERROR: no unit/test_*.c found - the registration guard cannot see the suite"; \
+	     exit 1; \
+	   fi; \
+	   seen=$$((seen+1)); o=$${f%.c}.o; \
+	   case " $(UNIT_OBJS) " in \
+	     *" $$o "*) ;; \
+	     *) echo "ERROR: $$f exists but $$o is not in UNIT_OBJS, so nothing compiles it"; \
+	        echo "       and no test in it can ever run. Fix: add $$o to UNIT_OBJS."; \
+	        fail=1;; \
+	   esac; \
+	 done; \
+	 for sym in $$(grep -h '^int test_[A-Za-z0-9_]*(void)' unit/test_*.c | sed -e 's/^int //' -e 's/(void).*//'); do \
+	   grep -q "^[[:space:]]*MU_RUN_TEST($$sym)" unit/run.c || { \
+	     echo "ERROR: $$sym is defined in unit/test_*.c but is not registered with"; \
+	     echo "       MU_RUN_TEST in unit/run.c, so it links and never executes."; \
+	     fail=1; }; \
+	 done; \
+	 n=$$(grep -c '^[[:space:]]*MU_RUN_TEST(' unit/run.c); \
+	 if [ "$$n" != "$(UNIT_RUN_TEST_COUNT)" ]; then \
+	   echo "ERROR: unit/run.c has $$n MU_RUN_TEST registration(s), expected $(UNIT_RUN_TEST_COUNT)."; \
+	   echo "       Fewer means a test stopped running; more means the pin is stale."; \
+	   echo "       Check the registration list, then update UNIT_RUN_TEST_COUNT."; \
+	   fail=1; \
+	 fi; \
+	 if [ $$seen -eq 0 ]; then \
+	   echo "ERROR: the glob unit/test_*.c matched nothing - wrong directory?"; fail=1; \
+	 fi; \
+	 test $$fail -eq 0
+
+unit: unit/registration-check $(UNIT_TESTS) $(UNIT_OBJS)
 	@for t in $(UNIT_TESTS); do echo "=== $$t ==="; ./$$t || exit 1; done
 
-../src/linux/libinjector.a:
+# FORCE, not "no prerequisites". A rule whose target file exists and whose
+# prerequisite list is empty is permanently up to date, so once
+# src/linux/libinjector.a had been built once this recipe never ran again and
+# `make -C tests unit` linked whatever archive was already on disk. Measured:
+# after editing src/linux/remote_call.c, `make -C tests unit` reported
+# "31 run, 0 failed" against the PRE-EDIT library, and only a forced
+# `make -C src/linux` made the change take effect - a green suite that had not
+# run the code under test. The sub-make has the real dependencies, so let it
+# decide every time.
+../src/linux/libinjector.a: FORCE
 	@cd ../src/linux && $(MAKE)
 
 unit/run: $(UNIT_OBJS) ../src/linux/libinjector.a
-	$(CC) $(CFLAGS) -I. -I../include -o $@ $(UNIT_OBJS) ../src/linux/libinjector.a -ldl
+	$(CC) $(CFLAGS) -I. -I../include -o $@ $(UNIT_OBJS) ../src/linux/libinjector.a -ldl -pthread
 
+# unit/run.c is the only file in unit/ that does not #include "injector.h" (it
+# includes just minunit.h), so it is the only rule here without that header as a
+# prerequisite. Every unit/test_*.c does include it. Listing it is not a style
+# nit: without it a .o built against an older public header survives an edit to
+# include/injector.h, and unit/run then links that stale .o against a freshly
+# rebuilt libinjector.a - the suite exercises an ABI the library no longer has
+# and still reports green.
 unit/run.o: unit/run.c unit/minunit.h
 	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/run.c
 
-unit/test_errmsg.o: unit/test_errmsg.c unit/minunit.h
+unit/test_errmsg.o: unit/test_errmsg.c unit/minunit.h ../include/injector.h
 	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_errmsg.c
 
-unit/test_opts.o: unit/test_opts.c unit/minunit.h
+unit/test_opts.o: unit/test_opts.c unit/minunit.h ../include/injector.h
 	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_opts.c
 
-unit/test_elf.o: unit/test_elf.c unit/minunit.h
+unit/test_elf.o: unit/test_elf.c unit/minunit.h ../include/injector.h
 	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_elf.c
 
-unit/test_proc.o: unit/test_proc.c unit/minunit.h ../src/linux/proc.h
+unit/test_proc.o: unit/test_proc.c unit/minunit.h ../src/linux/proc.h ../include/injector.h
 	$(CC) $(CFLAGS) -I. -I../include -I../src/linux -c -o $@ unit/test_proc.c
 
-unit/test_init.o: unit/test_init.c unit/minunit.h
+unit/test_init.o: unit/test_init.c unit/minunit.h ../include/injector.h
 	$(CC) $(CFLAGS) -I. -I../include -c -o $@ unit/test_init.c
 
-unit/test_guards.o: unit/test_guards.c unit/minunit.h ../src/linux/proc.h
+unit/test_guards.o: unit/test_guards.c unit/minunit.h ../src/linux/proc.h ../include/injector.h
 	$(CC) $(CFLAGS) -I. -I../include -I../src/linux -c -o $@ unit/test_guards.c
 
-unit/test_trampoline.o: unit/test_trampoline.c unit/minunit.h ../src/linux/injector_internal.h
+unit/test_trampoline.o: unit/test_trampoline.c unit/minunit.h ../src/linux/injector_internal.h ../include/injector.h
 	$(CC) $(CFLAGS) -I. -I../include -I../src/linux -c -o $@ unit/test_trampoline.c
+
+# test_handles.c drives the real library against throwaway children it forks
+# itself (FP-slot exhaustion, the desync latch) and against a second thread
+# (ptrace tracer affinity), hence -pthread. It does NOT include
+# injector_internal.h - that used to be listed here as a prerequisite on the
+# claim that the test needed it for FP_SLOTS / DESYNC_SLOTS, which was false:
+# both constants live in .c files (FP_SLOTS in ptrace.c, DESYNC_SLOTS in
+# remote_call.c) and are not in any header, so the test spells its own expected
+# values out as FP_SLOTS_EXPECTED (4) / DESYNC_SLOTS_EXPECTED (40). That is
+# deliberate - it tests the boundary itself, so a change to either constant
+# fails an assertion naming the expected number. The only header from this repo
+# that it does include is the public one; the two desync functions it drives
+# (injector__handle_mark_desynced / injector__handle_is_desynced) are declared
+# in the test file itself, because they too are exported non-static from
+# remote_call.c without appearing in any header.
+unit/test_handles.o: unit/test_handles.c unit/minunit.h ../include/injector.h
+	$(CC) $(CFLAGS) -pthread -I. -I../include -I../src/linux -c -o $@ unit/test_handles.c
+
+unit/test_x32_refused.o: unit/test_x32_refused.c unit/minunit.h ../src/linux/injector_internal.h ../include/injector.h
+	$(CC) $(CFLAGS) -I. -I../include -I../src/linux -c -o $@ unit/test_x32_refused.c
+
+# test_orphan_scan.c drives injector__nonstop_orphan_kill(), which injector.c
+# exports non-static for exactly this harness, so it needs injector_internal.h
+# (for injector_t and the arch types) and the -I../src/linux that goes with it;
+# injector.h reaches it through injector_internal.h, and is listed here as well
+# because it is a real dependency of that include chain. It clone()s throwaway
+# children but creates no pthreads, so unlike test_handles.o it needs no
+# -pthread.
+unit/test_orphan_scan.o: unit/test_orphan_scan.c unit/minunit.h ../src/linux/injector_internal.h ../include/injector.h
+	$(CC) $(CFLAGS) -I. -I../include -I../src/linux -c -o $@ unit/test_orphan_scan.c
 
 clean:
 	$(RM) test-prog$(EXE_EXT) test-prog-* test-target$(EXE_EXT) test-target-* test-library.$(SO_EXT) test-library-*.$(SO_EXT) arch-probe$(EXE_EXT) arch-probe-* $(UNIT_TESTS) $(UNIT_OBJS)
 
-.PHONY: $(BUILD_TARGETS) build check clean unit FORCE
+.PHONY: $(BUILD_TARGETS) build check clean unit unit/registration-check FORCE

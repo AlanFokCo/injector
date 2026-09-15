@@ -103,6 +103,78 @@ static int elf_range_in_file(uint64_t off, uint64_t len, uint64_t fsize);
 static int validate_elf_layout(FILE *fp, const Elf_Ehdr *ehdr, uint64_t *fsize_out);
 static int section_name_is(FILE *fp, uint64_t strtab_off, uint64_t strtab_size, uint64_t name_off, const char *want);
 
+/* One wording for the x32 refusal, shared by the guard in front of the
+ * e_machine switch and by the EM_X86_64 arm that re-checks it, so the two
+ * cannot drift apart into "unsupported" and "unknown architecture". */
+#define X32_UNSUPPORTED_MSG \
+    "x86_64 x32-ABI target process is not supported: this build injects only into LP64 x86_64 and i386 targets."
+
+/* Non-zero if an ELF with this e_machine/EI_CLASS pair names an ABI this build
+ * refuses to inject into. Declared in injector_internal.h, and unit-tested
+ * directly (table-driven, no attach) by tests/unit/test_x32_refused.c.
+ *
+ * The only refusal is the x86_64 x32 ABI: EM_X86_64 with ELFCLASS32. Every
+ * other pair returns 0 - EM_X86_64+ELFCLASS64 (LP64) and EM_386+ELFCLASS32 are
+ * what this project actually ships, and the non-x86 machines are someone else's
+ * business. Note what this function is NOT: it does not validate an ELF, and it
+ * does not decide whether an arch is supported at all - the e_machine switch
+ * below still rejects machines it has no arch for with its own
+ * INJERR_UNSUPPORTED_TARGET. This is one narrow question, asked early.
+ *
+ * WHY x32 IS REFUSED RATHER THAN SUPPORTED
+ *
+ * This project no longer provides an x32 runtime. Everything shipped is
+ * x86_64 (LP64) and i386. Classifying an x32 libc as ARCH_X86_64_X32 used to
+ * hand it to remote_call.c's shared x86_64 `0f 05 cc` trampoline path - i.e. it
+ * injected into x32 targets down a path nobody can test, because execve'ing an
+ * x32 binary needs a kernel with CONFIG_X86_X32_ABI and neither our build host
+ * nor GitHub's runners has one. An unverifiable code path that patches a live
+ * process is worse than no path at all: it cannot be exercised, so it cannot be
+ * fixed, and its first real user is a production target whose text we have
+ * already modified by the time we find out. So the ABI is named and refused.
+ *
+ * remote_call.c's `case ARCH_X86_64_X32:` labels and its
+ * `#if !(defined(__x86_64__) && defined(__LP64__))` refusal are DELIBERATELY
+ * RETAINED, not removed as dead code. Read what they actually do, though,
+ * because on the build that ships they are NOT a second refusal. All four
+ * labels - in injector__call_syscall(), injector__call_function_va_list(),
+ * injector__code_is_trampoline() and stopped_at_our_break() - sit inside
+ * `#if defined(__x86_64__) && defined(__LP64__)` and fall through from
+ * `case ARCH_X86_64:`, so on a mainline x86_64 LP64 build ARCH_X86_64_X32
+ * ALIASES ARCH_X86_64 and shares its `0f 05 cc` trampoline: it refuses nothing
+ * and would drive an x32 target down the LP64 path. The one refusal is in
+ * injector__call_syscall(), inside `#if !(defined(__x86_64__) &&
+ * defined(__LP64__))`, so it compiles in only on a build that is NOT x86_64
+ * LP64. Nothing in the detection path assigns ARCH_X86_64_X32 any more, and on
+ * an LP64 build the only thing standing between an x32 libc and that shared
+ * trampoline is the guard this comment sits on, which runs first.
+ *
+ * The labels stay anyway, for two reasons that are not redundancy. Deleting
+ * them turns the aliasing into a `default:` arm that misreports a
+ * classification bug as an unknown arch; and
+ * tests/unit/test_trampoline.c asserts the aliasing on purpose - on LP64 it
+ * requires ARCH_X86_64_X32 to produce the same TRAMP_SYSCALL64_B0/B1 and
+ * TRAMP_CALLFUNC_B0/B1 bytes as ARCH_X86_64 - so removing them breaks a test
+ * that is pinning intended behaviour rather than catching an accident. Do not
+ * "tidy" them.
+ *
+ * The x86-only guard mirrors the `#if defined(__x86_64__) || defined(__i386__)`
+ * the surrounding code (code_t, TRAMP_*) already uses. On a non-x86 build there
+ * is no x32 to refuse - x32 is an x86 ABI and a non-x86 injector cannot reach
+ * one - and leaving the comparison unguarded would be dead code that reads as
+ * coverage it does not provide. The EM_X86_64 arm below keeps its own refusal so
+ * that compiling this out does not make a non-x86 build permissive. */
+int injector__arch_is_unsupported(unsigned short e_machine, unsigned char ei_class)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    return e_machine == EM_X86_64 && ei_class == ELFCLASS32;
+#else
+    (void)e_machine;
+    (void)ei_class;
+    return 0;
+#endif
+}
+
 int injector__collect_libc_information(injector_t *injector)
 {
     pid_t pid = injector->pid;
@@ -149,6 +221,31 @@ int injector__collect_libc_information(injector_t *injector)
         goto cleanup;
     }
 
+    /* Refuse an ABI this build does not inject into BEFORE `injector->arch` is
+     * assigned - see injector__arch_is_unsupported() above for why x32 is the
+     * only refusal.
+     *
+     * That this is early enough was checked against the call chain by reading
+     * it, not assumed. In injector__attach_internal() (src/linux/injector.c)
+     * the order is: injector__attach_process() -> this function ->
+     * injector__get_regs()/injector__read() of the original bytes and the
+     * trampoline-ownership check, all read-only -> the first
+     * injector__call_syscall() (sys_mmap), which is the first thing that
+     * patches the `0f 05 cc` trampoline over injector->code_addr. The steps are
+     * named rather than cited by line number deliberately: the numbers the
+     * first draft of this comment carried were already wrong when they were
+     * re-checked against the tree (every one of them off by 10-19 lines), and
+     * what was verified - and what a future edit has to preserve - is the
+     * ORDER. So returning INJERR_UNSUPPORTED_TARGET here lands on that
+     * function's error_exit label, which detaches: the target is stopped and
+     * traced for a moment, /proc/<pid>/maps and this ELF header are read, and
+     * its text is never touched. */
+    if (injector__arch_is_unsupported(ehdr.e_machine, ehdr.e_ident[EI_CLASS])) {
+        injector__set_errmsg(X32_UNSUPPORTED_MSG);
+        rv = INJERR_UNSUPPORTED_TARGET;
+        goto cleanup;
+    }
+
     switch (ehdr.e_machine) {
     case EM_X86_64:
         if (ehdr.e_ident[EI_CLASS] == ELFCLASS64) {
@@ -158,11 +255,22 @@ int injector__collect_libc_information(injector_t *injector)
             injector->sys_mprotect = 10;
             injector->sys_munmap = 11;
         } else {
-            /* ILP32 */
-            injector->arch = ARCH_X86_64_X32;
-            injector->sys_mmap = 0x40000000 + 9;
-            injector->sys_mprotect = 0x40000000 + 10;
-            injector->sys_munmap = 0x40000000 + 11;
+            /* ILP32, i.e. the x32 ABI. Dead on an x86 build, whose
+             * injector__arch_is_unsupported() guard above already refused it.
+             * Load-bearing on a non-x86 LP64 build (arm64, riscv64, ppc64,
+             * mips64): read_elf_ehdr() re-parses an ELFCLASS32 header from
+             * Elf32_Ehdr there too, so EM_X86_64 + ELFCLASS32 reaches this
+             * switch, but that build's copy of the guard is compiled to
+             * `return 0`. Same answer either way, and no build is left
+             * permissive. (EI_CLASS is already narrowed to ELFCLASS32/64 by
+             * read_elf_ehdr()'s `default:` arm, which refuses "Invalid ELF
+             * class", so ELFCLASSNONE cannot get here.)
+             * ARCH_X86_64_X32 is deliberately not assigned any more: the
+             * detection path must not be able to produce an arch that only
+             * remote_call.c's non-LP64 refusal knows how to reject. */
+            injector__set_errmsg(X32_UNSUPPORTED_MSG);
+            rv = INJERR_UNSUPPORTED_TARGET;
+            goto cleanup;
         }
         break;
     case EM_386:

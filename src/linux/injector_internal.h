@@ -89,6 +89,13 @@ struct injector {
     pid_t pid;
     uint8_t attached;
     uint8_t mmapped;
+    /* Thread that PTRACE_ATTACHed, i.e. the only thread the kernel lets issue
+     * PTRACE_SETREGS/GETREGS/DETACH for this tracee. ptrace tracer ownership is
+     * per-thread, not per-process: from any other thread those requests fail
+     * with ESRCH while the target stays stopped and traced, and the handle
+     * looks usable right up to the moment it silently is not. Set when the
+     * attach succeeds, 0 while unattached. */
+    pid_t owner_tid;
     arch_t arch;
     libc_type_t libc_type;
     struct user_regs_struct regs;
@@ -193,6 +200,14 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
  * Declared here, not forward-declared in the two .c files that use it, so the
  * signature is checked against the definition in one place. */
 int injector__code_is_trampoline(const injector_t *injector, const code_t *code);
+
+/* True if an ELF with this e_machine/EI_CLASS denotes an ABI this build
+ * deliberately does not inject into, so the caller must refuse it BEFORE
+ * patching anything. Currently only the x86_64 x32 ABI: it is detected, named
+ * and refused rather than driven down the x86_64 path, which cannot be verified
+ * anywhere we can test (it needs a kernel with CONFIG_X86_X32_ABI to even
+ * execve an x32 process). Declared here so it can be unit-tested directly. */
+int injector__arch_is_unsupported(unsigned short e_machine, unsigned char ei_class);
 
 /* Thread-group leader of `pid` (field 1 of /proc/<pid>/stat, i.e. what a clone
  * child reports as its PPid), or -1. A clone child's parent is the TGID, never

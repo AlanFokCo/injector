@@ -237,11 +237,22 @@ static int syscall_arg_count(const injector_t *injector, long syscall_number)
 }
 
 /* Same idea for the libc functions this library calls itself: dlerror(0),
- * dlclose(1), dlopen(2), dlsym(2), clone(4). An arbitrary user function
+ * dlclose(1), dlopen(2), dlsym(2), clone(6). An arbitrary user function
  * address (injector_remote_call / injector_invoke) cannot communicate its
  * argument count through injector__call_function_va_list()'s signature, so it
  * keeps the historical six; the reads stay in bounds because a SysV varargs
- * caller always provides a six-slot register save area. */
+ * caller always provides a six-slot register save area.
+ *
+ * clone() used to be counted as 4 - fn, stack, flags, arg - because that is all
+ * the two call sites needed. It is 6 now: both of them pass CLONE_PARENT_SETTID,
+ * whose `ptid` is glibc's FIFTH parameter (clone(fn, stack, flags, arg, ptid,
+ * tls, ctid)) and therefore the fifth vararg. Counting 4 would zero it in
+ * read_varargs(), the kernel's put_user() into a NULL ptid fails silently at the
+ * end of copy_process(), and clone() would still SUCCEED while recording nothing
+ * - i.e. the orphaned-helper scan in injector.c would lose the one piece of
+ * evidence that can still name a helper after its target died, with no error
+ * anywhere to say so. Both call sites pass all six, so nothing is read beyond
+ * what the caller supplied. */
 static int function_arg_count(const injector_t *injector, long function_addr)
 {
     size_t a = (size_t)function_addr;
@@ -260,7 +271,7 @@ static int function_arg_count(const injector_t *injector, long function_addr)
     }
 #ifdef INJECTOR_HAS_INJECT_IN_CLONED_THREAD
     if (injector->clone_addr == a) {
-        return 4;
+        return 6;   /* fn, stack, flags, arg, ptid (CLONE_PARENT_SETTID), tls */
     }
 #endif
     return 6;
@@ -293,6 +304,12 @@ static int kick_then_wait_sigtrap(const injector_t *injector, struct user_regs_s
  * The arguments after syscall_number must be integer types and
  * the size must not be greater than the size of long.
  */
+/* ptrace.c: refuse a remote call issued from a thread other than the one that
+ * PTRACE_ATTACHed. Declared at the call site, the way ptrace.c declares
+ * injector__remote_call_reset() and injector.c declares
+ * injector__code_is_trampoline(). */
+int injector__owner_thread_check(const injector_t *injector, const char *op);
+
 int injector__call_syscall(const injector_t *injector, intptr_t *retval, long syscall_number, ...)
 {
     struct user_regs_struct regs = injector->regs;
@@ -311,6 +328,14 @@ int injector__call_syscall(const injector_t *injector, intptr_t *retval, long sy
 #endif
 #endif
 
+    /* Thread affinity first: a remote call from the wrong thread cannot work
+     * (PTRACE_SETREGS fails ESRCH) and used to fail only after this function had
+     * built its trampoline and, in injector__write's fallback, possibly poked
+     * the target. Refusing here means nothing at all is written to it. */
+    rv = injector__owner_thread_check(injector, "remote syscall");
+    if (rv != 0) {
+        return rv;
+    }
     nargs = syscall_arg_count(injector, syscall_number);
     va_start(ap, syscall_number);
     read_varargs(ap, nargs, sc_args);
@@ -602,6 +627,11 @@ int injector__call_function_va_list(const injector_t *injector, intptr_t *retval
     uint32_t *uregs = (uint32_t *)&regs;
 #endif
 
+    /* Thread affinity first - see the same check in injector__call_syscall(). */
+    rv = injector__owner_thread_check(injector, "remote function call");
+    if (rv != 0) {
+        return rv;
+    }
     nargs = function_arg_count(injector, function_addr);
     read_varargs(ap, nargs, fc_args);
     arg1 = fc_args[0];
@@ -1188,8 +1218,60 @@ void injector__handle_mark_desynced(pid_t pid)
     desync_tgids[slot] = (tgid > 1) ? tgid : 0;
 }
 
-/* Called by injector__attach_process(): a new attach re-establishes the
- * waitpid protocol from scratch, so forget any previous desync of this pid. */
+/* Called by injector__attach_process(): a new attach re-establishes the waitpid
+ * protocol from scratch - PTRACE_ATTACH plus the attach-time waitpid in
+ * injector__attach_internal() - so forget any previous desync of this pid.
+ *
+ * Dropping the marker here was flagged as unsafe on the grounds that the pid may
+ * STILL carry the `ff d0 cc` / `0f 05 cc` trampoline the desync was recorded
+ * for, and the fresh attach reads sizeof(code_t) bytes at its code_addr into
+ * backup_code: adopt our own bytes there and every later "restore" re-installs
+ * an int3 into libc's entry point, with the original bytes unrecoverable. It is
+ * closed. That is an argument from four checked facts, not optimism:
+ *
+ *   1. ONE writer. kick_then_wait_sigtrap() below is the only place this library
+ *      writes a trampoline, and it writes at injector->code_addr. The only other
+ *      writes to code_addr are cleanup_restore_full()'s, which put backup_code
+ *      BACK and then read it to verify.
+ *   2. ONE attach path, and the detector is on it before backup_code is used.
+ *      injector_attach() and injector_attach_with_opts() both end in
+ *      injector__attach_internal(), which reads backup_code, matches it against
+ *      injector__code_is_trampoline(), and refuses the attach (error_exit ->
+ *      detach, handle freed) on a hit. Nothing consumes backup_code before that:
+ *      its only readers are cleanup_restore_full()'s write-back and its
+ *      verification memcmp, both reachable only from a remote call, and the
+ *      first remote call of an attach is the mmap that happens after the check.
+ *   3. The detector matches what the writers emit, full width and including
+ *      their nop padding, through the same TRAMP_xxx and BREAKINST_xxx macros,
+ *      for the arch of the target being attached to - and
+ *      tests/unit/test_trampoline.c
+ *      asserts the detector against those macros, so a writer that drifts from
+ *      the detector is a red build rather than a false negative here.
+ *   4. code_addr is a function of the target's own libc mapping: libc_addr +
+ *      ehdr.e_entry for ET_DYN, ehdr.e_entry for ET_EXEC (elf.c). libc is mapped
+ *      once and is neither moved nor unloaded, so two attaches to the same
+ *      process compute the SAME address - including attaches to two different
+ *      threads of it, which share the mapping and so share the patched bytes.
+ *
+ * Ordering, because it is the only thing the four facts leave open: reset() runs
+ * BEFORE that detector (PTRACE_ATTACH has to have succeeded first, and that
+ * success is what makes the reset legitimate), so there is a window in which the
+ * marker is gone while a trampoline may still be there. Nothing can act in it.
+ * The table is __thread, so the only reader that lost the marker is this thread,
+ * and the only handle this thread can drive now is the one being attached -
+ * which either refuses at the detector or proceeds with genuine bytes. No other
+ * thread can be holding a live handle on the same pid: PTRACE_ATTACH succeeding
+ * here proves nothing else was tracing it, and the one case that leaves a target
+ * both traced and marked - a failed PTRACE_DETACH, NIT 6 in ptrace.c - would
+ * have made this attach fail EPERM long before reset() ran.
+ *
+ * The residual, which is not this function's to fix: were the target's libc
+ * mapping ever to change between sessions (a dlclose/dlopen of libc, which does
+ * not happen in practice), the new code_addr would differ from the patched
+ * address, the detector would read clean bytes and the attach would proceed. The
+ * stale trampoline would then stay in the target's text unrepaired - corruption
+ * that already existed before this reset ran, not corruption reset() caused, and
+ * still never adopted as anybody's original bytes. */
 void injector__remote_call_reset(pid_t pid)
 {
     int i;

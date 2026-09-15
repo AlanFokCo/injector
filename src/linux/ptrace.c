@@ -29,6 +29,7 @@
 #include <unistd.h>    /* getpagesize */
 #include <errno.h>
 #include <stdlib.h>  /* the one-off regset size probe */
+#include <sys/syscall.h> /* SYS_gettid: the tid of the thread that attached */
 
 #include <elf.h>   /* NT_PRSTATUS, NT_FPREGSET, NT_X86_XSTATE */
 
@@ -59,6 +60,87 @@ static int set_ptrace_error(const char *request_name)
     case ESRCH:
         return INJERR_NO_PROCESS;
     }
+    return INJERR_OTHER;
+}
+
+/* -------------------------------------------------------------------------
+ * Thread affinity: which thread may drive a handle.
+ *
+ * ptrace tracer ownership is PER-THREAD, not per-process: PTRACE_ATTACH makes
+ * the *calling task* the tracer, and from any other thread of this process the
+ * kernel answers PTRACE_GETREGS/SETREGS/POKETEXT/DETACH for that tracee with
+ * ESRCH, exactly as if we were not tracing it at all. Measured on Linux 6.8
+ * (x86_64): attach in thread A, then from thread B both PTRACE_GETREGS and
+ * PTRACE_DETACH return -1/ESRCH while /proc/<target>/status keeps reporting
+ * `State: t (tracing stop)` and `TracerPid: <A's tid>`. So the target is left
+ * stopped and traced, and every later operation on the handle fails with a
+ * message about a process that plainly exists.
+ *
+ * What CAN be fixed is the silence, and that is what this does: every operation
+ * that would issue a ptrace request refuses BEFORE issuing it, and says which
+ * two threads are involved. What CANNOT be fixed is the ownership itself - there
+ * is no request that moves a tracee to another tracer (PTRACE_SEIZE from thread
+ * B fails EPERM while A still traces it, and A cannot hand the tracee over), so
+ * a handle driven from the wrong thread cannot be detached from there. The
+ * kernel does release the target when the tracer THREAD exits (measured: the
+ * same target went to `State: S`, `TracerPid: 0` as soon as thread A returned
+ * from its start routine without detaching), which is the recovery the message
+ * below points at.
+ *
+ * owner_tid is set by injector__attach_internal() once PTRACE_ATTACH has
+ * succeeded, and is 0 while the handle is not attached (or if the tid could not
+ * be read, in which case there is nothing to compare against and the gate stays
+ * silent rather than inventing a refusal).
+ *
+ * Nothing in this library ever crosses threads on its own - src/linux has no
+ * pthread_create and no clone() of the LOCAL process (the two clone() calls it
+ * makes run INSIDE the target, see injector.c) - so the single-threaded flow,
+ * injector_inject_in_cloned_thread() and injector_invoke_nonstop() all issue
+ * every ptrace request from the caller's own thread and never reach a refusal.
+ * ---------------------------------------------------------------------- */
+
+/* This thread's kernel tid. syscall(SYS_gettid) rather than glibc's gettid():
+ * the wrapper is only guaranteed from glibc 2.30, and this also has to build
+ * against musl and for -m32/-mx32. 0 means "could not be determined". */
+pid_t injector__current_tid(void)
+{
+#ifdef SYS_gettid
+    long t = syscall(SYS_gettid);
+    return (t > 0) ? (pid_t)t : 0;
+#else
+    return 0;
+#endif
+}
+
+/* 0 when this thread may issue ptrace requests for `injector`. Otherwise the
+ * request is refused BEFORE anything is sent to the target: errmsg names both
+ * tids, errno is ESRCH (what the kernel would have said), and INJERR_OTHER is
+ * returned - the same code the FP-slot refusal uses for "we refuse, the target
+ * is untouched". Declared at its call sites in injector.c and remote_call.c the
+ * way injector__remote_call_reset() is declared in ptrace.c, because
+ * injector_internal.h is not this change's to edit. */
+int injector__owner_thread_check(const injector_t *injector, const char *op)
+{
+    pid_t owner = injector->owner_tid;
+    pid_t me;
+
+    if (owner == 0) {
+        return 0;          /* not attached, or the attaching tid is unknown */
+    }
+    me = injector__current_tid();
+    if (me == 0 || me == owner) {
+        return 0;          /* the right thread, or no way to tell: do not refuse */
+    }
+    injector__set_errmsg("%s refused: this handle was attached by thread %d and ptrace tracer "
+                         "ownership is per-THREAD, so only that thread can issue ptrace requests "
+                         "for pid %d. This is thread %d, from which the kernel answers "
+                         "PTRACE_GETREGS/SETREGS/POKETEXT/DETACH with ESRCH while the target stays "
+                         "stopped and traced, so nothing was attempted and the target is untouched. "
+                         "Drive this handle - injector_detach() included - from thread %d; if that "
+                         "thread cannot be used, exiting it releases the target (the kernel detaches "
+                         "a tracee when its tracer thread exits).",
+                         op, (int)owner, (int)injector->pid, (int)me, (int)owner);
+    errno = ESRCH;
     return INJERR_OTHER;
 }
 
@@ -153,6 +235,19 @@ int injector__attach_process(const injector_t *injector)
 
 int injector__detach_process(const injector_t *injector)
 {
+    /* Refuse BEFORE the FP slot is released and before PTRACE_DETACH is
+     * attempted. From a thread other than the tracer's, DETACH fails ESRCH and
+     * the target is left stopped and traced; releasing the slot first would
+     * also clear it in the WRONG thread's table (the slots are __thread), i.e.
+     * do nothing at all here while the attaching thread keeps a slot bound to a
+     * pid whose handle injector_detach() is about to free. See the thread
+     * affinity block above. */
+    {
+        int rv = injector__owner_thread_check(injector, "injector_detach");
+        if (rv != 0) {
+            return rv;
+        }
+    }
     /* Release the slot *before* PTRACE_DETACH and independently of its result.
      * PTRACE_OR_RETURN returns early on failure (typically after a KILL_THREAD
      * timeout, when the thread is dying), and a slot left bound to a dead pid
@@ -236,9 +331,13 @@ int injector__detach_process(const injector_t *injector)
  * and the message - correctly, but unhelpfully - points at the handles it can
  * still see. The one-handle-per-thread model (util.c's injector__set_current(),
  * remote_call.c's desync table) already requires attach and detach to pair up on
- * one thread; a leaked FP slot is the second reason. Saying so in
- * include/injector.h and README.md would reach users better than a comment in
- * here, but both files are outside this change's write scope.
+ * one thread; a leaked FP slot is the second reason, and the per-thread nature
+ * of ptrace tracer ownership (block above) is the third and the one the kernel
+ * enforces. That is now said where users read it - include/injector.h documents
+ * the affinity contract on the affected entry points - and
+ * injector__detach_process() refuses a cross-thread detach up front, so the slot
+ * leak cannot be reached by accident any more. README.md still does not mention
+ * it; that file is outside this change's write scope.
  * The slots themselves are not heap-allocated (the only
  * malloc is the one-off size probe in regset_probe(), freed before it
  * returns), so there is nothing to free:
@@ -512,6 +611,15 @@ static int fp_state_restore(pid_t pid, fp_slot_t *s)
 
 int injector__get_regs(const injector_t *injector, struct user_regs_struct *regs)
 {
+    /* Refuse before the FP slot is touched: from a non-tracer thread the regset
+     * reads below fail ESRCH anyway, but only after this thread has taken a
+     * slot and saved nothing into it. See the thread affinity block above. */
+    {
+        int rv = injector__owner_thread_check(injector, "PTRACE_GETREGS");
+        if (rv != 0) {
+            return rv;
+        }
+    }
     /* Save the target's FP/vector state once per attach session, before any
      * remote call hijacks the thread. Subsequent calls (which read back the
      * result registers of a remote call) must not overwrite it. */
@@ -606,6 +714,17 @@ int injector__set_regs(const injector_t *injector, const struct user_regs_struct
 {
     fp_slot_t *s = fp_slot_find(injector->pid);
     int fp_errno;
+    int rv;
+
+    /* Refuse before anything is written. This is the FIRST ptrace request of
+     * every remote call, so it is also where a handle driven from the wrong
+     * thread now stops - with a message naming both tids rather than the
+     * ESRCH-from-SETREGS one it used to produce. See the thread affinity block
+     * above. */
+    rv = injector__owner_thread_check(injector, "PTRACE_SETREGS");
+    if (rv != 0) {
+        return rv;
+    }
 
     /* MINOR 3: mirror injector__get_regs()' refusal instead of writing the
      * integer registers and then silently skipping the FP/XSTATE restore. No
@@ -633,14 +752,18 @@ int injector__set_regs(const injector_t *injector, const struct user_regs_struct
      * SETREGS from a non-tracer thread fails ESRCH and PTRACE_OR_RETURN returned
      * first - so the silent FP skip did not actually happen there either, and
      * what the caller saw was a confusing error that named neither the FP state
-     * nor the real cause. With the guard it gets rv=-1 INJERR_OTHER and a
-     * message that says exactly what is missing and why nothing was written.
-     * Note that in that scenario the target is NOT left detached and runnable -
-     * PTRACE_DETACH from the non-tracer thread fails ESRCH too, so it stays
-     * traced and stopped (TracerPid non-zero, state 't'). That is a pre-existing
-     * property of driving a handle from the wrong thread, unchanged by this
-     * guard and not something it can fix; handles must be driven by the thread
-     * that attached them.
+     * nor the real cause. With the guard it got rv=-1 INJERR_OTHER and a message
+     * about the missing FP slot, which was accurate but still not the cause.
+     * injector__owner_thread_check() at the top of this function now answers
+     * that case first, with the real one: both tids, and the fact that ptrace
+     * ownership is per-thread. The FP-slot refusal below is therefore reachable
+     * only from the thread that attached, which is where a NULL slot really does
+     * mean "no saved FP state".
+     * Note that in the cross-thread scenario the target is NOT left detached and
+     * runnable - PTRACE_DETACH from the non-tracer thread fails ESRCH too, so it
+     * stays traced and stopped (TracerPid non-zero, state 't'). No refusal can
+     * fix that; the kernel only releases the target when the tracer thread
+     * detaches it or exits (both measured - see the thread affinity block).
      *
      * Where a same-thread NULL slot ever did occur, the caller is
      * kick_then_wait_sigtrap(), which calls set_regs() BEFORE writing the
@@ -689,7 +812,18 @@ int injector__read(const injector_t *injector, size_t addr, void *buf, size_t le
     if (len > 0 && read_vm(pid, addr, buf, len) == 0) {
         return 0;
     }
-    /* fall back to word-at-a-time PTRACE_PEEKTEXT */
+    /* fall back to word-at-a-time PTRACE_PEEKTEXT.
+     * process_vm_readv() above is NOT ptrace-scoped - it needs
+     * ptrace_may_access(), which any thread of this process has - so a read
+     * from another thread usually succeeds and is deliberately left alone.
+     * PEEKTEXT is a ptrace request and the kernel answers it ESRCH from any
+     * thread but the tracer, so refuse here, before the first one. */
+    {
+        int rv = injector__owner_thread_check(injector, "PTRACE_PEEKTEXT");
+        if (rv != 0) {
+            return rv;
+        }
+    }
     errno = 0;
     while (len >= sizeof(long)) {
         word = ptrace(PTRACE_PEEKTEXT, pid, addr, 0);
@@ -723,7 +857,14 @@ int injector__write(const injector_t *injector, size_t addr, const void *buf, si
     if (len > 0 && write_vm(pid, addr, buf, len) == 0) {
         return 0;
     }
-    /* fall back to word-at-a-time PTRACE_POKETEXT */
+    /* fall back to word-at-a-time PTRACE_POKETEXT - a ptrace request, so unlike
+     * the process_vm_writev() above it only works from the tracer thread. */
+    {
+        int rv = injector__owner_thread_check(injector, "PTRACE_POKETEXT");
+        if (rv != 0) {
+            return rv;
+        }
+    }
     while (len >= sizeof(long)) {
         PTRACE_OR_RETURN(PTRACE_POKETEXT, injector, addr, *(long*)src);
         addr += sizeof(long);
@@ -752,6 +893,12 @@ int injector__write(const injector_t *injector, size_t addr, const void *buf, si
 
 int injector__continue(const injector_t *injector)
 {
+    {
+        int rv = injector__owner_thread_check(injector, "PTRACE_CONT");
+        if (rv != 0) {
+            return rv;
+        }
+    }
     PTRACE_OR_RETURN(PTRACE_CONT, injector, 0, 0);
     return 0;
 }

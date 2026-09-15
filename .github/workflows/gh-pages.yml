@@ -4,15 +4,16 @@ on:
     
 jobs:
   gh-pages:
-    # Skipped on a fork, where this job cannot succeed and never will: it pushes
-    # to a `gh-pages` branch that does not exist there (so `git fetch origin
-    # gh-pages` fails), using GITHUB_TOKEN, which is read-only for a fork's own
-    # Actions. Publishing the API docs is a release concern of the upstream
-    # repository, not of a fork, and an unconditionally red workflow on every
-    # push is worse than no workflow - it trains people to read past red, which
-    # is how a real failure in tests.yml gets missed. The condition is on the
-    # job, not on the trigger, so nothing about the upstream behaviour changes.
-    if: ${{ !github.event.repository.fork }}
+    # This job does two things with different reasons to exist: it BUILDS the
+    # API docs (doxygen over Doxyfile, README.md and include/) and it PUBLISHES
+    # them to the `gh-pages` branch. Only the second is impossible on a fork, so
+    # the fork guard lives on the "push docs" STEP below rather than here. When
+    # it was a job-level `if`, a fork skipped the doxygen run too and therefore
+    # never validated the Doxyfile at all - a broken Doxyfile would go green on
+    # every fork and be found only after merging upstream, where the same job
+    # would then fail on the step that was supposed to be the cheap one. Nothing
+    # about the upstream behaviour changes: on a non-fork the step condition is
+    # true and the job does exactly what it always did.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -25,6 +26,22 @@ jobs:
           doxygen
           sed -i -e 's/:smiley:/\&#x1f603;/g' -e 's/:skull:/\&#x1f480;/g' html/index.html
       - name: push docs
+        # Skipped on a fork, where this step cannot succeed and never will. The
+        # load-bearing reason is the first line: it runs `git fetch origin
+        # gh-pages`, and a fork has no `gh-pages` branch, so the fetch fails and
+        # the step shell's `-e` (Actions' default is `bash -e {0}`) turns that
+        # into a red job on every push - before any credential is ever used. Publishing the API docs is a release concern
+        # of the upstream repository, not of a fork, and an unconditionally red
+        # workflow is worse than no workflow: it trains people to read past red,
+        # which is how a real failure in tests.yml gets missed.
+        #
+        # The GITHUB_TOKEN used for the push at the end is a second and weaker
+        # reason, stated here only so the old wording's overclaim is not
+        # repeated: a fork's own Actions settings decide that token's
+        # permissions, so it may well be writable for contents there - but the
+        # missing branch has already failed the step by then, so it never comes
+        # up.
+        if: ${{ !github.event.repository.fork }}
         run: |
           git fetch --depth=1 origin gh-pages
           git checkout gh-pages

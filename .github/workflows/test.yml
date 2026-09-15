@@ -45,8 +45,20 @@ jobs:
         # `make cross` builds the per-arch fixtures (test-prog-x86_64,
         # test-target-i386, ...) that the arch-pair steps below run, but not the
         # unsuffixed test-target / test-library.so that the CLI steps use, so
-        # build those too. `cross` also leaves src/linux/libinjector.a rebuilt
-        # for the host arch; see tests/Makefile.
+        # build those too with `make all`.
+        #
+        # Which arch src/linux/libinjector.a belongs to is worth spelling out,
+        # because the earlier wording here ("`cross` also leaves it rebuilt for
+        # the host arch") read as a contradiction of tests/Makefile:93-95, which
+        # says the archive belongs to the LAST arch built - i386 here. Both are
+        # true of different moments: every per-arch rule runs `make clean &&
+        # make` in src/linux, so after the last of them the archive IS i386;
+        # what puts it back is the trailing `cd $(SRC_DIR) && $(MAKE) clean &&
+        # $(MAKE)` in the `cross` recipe itself (tests/Makefile:100-102), not
+        # `make all`. `all` rebuilds it again only when its test-prog rule has
+        # to relink, since a rule with an existing, up-to-date target is
+        # skipped - so do not rely on `all` for the arch, and do not delete the
+        # trailing rebuild from `cross`.
         cd tests && make cross && make all
     - name: unit tests
       run: |
@@ -249,16 +261,33 @@ jobs:
     # This step exists to exercise the accounting that tests/Makefile's `check`
     # target wraps around them - the arch-probe RUN / SKIP / ERROR bookkeeping
     # and its summary - plus the pairs the manual list omits: `default ->
-    # default`, `x86_64 -> x32`, `x32 -> i386`, and the arm pairs (not built
-    # here, so they SKIP for that reason). `x86_64 -> i386` and `i386 -> i386`
-    # are already covered by manual steps above and are known to work on an
-    # equivalent Ubuntu x86_64 host, so re-running them here is confirmation
-    # rather than new coverage.
+    # default` and the arm pairs (not built here, so they SKIP for that reason).
+    # `x86_64 -> x86_64`, `x86_64 -> i386` and `i386 -> i386` are already
+    # covered by manual steps above and are known to work on an equivalent
+    # Ubuntu x86_64 host, so re-running them here is confirmation rather than
+    # new coverage.
     #
-    # x32 pairs are EXPECTED to SKIP on kernels without CONFIG_X86_X32_ABI - an
-    # x32 fixture links fine wherever gcc-multilib is installed, but execve
-    # fails with ENOEXEC. That is by design, not a failure: `check` only errors
-    # when zero pairs ran, and its summary states both counts.
+    # PRODUCT DECISION: this project no longer provides an x32 runtime. What is
+    # shipped is x86_64 (LP64) and i386. The x32 arch pairs therefore dropped
+    # out of what this step covers, for two distinct reasons that the previous
+    # wording here flattened into one "expected to skip":
+    #   1. x32 fixtures are not built at all. There is nothing to run and
+    #      nothing to skip; the `x32` build target and the `x86_64 -> x32` /
+    #      `x32 -> i386` CHECK_TARGETS pairs in tests/Makefile are gone, removed
+    #      alongside this comment. Do not re-add either without a kernel that
+    #      can actually execute the result.
+    #   2. an x32 TARGET is REFUSED, not skipped. src/linux/elf.c asks
+    #      injector__arch_is_unsupported() about EM_X86_64 + ELFCLASS32 and
+    #      returns INJERR_UNSUPPORTED_TARGET during attach, before any
+    #      trampoline is patched, so attach fails and its own error_exit detaches
+    #      with the target's text untouched. That is deterministic and ours; the
+    #      old "EXPECTED to SKIP on kernels without CONFIG_X86_X32_ABI" described
+    #      the runner's kernel instead of this library, and an unverifiable path
+    #      that patches a live process is worse than no path at all.
+    #      tests/unit/test_x32_refused.c pins the classifier.
+    # The accounting this step exercises is unchanged: `check` only errors when
+    # zero pairs ran, and its summary states all three counts (run, skipped, and
+    # fixtures built for an arch no CHECK_TARGETS pair names).
     #
     # Deliberately the last step of this job: if it goes red, the manual steps
     # above have already localized the failure, so the red run stays

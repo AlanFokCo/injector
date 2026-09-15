@@ -678,16 +678,28 @@ $ cc -o myapp myapp.c $(pkg-config --cflags --libs libinjector)
 
 | injector \ target | x86_64 | i386 | x32(*1) |
 |---|---|---|---|
-| **x86_64** | :smiley: success(*2) | :smiley: success(*3) | :smiley: success(*6) |
-| **i386**   | :skull: failure(*4) | :smiley: success(*3) | :skull: failure(*5) |
-| **x32**(*1) | :skull: failure(*4) | :smiley: success(*6) | :skull: failure(*5) |
+| **x86_64** | :smiley: success(*2) | :smiley: success(*3) | refused(*5) |
+| **i386**   | :skull: failure(*4) | :smiley: success(*3) | refused(*5) |
+| **x32**(*1)(*6) | not built(*6) | not built(*6) | not built(*6) |
 
 *1: [x32 ABI](https://en.wikipedia.org/wiki/X32_ABI)
 *2: tested on GitHub Actions with both glibc and musl.
 *3: tested on GitHub Actions with glibc.
 *4: failure with `64-bit target process isn't supported by 32-bit process`.
-*5: failure with `x32-ABI target process is supported only by x86_64`.
-*6: tested on a local machine. `CONFIG_X86_X32` isn't enabled in GitHub Actions.
+*5: refused by design, not a test result: this project ships x86_64 (LP64) and
+i386 runtimes only, so an x32 target is named and turned away. During attach,
+before anything is written to the target, the library asks
+`injector__arch_is_unsupported()` about `EM_X86_64` + `ELFCLASS32` and fails
+with `INJERR_UNSUPPORTED_TARGET` and the message `x86_64 x32-ABI target process
+is not supported: this build injects only into LP64 x86_64 and i386 targets.`
+It then detaches, so the target's text is never touched. The classifier is
+pinned by `tests/unit/test_x32_refused.c`. Nothing here needs a kernel with
+`CONFIG_X86_X32` - the refusal happens in this library, which is exactly why it
+is stated as "refused" rather than as a pass or a skip.
+*6: there is no x32 injector to run. The `-mx32` build target and the
+`x86_64 -> x32` / `x32 -> i386` pairs were removed from `tests/Makefile`
+together with the x32 runtime, so the row is kept only to name every ABI this
+project has an opinion about; do not read it as coverage.
 
 ### ARM
 

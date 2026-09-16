@@ -21,6 +21,10 @@
 __pycache__/
 
 docs/
+# doxygen run by .github/workflows/gh-pages.yml and by a local `doxygen`
+/ci-docs/
+/ci.Doxyfile
+/doxygen.log
 task_plan.md
 findings.md
 progress.md

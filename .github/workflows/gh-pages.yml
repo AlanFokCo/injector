@@ -4,27 +4,95 @@ on:
     
 jobs:
   gh-pages:
-    # This job does two things with different reasons to exist: it BUILDS the
-    # API docs (doxygen over Doxyfile, README.md and include/) and it PUBLISHES
-    # them to the `gh-pages` branch. Only the second is impossible on a fork, so
-    # the fork guard lives on the "push docs" STEP below rather than here. When
-    # it was a job-level `if`, a fork skipped the doxygen run too and therefore
-    # never validated the Doxyfile at all - a broken Doxyfile would go green on
-    # every fork and be found only after merging upstream, where the same job
-    # would then fail on the step that was supposed to be the cheap one. Nothing
-    # about the upstream behaviour changes: on a non-fork the step condition is
-    # true and the job does exactly what it always did.
+    # This job builds the API docs (doxygen over Doxyfile, README.md and
+    # include/) and publishes them to the `gh-pages` branch. Only publishing is
+    # impossible on a fork, so the fork guard sits on the "push docs" step below
+    # rather than on the job. As a job-level `if` it also skipped the doxygen
+    # run, so a fork never checked the documentation build at all.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       - name: install doxygen
+        # graphviz is not optional: with HAVE_DOT set doxygen shells out to
+        # `dot` for the include graphs, and a missing `dot` is reported on
+        # stderr as `error: Problems running dot` while doxygen still exits 0
+        # and still writes an index.html - so the pages would publish with
+        # broken graphs and nothing would complain. Installing it here is what
+        # makes the error check below mean something.
         run: |
           sudo apt-get update
-          sudo apt-get install -y doxygen
-      - name: genereate docs
+          sudo apt-get install -y doxygen graphviz
+      - name: generate docs
+        # OUTPUT_DIRECTORY and WARN_AS_ERROR are forced here rather than read
+        # from the Doxyfile, so this step and the publish step below cannot be
+        # broken by a change to it.
+        #
+        # WARN_AS_ERROR is forced OFF because the counts below are a better gate
+        # than "any warning is fatal". Three warnings survive and are not fixable
+        # from here: doxygen reads the three badge links at the top of README.md
+        # as \ref autotoc_md. Everything else is fatal, so a public symbol that
+        # loses its documentation, or a \ref in include/injector.h that stops
+        # resolving, fails this job instead of quietly leaving the published API
+        # reference incomplete. The published symbol count is pinned for the same
+        # reason: 21 of the 25 public functions once reached the docs and the run
+        # was still green.
+        #
+        # doxygen's exit status is not trusted. It returns 0 while emitting
+        # `error:` lines, so the log is counted for both severities.
         run: |
-          doxygen
-          sed -i -e 's/:smiley:/\&#x1f603;/g' -e 's/:skull:/\&#x1f480;/g' html/index.html
+          set -e
+          { cat Doxyfile
+            echo 'OUTPUT_DIRECTORY = ci-docs'
+            echo 'WARN_AS_ERROR = NO'
+          } > ci.Doxyfile
+          doxygen ci.Doxyfile 2> doxygen.log || true
+          errs=$(grep -c "error:" doxygen.log || true)
+          total=$(grep -c "warning:" doxygen.log || true)
+          # The tolerated class is narrow on purpose: an unresolvable \ref is
+          # only benign when it comes from README.md, where doxygen invents it
+          # from the three badge links. The same warning from a header means a
+          # real cross-reference in the published API docs is dead, so those are
+          # counted separately and are always fatal - a count pin alone would
+          # let a header \ref break as long as a README link broke with it.
+          badrefs=$(grep -E "unable to resolve reference|unexpected token TK_EOF as the argument of ref" doxygen.log | grep -vc "README.md" || true)
+          mdrefs=$(grep -E "unable to resolve reference|unexpected token TK_EOF as the argument of ref" doxygen.log | grep -c "README.md" || true)
+          other=$((total - mdrefs - badrefs))
+          echo "doxygen: errors=$errs warnings=$total readme-anchors=$mdrefs bad-refs=$badrefs other=$other"
+          if [ "$errs" -ne 0 ]; then
+            echo "ERROR: doxygen reported $errs error(s):"
+            grep "error:" doxygen.log
+            exit 1
+          fi
+          if [ "$badrefs" -ne 0 ]; then
+            echo "ERROR: $badrefs unresolvable reference(s) outside README.md:"
+            grep -E "unable to resolve reference|unexpected token TK_EOF" doxygen.log | grep -v "README.md"
+            exit 1
+          fi
+          if [ "$other" -ne 0 ]; then
+            echo "ERROR: $other doxygen warning(s) other than the README badge links:"
+            grep "warning:" doxygen.log | grep -vE "unable to resolve reference|unexpected token TK_EOF as the argument of ref"
+            exit 1
+          fi
+          expected_mdrefs=3
+          if [ "$mdrefs" -ne "$expected_mdrefs" ]; then
+            echo "ERROR: $mdrefs markdown-anchor warnings, expected $expected_mdrefs"
+            echo "       (the three badge links at the top of README.md)."
+            echo "       Update expected_mdrefs here only if that genuinely changed."
+            exit 1
+          fi
+          html=ci-docs/html
+          test -f "$html/index.html"
+          funcs=$(grep -oE 'injector_[a-z_0-9]+' "$html/globals_func.html" \
+                  | sort -u | grep -vx 'injector_8h' | wc -l)
+          expected_funcs=25
+          echo "documented public functions: $funcs"
+          if [ "$funcs" -ne "$expected_funcs" ]; then
+            echo "ERROR: $funcs public injector_* functions reached the docs, expected $expected_funcs."
+            echo "       A documented symbol went missing, or one was added and the pin"
+            echo "       was not raised. Missing:"
+            grep -oE 'injector_[a-z_0-9]+' "$html/globals_func.html" | sort -u | grep -vx 'injector_8h'
+            exit 1
+          fi
       - name: push docs
         # Skipped on a fork, where this step cannot succeed and never will. The
         # load-bearing reason is the first line: it runs `git fetch origin
@@ -46,7 +114,7 @@ jobs:
           git fetch --depth=1 origin gh-pages
           git checkout gh-pages
           rm -rf docs
-          mv html docs
+          mv ci-docs/html docs
           git config --local user.email "docs-action@github.com"
           git config --local user.name "GitHub Action (docs)"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}

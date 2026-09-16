@@ -6,7 +6,7 @@
 [![Version: 1.0.0](https://img.shields.io/badge/version-1.0.0-4CAF50.svg)](#)
 [![API reference](https://img.shields.io/badge/docs-API_reference-blue.svg)](http://www.jiubao.org/injector/injector_8h.html)
 
-**A production-grade library for injecting a shared library into a running Linux process.**
+**Inject a shared library into a running Linux process, then call a function it exports.**
 
 This is an active fork of [`kubo/injector`](https://github.com/kubo/injector),
 hardened for production use and FFI consumption. It keeps the original
@@ -21,46 +21,62 @@ for **Go**, **Python**, and **Rust**. The shared library carries SONAME
 
 ## Features
 
-- **One-shot injection** — `injector_run(pid, lib, "entry", args, argc, opts, &result)`
-  attaches, injects, calls an entry symbol with arguments, captures the return
-  value, and detaches in a single call.
-- **Bounded remote calls** — every remote call has a configurable timeout
-  (`call_timeout_ms`, default 5 s). On timeout the target's original registers
-  and code are restored and the call returns `INJERR_TIMEOUT`; the target is
-  never left hijacked.
-- **Failure isolation** — an injected entry method that *fails* (returns an
-  error, throws a caught exception, `pthread_exit`s, leaves a lock held) is
-  confined to the injected thread and does not corrupt the target's main
-  threads. See [Production contract](#production-contract).
-- **Per-handle, thread-safe errors** — each `injector_t` carries its own
-  error buffer; concurrent operations on different targets from different
-  threads don't clobber each other's diagnostics.
-- **Non-intrusive introspection** — `injector_target_info` / `injector_can_attach`
-  read `/proc` to report a target's arch, libc, exe, cwd, root, and ptrace
-  feasibility *without attaching*.
-- **Target memory I/O** — `injector_read_mem` / `injector_write_mem` (gated)
-  / `injector_resolve_symbol` expose the target's address space to the caller.
-- **Module management** — `injector_list_modules` enumerates loaded libraries
-  (non-intrusive); `injector_uninject_all` tears down everything a handle
-  injected.
-- **Fast, portable transport** — bulk memory transfer via `process_vm_readv` /
-  `process_vm_writev` with a ptrace word-at-a-time fallback for kernels or
-  pages that reject the vector path.
-- **Signal-free** — the library installs no signal handlers and uses no
-  `SIGALRM`; it is safe to embed in a Go-runtime (cgo) host.
-- **Language bindings** — idiomatic [Go](#go), [Python](#python), and
-  [Rust](#rust) bindings with vendored static linking (no system install
-  required).
-- **Packaged** — `make install`, versioned SONAME, `libinjector.pc`,
-  `injector_abi_version()`, and a unit + integration test suite (`make unit`,
-  `make check`).
+`injector_run(pid, lib, "entry", args, argc, opts, &result)` attaches, injects,
+calls a symbol with up to `INJECTOR_MAX_INVOKE_ARGS` (6) `intptr_t` arguments,
+captures the return value, and detaches. The pieces underneath are public too:
+`injector_inject` / `injector_uninject` for library lifetime, `injector_invoke`
+for bounded remote calls, `injector_read_mem` / `injector_write_mem` /
+`injector_resolve_symbol` for the target's address space, `injector_list_modules`
+and `injector_uninject_all` for bookkeeping.
+
+Remote calls are bounded. `opts.call_timeout_ms` (default 5000 ms) sets the
+budget; on expiry the target's original registers and the patched libc bytes are
+put back and the call returns `INJERR_TIMEOUT`. There is one documented gap: if
+the `SIGSTOP` used to re-stop the target fails, the target keeps running the
+hijacked code, libc's `e_entry` stays patched, and the handle is marked
+desynchronised (`handle_timeout` in `src/linux/remote_call.c`). See
+[Caveats](#caveats).
+
+Errors are per-handle. `injector_last_error(inj)` reads that handle's own buffer,
+so concurrent work on different targets does not clobber diagnostics.
+Introspection needs no attach either: `injector_target_info`,
+`injector_can_attach` and `injector_find_process` read `/proc` and never ptrace
+(`can_attach` also probes with `kill(pid, 0)` and compares `geteuid()`), so you can
+judge a target before touching it.
+
+Bulk memory transfer goes through `process_vm_readv` / `process_vm_writev`, with
+a ptrace word-at-a-time fallback for kernels or pages that reject the vector
+path. The library installs no signal handlers and never raises `SIGALRM`, so it
+is safe to embed in a cgo host. Packaging covers `make install`, SONAME
+`libinjector.so.1`, `libinjector.pc`, `injector_abi_version()`, `make unit` and
+`make check`.
+
+Two rules a caller can actually break on:
+
+- **Handles are thread-affine.** `injector_attach` records the attaching OS
+  thread's tid, and every later ptrace operation on that handle — including
+  `injector_detach` — must come from that same thread. See [Thread affinity and
+  handle lifetime](#thread-affinity-and-handle-lifetime).
+- **x32 is not supported.** This build ships x86_64 (LP64) and i386 runtimes.
+  An x32-ABI target is refused at attach with `INJERR_UNSUPPORTED_TARGET`,
+  before anything is written to it.
 
 ## Table of contents
 
+- [Features](#features)
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [Production contract](#production-contract)
 - [C API](#c-api)
+  - [Tier 1 — One-shot](#tier-1--one-shot)
+  - [Tier 2 — Granular attached handle](#tier-2--granular-attached-handle)
+  - [Thread affinity and handle lifetime](#thread-affinity-and-handle-lifetime)
+  - [Tier 3 — Non-intrusive introspection](#tier-3--non-intrusive-introspection)
+  - [Delivery modes](#delivery-modes)
+  - [Error codes](#error-codes)
+  - [Other public API](#other-public-api)
+  - [Link flags, ABI, and init](#link-flags-abi-and-init)
+  - [Legacy attach path](#legacy-attach-path)
 - [Language bindings](#language-bindings)
   - [Go](#go)
   - [Python](#python)
@@ -68,7 +84,15 @@ for **Go**, **Python**, and **Rust**. The shared library carries SONAME
 - [Command line program](#command-line-program)
 - [Installation](#installation)
 - [Tested architectures](#tested-architectures)
+  - [Linux — x86_64 and i386](#linux--x86_64-and-i386)
+  - [Non-x86 results are upstream's, not re-verified here](#non-x86-results-are-upstreams-not-re-verified-here)
+  - [ARM](#arm)
+  - [MIPS](#mips)
+  - [PowerPC](#powerpc)
+  - [RISC-V](#risc-v)
 - [Caveats](#caveats)
+  - [Never target `init`/PID 1 or other critical system processes](#never-target-initpid-1-or-other-critical-system-processes)
+  - [NONSTOP delivery runs `dlopen` without TLS](#nonstop-delivery-runs-dlopen-without-tls)
 - [Roadmap](#roadmap)
 - [License](#license)
 - [Acknowledgements](#acknowledgements)
@@ -103,6 +127,11 @@ int main(void) {
 $ cc -o probe probe.c $(pkg-config --cflags --libs libinjector)
 ```
 
+Choose the pid deliberately: never target PID 1, and never target a process you
+cannot afford to lose. `pid <= 1` is refused outright; the rest is on you. See
+[Never target `init`/PID 1 or other critical system
+processes](#never-target-initpid-1-or-other-critical-system-processes).
+
 ## How it works
 
 `injector` was inspired by [`linux-inject`][] and shares its basic idea, but
@@ -135,35 +164,61 @@ APIs (`injector_invoke`, `injector_run`, and the granular
 > target's state on timeout/failure, but a carelessly written entry method
 > can still stop or crash the target. Read this section and [Caveats](#caveats).
 
-**Failure isolation.** An injected entry method that *fails* — returns an
-error code, throws a caught exception, `longjmp`s, `pthread_exit`s, or leaves
-a lock held — is confined to the injected thread and does not affect the
-target's main threads. The entry method MUST be `extern "C"`, must catch its
-own C++ exceptions, and must convert failures to return codes. An *uncaught*
-exception, `SIGSEGV`, or `SIGABRT` is a **crash**, not a "failure" — it will
-terminate the target process (not isolated). Write entry methods defensively.
+Failure isolation depends on which delivery mode ran the payload. With
+`INJECTOR_DELIVERY_NONSTOP`, the default on x86_64, the payload runs in a helper
+task created by `clone()` inside the target, so an entry method that returns an
+error code, throws and catches its own exception, `longjmp`s, `pthread_exit`s or
+leaves a lock held is confined to that helper and never touches the target's own
+threads. Ptrace delivery gives no such isolation, because there the entry runs on
+a hijacked thread of the target itself; that is the only path on i386 and what
+`-d ptrace` selects.
 
-**Bounded timeout.** Remote calls have a configurable `call_timeout_ms`
-(default 5000 ms, set via `injector_opts_t`). On timeout the target's original
-state is restored and the call returns `INJERR_TIMEOUT`. With
-`INJECTOR_TIMEOUT_KILL_THREAD` (roadmap: M3) the injected thread is terminated;
-with `INJECTOR_TIMEOUT_LEAVE` (the default) it is left in place after state
-restoration.
+A crash does not kill the target under either delivery, which is worth stating
+precisely because it is not what "the entry ran in the target" suggests. On the
+ptrace path the target is stopped and traced, so a fatal signal raised inside the
+hijacked thread becomes a signal-delivery-stop that the library sees through
+`waitpid`: `injector_invoke` returns `INJERR_OTHER` with the message "The target
+process unexpectedly stopped by signal 6", the thread's registers and patched code
+are restored, and the target goes on running. Measured on kernel 6.8 for both
+`abort()` and `SIGSEGV`, with a clean `injector_detach` afterwards. Under NONSTOP
+the crash kills only the helper, and the call surfaces as `INJERR_TIMEOUT`. The
+target does die if it crashes after you detach, or in a thread the library was
+never driving.
 
-**ptrace permission.** The injector needs ptrace access to the target: run as
-root, grant `CAP_SYS_PTRACE`, or set `kernel.yama.ptrace_scope=0` for
-non-parent targets. In containers, pass `--cap-add=SYS_PTRACE` (and a
-sufficient kernel version — see [Caveats](#caveats)).
+That is an argument about what survives, not about what works. Write entry
+methods defensively: `extern "C"`, catch your own C++ exceptions, convert
+failures to return codes.
 
-**Per-handle errors.** Use `injector_last_error(inj)` to read a handle's last
-error, or the `errmsg` field of `injector_result_t` returned from
-`injector_run`. `injector_error()` is deprecated — it reads a thread-local
-fallback intended only for the attach-failure case where no handle exists.
+Each remote call is bounded by `opts.call_timeout_ms`, which defaults to 5000 ms.
+On expiry the target's original state is restored and the call returns
+`INJERR_TIMEOUT`; `opts.timeout_action` decides what happens to the stuck task.
+`INJECTOR_TIMEOUT_LEAVE`, the default, re-stops the target and restores it.
+`INJECTOR_TIMEOUT_KILL_THREAD` sends `SIGKILL` to the task running the hijacked
+code, and the name should be read literally: Linux has no per-thread `SIGKILL`,
+so one sent to a single tid takes down its whole thread group. On the ptrace path
+the hijacked task is a thread of the target, so `KILL_THREAD` kills the entire
+target process. Only NONSTOP delivery can kill the helper alone, because there
+the stuck task is a separate process; that timeout loop lives in
+`src/linux/injector.c`. `handle_timeout` in `src/linux/remote_call.c` is the
+ptrace path, and it kills the target.
 
-**Thread safety.** An `injector_t` handle is not safe for concurrent use from
-multiple threads. Use a handle from a single thread, or serialize access per
-handle. Different handles targeting different processes may be used
-concurrently from different threads.
+The injector needs ptrace access to the target: run as root, grant
+`CAP_SYS_PTRACE`, or set `kernel.yama.ptrace_scope=0` for non-parent targets. In
+containers pass `--cap-add=SYS_PTRACE`, and check the kernel version note in
+[Caveats](#caveats).
+
+Read a handle's error with `injector_last_error(inj)`, or from the `errmsg` field
+of the `injector_result_t` that `injector_run` fills in. `injector_error()` is
+deprecated: it reads a thread-local fallback meant only for the attach-failure
+case, where no handle exists yet.
+
+A handle is bound to the OS thread that attached it, which is a stronger rule
+than "not reentrant". Every later ptrace operation, `injector_detach` included,
+must come from that thread, and a refused cross-thread detach still frees the
+handle. The full rules, the double-free hazard and the recovery path are in
+[Thread affinity and handle lifetime](#thread-affinity-and-handle-lifetime).
+Different handles on different processes may be driven concurrently from
+different threads.
 
 ## C API
 
@@ -179,20 +234,12 @@ introspection that never ptrace-attaches.
 
 ### Tier 1 — One-shot
 
-```c
-#include <injector.h>
-#include <stdio.h>
-
-int main(void) {
-    injector_result_t r;
-    /* attach + inject + call + detach. NULL opts => defaults. */
-    int rc = injector_run(1234, "/path/to/libprobe.so", "entry",
-                          NULL, 0, NULL, &r);
-    if (rc != 0) { fprintf(stderr, "injector_run (rc=%d): %s\n", rc, r.errmsg); return 1; }
-    printf("entry returned %ld\n", (long)r.retval);
-    return 0;
-}
-```
+`injector_run(pid, path, symbol, args, argc, opts, result)` attaches, injects,
+calls and detaches in one call, and is what [Quick start](#quick-start) compiles
+and runs. Pass `NULL` for `opts` to get the defaults. The return code says
+whether the sequence completed; `result->retval` is what your entry method
+returned, and `result->errmsg` carries the failure message, so a caller that
+wants the reason does not have to reach for a separate error function.
 
 ### Tier 2 — Granular attached handle
 
@@ -208,7 +255,8 @@ int main(void) {
     opts.enable_write_mem = 1;     /* allow injector_write_mem */
 
     if (injector_attach_with_opts(&inj, 1234, &opts) != 0) {
-        fprintf(stderr, "attach: %s\n", injector_error());   /* no handle yet */
+        /* no handle yet: NULL reads the thread-local fallback */
+        fprintf(stderr, "attach: %s\n", injector_last_error(NULL));
         return 1;
     }
 
@@ -224,7 +272,7 @@ int main(void) {
                         NULL, 0, &r) == 0)
         printf("entry returned %ld\n", (long)r.retval);
 
-    /* call a function with arguments */
+    /* up to INJECTOR_MAX_INVOKE_ARGS (6) intptr_t arguments */
     intptr_t args[] = {42, 100};
     if (injector_invoke(inj, "/path/to/libprobe.so", "add_values",
                         args, 2, &r) == 0)
@@ -245,16 +293,56 @@ int main(void) {
         injector_list_modules(inj, mods, n < 64 ? (size_t)n : 64);
     }
 
-    injector_uninject_all(inj);   /* dlclose everything this handle injected */
+    /* dlclose everything this handle injected.
+     * Refuses musl-libc targets: INJERR_UNSUPPORTED_TARGET (footnote *2). */
+    injector_uninject_all(inj);
     injector_detach(inj);
     return 0;
 }
 ```
 
-### Tier 3 — Non-intrusive introspection
+### Thread affinity and handle lifetime
 
-These never ptrace-attach and never execute code in the target — safe to call
-before deciding whether to inject.
+`injector_attach` records the tid of the calling OS thread as the handle's owner.
+Linux pins a tracee to its tracer *thread*, so from any other thread of your
+process the kernel answers `PTRACE_GETREGS`/`SETREGS`/`POKETEXT`/`DETACH` for
+that target with `ESRCH`, as if it were not traced at all. Measured on Linux
+6.8/x86_64: attach in thread A, then from thread B both `PTRACE_GETREGS` and
+`PTRACE_DETACH` fail `ESRCH` while the target keeps reporting `State: t` and a
+`TracerPid` pointing at A.
+
+Everything below must therefore run on the attaching thread: `injector_detach`,
+`injector_inject`, `injector_uninject`, `injector_uninject_all`,
+`injector_call`, `injector_remote_func_addr`, `injector_remote_call`,
+`injector_remote_vcall`, `injector_invoke`, `injector_run` (it attaches, invokes
+and detaches, so all three legs), `injector_inject_in_cloned_thread`, and the
+`PEEKTEXT`/`POKETEXT` fallback inside `injector_read_mem` /
+`injector_write_mem`. A violation is refused *before* anything reaches the
+target, with `INJERR_OTHER`, `errno == ESRCH`, and a message naming both tids.
+The `process_vm_readv`/`writev` fast path of those two is not ptrace-scoped and
+does work from another thread, which is why the refusal surfaces at the fallback
+rather than at their entry point.
+
+Two consequences to design around:
+
+- **A refused cross-thread detach still frees the handle.** `injector_detach`
+  destroys the handle whether or not the detach succeeded. Detaching that pointer
+  a second time is a double free — empirically `double free or corruption
+  (!prev)`, then `SIGABRT`. This is documented behaviour, not a bug to file.
+  Detach a given pointer once; after a refused detach the pointer is dead, and
+  the target is left stopped and traced.
+- **Only the owning thread can release the target.** No ptrace request moves a
+  tracee to a different tracer, so nothing done from another thread helps.
+  Exiting the owning thread does release it (measured: the target returned to
+  `State: S` with `TracerPid: 0`). That is the recovery path when the owner can
+  no longer be used.
+
+The Go binding takes care of this: `Attach`/`AttachWithOpts` call
+`runtime.LockOSThread`, so the goroutine stays on the thread that attached
+(both `Attach` and `AttachWithOpts` in `pkg/injector/injector.go`). In C, and in the Python and Rust bindings,
+keeping attach and every later call on one thread is yours to arrange.
+
+### Tier 3 — Non-intrusive introspection
 
 ```c
 #include <injector.h>
@@ -275,15 +363,82 @@ int main(void) {
 }
 ```
 
+### Delivery modes
+
+`opts.delivery` in C, `-d/--delivery` on the command line, and `DeliveryMode` in
+the Go and Rust bindings all select how the payload reaches the target.
+
+| mode | what happens |
+|---|---|
+| `INJECTOR_DELIVERY_AUTO` (default) | NONSTOP on x86_64, ptrace everywhere else. |
+| `INJECTOR_DELIVERY_NONSTOP` | The call runs in a helper task created inside the target with `clone()`. The target's own threads are not interrupted, and a timeout can kill just the helper. x86_64 only: elsewhere `injector_invoke` returns `INJERR_UNSUPPORTED_TARGET`. |
+| `INJECTOR_DELIVERY_PTRACE` | The stopped thread's registers are saved, pointed at an injected snippet, and restored afterwards. The entry runs on a thread of the target, so there is no failure isolation. Works on every supported architecture. |
+
+The CLI spells out the trade-off in its own `--help`: nonstop `dlopen` runs in a
+`clone()` with no TLS, so it can fault inside `ld.so`; use `-d ptrace` for CUDA
+and other heavy targets.
+
+### Error codes
+
+All public entry points return one of these; `injector_last_error(inj)` (or
+`injector_result_t.errmsg`) carries the detail.
+
+| code | value | when you get it |
+|---|---|---|
+| `INJERR_SUCCESS` | 0 | The only non-negative code. |
+| `INJERR_OTHER` | -1 | Unclassified — read the message. Also covers two refusals that leave the target untouched: no FP-state slot free (`errno` is `EMFILE`), and a ptrace request from a thread other than the one that attached (`errno` is `ESRCH`). |
+| `INJERR_NO_MEMORY` | -2 | A local allocation failed. |
+| `INJERR_NO_PROCESS` | -3 | The pid is invalid, does not exist, or is one the library refuses to touch at all — notably pid 1 / `init`. |
+| `INJERR_NO_LIBRARY` | -4 | The library to inject, or libc in the target, could not be found or opened. |
+| `INJERR_ERROR_IN_TARGET` | -5 | The injected code failed inside the target; `dlopen` returning NULL is the usual cause. The message carries the target-side reason when there is one. |
+| `INJERR_FILE_NOT_FOUND` | -6 | A path could not be opened, or was too long to fit the target's data page. |
+| `INJERR_INVALID_MEMORY_AREA` | -7 | `ptrace(2)` reported `EFAULT`: the address is not valid in the target's address space. |
+| `INJERR_PERMISSION` | -8 | `ptrace(2)` denied (`EPERM`/`EACCES` — Yama, missing `CAP_SYS_PTRACE`), or `injector_write_mem` on a handle attached without `opts.enable_write_mem`. |
+| `INJERR_UNSUPPORTED_TARGET` | -9 | The target's architecture, ABI or libc is not supported by this build: an x32-ABI target, or `injector_uninject` / `injector_uninject_all` against a musl-libc target, which cannot `dlclose` what was loaded. This is the only libc gate in the API: inject and invoke check architecture alone. |
+| `INJERR_INVALID_ELF_FORMAT` | -10 | The ELF file is malformed, truncated, or has fields the library refuses to trust. |
+| `INJERR_WAIT_TRACEE` | -11 | The ptrace/waitpid protocol for this handle is out of sync: an earlier remote call timed out and could not leave the target stopped, or the desync table overflowed. The message says whether the target can still be repaired — read it before retrying. |
+| `INJERR_FUNCTION_MISSING` | -12 | The symbol was not found in the target, or the name was NULL or too long. |
+| `INJERR_TIMEOUT` | -13 | A remote call did not complete within `opts.call_timeout_ms`. `opts.timeout_action` decides what happens to the target next. |
+
+`INJERR_NO_FUNCTION` is a deprecated alias for `INJERR_FUNCTION_MISSING`.
+
+### Other public API
+
+Beyond the examples above, `include/injector.h` also exports:
+
+- `injector_call(inj, handle, name)` — call a no-argument function in a library
+  this handle injected; shorthand for `injector_remote_func_addr` plus
+  `injector_remote_call`.
+- `injector_remote_func_addr(inj, handle, name, &func_addr)` — address of a
+  function inside an injected library.
+- `injector_remote_call(inj, &retval, func_addr, ...)` and
+  `injector_remote_vcall(inj, &retval, func_addr, ap)` — call an arbitrary
+  address in the target, variadic or `va_list`. Both exist only when
+  `INJECTOR_HAS_REMOTE_CALL_FUNCS` is defined.
+- `injector_version_string()` — runtime version string, the same value as
+  `INJECTOR_VERSION` ("1.0.0"). `injector_abi_version()` returns
+  `INJECTOR_ABI_VERSION` (currently 1); compare it against your headers before
+  trusting a handle.
+- `injector_library_init()` / `injector_library_deinit()` — idempotent hooks for
+  FFI hosts; near-no-ops today, reserved for future use.
+- `injector_inject_in_cloned_thread(inj, path, &handle)` — `dlopen` from a
+  `clone()`d thread, defined only when `INJECTOR_HAS_INJECT_IN_CLONED_THREAD` is
+  (Linux x86_64). `#ifdef` both feature macros before use.
+
+One ABI detail that bites: `injector_module_t.name` is a fixed 256-byte field
+hardcoded into the binding layouts, so a path longer than 255 characters is
+truncated, though still NUL-terminated. Compare by suffix, or resolve the real
+path yourself, when targets live under something like `/nix/store` or a snap
+mount.
+
 ### Link flags, ABI, and init
 
-FFI bindings should call `injector_library_init()` once at startup
-(idempotent; currently near-no-op, reserved for future use) and
-`injector_library_deinit()` at shutdown. Link with
-`pkg-config --libs libinjector` (`-linjector`); the versioned SONAME is
-`libinjector.so.1`. The ABI version is available at runtime via
-`injector_abi_version()` and matches the `INJECTOR_ABI_VERSION` compile-time
-macro.
+Link with `pkg-config --cflags --libs libinjector`, which yields `-linjector`
+and the include path; the versioned SONAME is `libinjector.so.1`. No `-ldl` and
+no `-lrt` are needed: the archive resolves `dlopen` and `dlsym` inside the
+target through generated shellcode and never calls them itself, and
+`clock_gettime` has been in libc since glibc 2.17. The init and version hooks
+are listed above with the rest of the API.
 
 ### Legacy attach path
 
@@ -293,8 +448,12 @@ thread-local fallback) is deprecated in favor of `injector_last_error(inj)`.
 
 ## Language bindings
 
-Official bindings for Go, Python, and Rust. All three vendor a prebuilt
-`libinjector.a` so no system-wide install is needed — just import and use.
+Official bindings for Go, Python, and Rust. Go and Rust vendor a prebuilt
+`libinjector.a`, so those two need no system install. Python vendors nothing: it
+`ctypes`-loads a `libinjector.so` from beside the package, from
+`ctypes.util.find_library("injector")`, or from the plain loader path, and if it
+finds none it raises with instructions to build one
+(`bindings/python/injector/_ffi.py`).
 
 ### Go
 
@@ -423,9 +582,12 @@ pid, err := injector.FindProcess("mysvc")
 
 **Package:** `injector` (under `bindings/python/`)
 
-The Python binding uses ctypes. Compatible with Python 3.6+. No compilation
-required — it loads `libinjector.so` at runtime (vendored beside the package
-or from the system library path).
+The Python binding uses ctypes and needs no compilation of its own. It declares
+`requires-python = ">=3.8"` and uses no construct newer than 3.8, but CI runs a
+single interpreter (whatever `setup-python` with `3.x` resolves to), so 3.8
+through 3.11 rest on that reading rather than on a test run. It needs a
+system-installed `libinjector.so`: build with `make` and `make install`, or copy
+the `.so` next to the package.
 
 #### One-shot injection
 
@@ -522,8 +684,10 @@ except InjectorError as e:
 `bindings/rust/`.
 
 The Rust binding provides a safe `Injector` type with RAII (auto-detach on
-drop). Requires Rust 1.56+ (2021 edition). Uses a vendored static library —
-no system install needed.
+drop). Both crates declare `edition = "2021"` and neither manifest sets
+`rust-version`, so there is no MSRV to quote — any toolchain that accepts the
+2021 edition builds them. Uses a vendored static library; no system install
+needed.
 
 #### Cargo.toml
 
@@ -536,7 +700,7 @@ Or if published to a registry:
 
 ```toml
 [dependencies]
-injector = "0.1"
+injector = "1.0"
 ```
 
 #### One-shot injection
@@ -632,17 +796,59 @@ fn main() {
 
 ## Command line program
 
-`cmd/injector` is a thin CLI around the library:
+`cmd/injector` is a thin CLI around the library. `--help` prints this verbatim
+(output of `./cmd/injector --help` on an x86_64 build):
 
-```shell
-$ ./cmd/injector -p <pid> /path/to/lib.so           # inject by pid
-$ ./cmd/injector -n <process-name> /path/to/lib.so  # inject by name (via injector_find_process)
+```text
+Usage: ./cmd/injector [options] [library-to-inject ...]
+
+Target (one required):
+  -p, --pid PID           target process id
+  -n, --name NAME         find target by executable basename
+
+Actions:
+  (default)               inject libraries listed after options
+  -r, --run LIB:SYMBOL    one-shot: inject LIB, call SYMBOL, detach
+  -d, --delivery MODE     one-shot delivery: auto|nonstop|ptrace (default: auto)
+                          use 'ptrace' for CUDA/heavy targets (nonstop dlopen
+                          from a TLS-less clone can fault in ld.so)
+  -a, --arg VALUE         argument for --run (up to 6, integer or 0x hex)
+  -i, --info              print target info (non-intrusive) and exit
+
+Options:
+  -t, --timeout MS        remote-call timeout in milliseconds (default: 5000)
+  -T, --cloned-thread     use clone()-based injection (x86_64 only)
+  -V, --version           print version and exit
+  -h, --help              print this help and exit
 ```
 
-For general usage and samples, see the [`Usage` section of linux-inject][`inject`]
-and substitute `inject` with `injector`.
+`-T/--cloned-thread` is present only in x86_64 builds, where
+`INJECTOR_HAS_INJECT_IN_CLONED_THREAD` is defined.
+
+```shell
+$ ./cmd/injector -p 4242 /path/to/lib.so                 # inject by pid
+$ ./cmd/injector -n mysvc /path/to/lib.so                # inject by basename
+$ ./cmd/injector -p 4242 -i                             # target info, no attach
+$ ./cmd/injector -p 4242 -r /path/to/lib.so:entry       # inject, call, detach
+$ ./cmd/injector -p 4242 -r /path/to/lib.so:add -a 42 -a 100
+$ ./cmd/injector -p 4242 -d ptrace -t 2000 -r /path/to/lib.so:entry
+```
+
+`-r/--run` prints the entry's return value on stdout. `-a/--arg` may be repeated
+up to 6 times and accepts decimal or `0x` hex. `-i/--info` reads only `/proc`.
+
+`-p` rejects anything outside 1-4194304, so a value like `8589934593` cannot
+silently truncate to pid 1. Pid 1 itself is refused by the library:
+
+```shell
+$ ./cmd/injector -p 1 --run /tmp/x.so:entry
+injector_run failed (rc=-3): refusing to attach to pid 1: attaching to init patches an int3 trampoline into its libc and will panic the host
+```
 
 ## Installation
+
+Building needs a C compiler (gcc or clang) and GNU make. `make fuzz` and
+`make fuzz-regress` additionally need clang.
 
 ```shell
 $ make            # build first
@@ -654,10 +860,14 @@ $ make install    # default prefix /usr/local
 | destination | description |
 |---|---|
 | `<PREFIX>/include/injector.h` | public header |
-| `<PREFIX>/lib/libinjector.so.1` | versioned shared library (SONAME) |
-| `<PREFIX>/lib/libinjector.so` | dev symlink |
+| `<PREFIX>/lib/libinjector.so.1.0.0` | the real shared library file |
+| `<PREFIX>/lib/libinjector.so.1` | symlink to `libinjector.so.1.0.0`; the SONAME |
+| `<PREFIX>/lib/libinjector.so` | symlink to `libinjector.so.1`, for linking |
 | `<PREFIX>/lib/libinjector.a` | static library |
 | `<PREFIX>/lib/pkgconfig/libinjector.pc` | pkg-config file |
+
+`libinjector.pc` lists `Libs: -L${libdir} -linjector`. If you link the static
+archive by hand instead, add `-ldl` — that is what `cmd/Makefile` does.
 
 Override the install prefix with `PREFIX=` and stage into a root with
 `DESTDIR=`:
@@ -674,40 +884,49 @@ $ cc -o myapp myapp.c $(pkg-config --cflags --libs libinjector)
 
 ## Tested architectures
 
-### Linux — x86_64
+### Linux — x86_64 and i386
+
+These rows come from this fork's CI (GitHub Actions).
 
 | injector \ target | x86_64 | i386 | x32(*1) |
 |---|---|---|---|
-| **x86_64** | :smiley: success(*2) | :smiley: success(*3) | refused(*5) |
-| **i386**   | :skull: failure(*4) | :smiley: success(*3) | refused(*5) |
+| **x86_64** | OK(*2) | OK(*3) | refused(*4) |
+| **i386**   | FAIL(*5) | OK(*3) | refused(*4) |
 | **x32**(*1)(*6) | not built(*6) | not built(*6) | not built(*6) |
 
 *1: [x32 ABI](https://en.wikipedia.org/wiki/X32_ABI)
-*2: tested on GitHub Actions with both glibc and musl.
-*3: tested on GitHub Actions with glibc.
-*4: failure with `64-bit target process isn't supported by 32-bit process`.
-*5: refused by design, not a test result: this project ships x86_64 (LP64) and
-i386 runtimes only, so an x32 target is named and turned away. During attach,
-before anything is written to the target, the library asks
-`injector__arch_is_unsupported()` about `EM_X86_64` + `ELFCLASS32` and fails
-with `INJERR_UNSUPPORTED_TARGET` and the message `x86_64 x32-ABI target process
-is not supported: this build injects only into LP64 x86_64 and i386 targets.`
-It then detaches, so the target's text is never touched. The classifier is
-pinned by `tests/unit/test_x32_refused.c`. Nothing here needs a kernel with
-`CONFIG_X86_X32` - the refusal happens in this library, which is exactly why it
-is stated as "refused" rather than as a pass or a skip.
-*6: there is no x32 injector to run. The `-mx32` build target and the
-`x86_64 -> x32` / `x32 -> i386` pairs were removed from `tests/Makefile`
-together with the x32 runtime, so the row is kept only to name every ABI this
-project has an opinion about; do not read it as coverage.
+*2: tested in CI with both glibc and musl. Injection works on musl; unloading
+does not. `injector_uninject` and `injector_uninject_all` return
+`INJERR_UNSUPPORTED_TARGET` for a musl-libc target, because musl's `dlclose`
+cannot unload a library. That is the only libc gate in the API: the inject and
+invoke paths check architecture alone, and CI runs `--invoke` on glibc only.
+*3: tested in CI with glibc.
+*4: refused by design, not a test result. During attach, before anything is
+written to the target, `injector__arch_is_unsupported()` is asked about
+`EM_X86_64` + `ELFCLASS32` and the attach fails with `INJERR_UNSUPPORTED_TARGET`
+and the message `x86_64 x32-ABI target process is not supported: this build
+injects only into LP64 x86_64 and i386 targets.`, then detaches, so the target's
+text is never touched. Pinned by `tests/unit/test_x32_refused.c`.
+*5: failure with `64-bit target process isn't supported by 32-bit process`.
+*6: no x32 injector exists — informational, not coverage. The `-mx32` build
+target and the `x86_64 -> x32` / `x32 -> i386` pairs were removed from
+`tests/Makefile` together with the x32 runtime.
+
+### Non-x86 results are upstream's, not re-verified here
+
+The ARM, MIPS, PowerPC and RISC-V results below are as reported by upstream
+[`kubo/injector`](https://github.com/kubo/injector). This fork's CI runs four
+jobs — Ubuntu x86_64/i686, the ASan/UBSan fuzz build, the language bindings, and
+Alpine x86_64 — and tests no arm, mips, ppc or riscv target. Treat these rows as
+provenance, not as current coverage.
 
 ### ARM
 
 | injector \ target | arm64 | armhf | armel |
 |---|---|---|---|
-| **arm64** | :smiley: success | :smiley: success | :smiley: success |
-| **armhf** | :skull: failure(*1) | :smiley: success | :smiley: success |
-| **armel** | :skull: failure(*1) | :smiley: success | :smiley: success |
+| **arm64** | OK | OK | OK |
+| **armhf** | FAIL(*1) | OK | OK |
+| **armel** | FAIL(*1) | OK | OK |
 
 *1: failure with `64-bit target process isn't supported by 32-bit process`.
 
@@ -715,21 +934,21 @@ project has an opinion about; do not read it as coverage.
 
 | injector \ target | mips64el | mipsel (n32) | mipsel (o32) |
 |---|---|---|---|
-| **mips64el** | :smiley: success (*1) | :smiley: success (*1) | :smiley: success (*1) |
-| **mipsel (n32)** | :skull: failure(*2) | :smiley: success (*1) | :smiley: success (*1) |
-| **mipsel (o32)** | :skull: failure(*2) | :smiley: success (*1) | :smiley: success (*1) |
+| **mips64el** | OK(*1) | OK(*1) | OK(*1) |
+| **mipsel (n32)** | FAIL(*2) | OK(*1) | OK(*1) |
+| **mipsel (o32)** | FAIL(*2) | OK(*1) | OK(*1) |
 
-*1: tested on [debian 11 mips64el](https://www.debian.org/releases/bullseye/mips64el/ch02s01.en.html#idm271) on [QEMU](https://www.qemu.org/).
+*1: reported from [debian 11 mips64el](https://www.debian.org/releases/bullseye/mips64el/ch02s01.en.html#idm271) on [QEMU](https://www.qemu.org/).
 *2: failure with `64-bit target process isn't supported by 32-bit process`.
 
 ### PowerPC
 
-- **ppc64le** (tested on [alpine 3.16.2 ppc64le](https://dl-cdn.alpinelinux.org/alpine/v3.16/releases/ppc64le/) on [QEMU](https://www.qemu.org/))
-- **powerpc (big endian)** (tested on [ubuntu 16.04 powerpc](https://old-releases.ubuntu.com/releases/xenial/) on [QEMU](https://www.qemu.org/))
+- **ppc64le** (reported from [alpine 3.16.2 ppc64le](https://dl-cdn.alpinelinux.org/alpine/v3.16/releases/ppc64le/) on [QEMU](https://www.qemu.org/))
+- **powerpc (big endian)** (reported from [ubuntu 16.04 powerpc](https://old-releases.ubuntu.com/releases/xenial/) on [QEMU](https://www.qemu.org/))
 
 ### RISC-V
 
-- **riscv64** (tested on [Ubuntu 22.04.1 riscv64 on QEMU](https://wiki.ubuntu.com/RISC-V#Booting_with_QEMU))
+- **riscv64** (reported from [Ubuntu 22.04.1 riscv64 on QEMU](https://wiki.ubuntu.com/RISC-V#Booting_with_QEMU))
 
 ## Caveats
 
@@ -747,17 +966,29 @@ project has an opinion about; do not read it as coverage.
 
 To run a function inside the target, `injector` temporarily patches a short
 `call *%rax; int3` trampoline into the target's libc and restores the original
-bytes afterwards. That means the target is *modified*, however briefly.
+bytes afterwards — the target is *modified*, however briefly. If PID 1 reaches
+that `int3` with no tracer to intercept it, PID 1 dies, and the kernel answers
+with `Kernel panic - not syncing: Attempted to kill init!`: the whole machine
+goes down. While a tracer is attached the `SIGTRAP` goes to the tracer instead,
+which is why the failure needs the trampoline left in place and nobody watching
+it.
 
-If PID 1 executes that `int3`, it dies, and the Linux kernel responds with
-`Kernel panic - not syncing: Attempted to kill init!` — **the whole machine
-goes down**. This is not hypothetical: it happened twice on the test host while
-a CLI smoke test ran `injector --pid 1 --run ...`.
+The attach path therefore refuses `pid <= 1`, with `INJERR_NO_PROCESS` and the
+message `refusing to attach to pid 1: attaching to init patches an int3
+trampoline into its libc and will panic the host`. More generally, only target
+processes you own and can afford to lose.
 
-The attach path therefore refuses `pid <= 1`. More generally, only target
-processes you own and can afford to lose, and prefer `injector_target_info()`
-(which is non-intrusive and reads only `/proc`) when you just want to inspect
-something.
+### NONSTOP delivery runs `dlopen` without TLS
+
+`INJECTOR_DELIVERY_NONSTOP` — what `INJECTOR_DELIVERY_AUTO` resolves to on
+x86_64 — creates the helper task with `clone()`. That task has no TLS, so
+`dlopen` can fault inside `ld.so` on targets whose loader or preloaded libraries
+need one; CUDA and other heavy runtimes are the case `cmd/main.c` names in its
+own `--help`. Use `-d ptrace` / `INJECTOR_DELIVERY_PTRACE` for those targets, and
+accept that ptrace delivery interrupts a thread of the target and gives up the
+failure isolation described in [Production contract](#production-contract).
+NONSTOP is x86_64 only; elsewhere `injector_invoke` returns
+`INJERR_UNSUPPORTED_TARGET`.
 
 `injector` calls functions inside a target process interrupted by `ptrace()`.
 If the target is interrupted while holding a non-reentrant lock and `injector`
@@ -779,23 +1010,25 @@ async-signal-safe where possible.
 
 ## Roadmap
 
-This fork is developed in milestones:
+Shipped: bounded timeouts with state restoration, per-handle errors,
+`process_vm_readv`/`writev`, one-pass ELF resolution, the `/proc` parser, target
+introspection, memory read/write, module listing, `injector_invoke` /
+`injector_run`, packaging, and unit + integration tests (M1); Go, Python and Rust
+bindings (M1.5); NONSTOP delivery with automatic ptrace fallback and
+`INJECTOR_TIMEOUT_LEAVE` (M2); `INJECTOR_TIMEOUT_KILL_THREAD`, the ASan/UBSan
+fuzz build, musl CI and the full CLI switch set (M3/M4).
 
-- **M1 (done)** — stability baseline: bounded timeouts with guaranteed state
-  restoration, per-handle errors, `process_vm_readv`/`writev`, one-pass ELF
-  resolution, `/proc` parser, target introspection, memory read/write,
-  module listing, `injector_invoke`/`injector_run`, packaging, unit +
-  integration tests.
-- **M1.5 (done)** — language bindings: idiomatic Go, Python, and Rust
-  bindings with vendored static linking and full API coverage.
-- **M2** — non-stop threaded delivery: a C-blob thread entry (zero-relocation
-  build gate) replaces direct ptrace `dlopen` so the target's main thread is
-  not interrupted; `injector_invoke`/`run` switch to the threaded path with
-  automatic ptrace fallback; timeout `LEAVE`.
-- **M3** — aarch64 C-blob + `INJECTOR_TIMEOUT_KILL_THREAD` (terminate the
-  injected thread via `SYS_exit` on timeout).
-- **M4** — polish: CLI switches, runtime log handler, ASan/UBSan builds,
-  expanded CI matrix (aarch64, musl).
+Still open:
+
+- **aarch64 NONSTOP delivery.** The `clone()`-based path is gated on `__x86_64__`
+  (`INJECTOR_HAS_INJECT_IN_CLONED_THREAD`), so aarch64 targets fall back to
+  ptrace delivery and get no failure isolation.
+- **Runtime log handler.** No public hook for the library's diagnostics; errors
+  surface only through `injector_last_error()`.
+- **CI beyond x86.** The workflow runs Ubuntu x86_64/i686, the fuzz job, the
+  bindings job and Alpine x86_64 — no arm, mips, ppc or riscv coverage, which is
+  why those rows under [Tested architectures](#tested-architectures) are labelled
+  as upstream's.
 
 ## License
 
@@ -805,13 +1038,12 @@ later**. Files under [`cmd`][] are licensed under **GPL 2 or later**. See
 
 ## Acknowledgements
 
-- [`kubo/injector`](https://github.com/kubo/injector) — the original project
-  this fork builds on.
+- [`kubo/injector`](https://github.com/kubo/injector), the original project this
+  fork builds on.
 - [`linux-inject`][] — the inspiration for the injection technique.
 
 [`linux-inject`]: https://github.com/gaffe23/linux-inject
 [Caveat about `ptrace()`]: https://github.com/gaffe23/linux-inject#caveat-about-ptrace
-[`inject`]: https://github.com/gaffe23/linux-inject#usage
 [`clone()`]: https://man7.org/linux/man-pages/man2/clone.2.html
 [`pthread_create()`]: https://man7.org/linux/man-pages/man3/pthread_create.3.html
 [`cmd`]: cmd

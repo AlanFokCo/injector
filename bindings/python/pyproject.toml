@@ -2,6 +2,8 @@
 name = "injector"
 version = "1.0.0"
 description = "Python bindings for libinjector (ptrace-based shared library injection)"
+# Nothing here uses a construct newer than 3.8; CI exercises a single
+# interpreter, so 3.8-3.11 rest on that reading rather than on a test run.
 requires-python = ">=3.8"
 
 [build-system]

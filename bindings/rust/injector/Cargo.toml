@@ -2,7 +2,10 @@
 name = "injector"
 version = "1.0.0"
 edition = "2021"
-description = "Safe Rust wrapper for libinjector"
+description = "Rust bindings for libinjector: inject a shared library into a running Linux process over ptrace and call it (x86_64 and i386; x32 targets are refused)"
+license = "GPL-2.0-or-later OR LGPL-2.1-or-later"
+repository = "https://github.com/AlanFokCo/injector"
+readme = "../../../README.md"
 
 [dependencies]
 injector-sys = { path = "../injector-sys" }

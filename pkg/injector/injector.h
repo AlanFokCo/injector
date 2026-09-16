@@ -45,49 +45,113 @@ extern "C" {
 }
 #endif
 
+/*! \brief Operation succeeded. This is the only non-negative code. */
 #define INJERR_SUCCESS 0               /* linux */
+/*! \brief Unclassified failure; call \c injector_last_error() for the reason. Also used for the refusals that deliberately leave the target untouched: no FP-state slot free (\c errno is \c EMFILE) and a ptrace request issued from a thread other than the one that attached (\c errno is \c ESRCH). */
 #define INJERR_OTHER -1                /* linux */
+/*! \brief A local allocation failed. */
 #define INJERR_NO_MEMORY -2            /* linux */
+/*! \brief The pid is invalid or does not exist, or is one this library refuses to touch at all - notably pid 1 / \c init, attaching to which would patch a trampoline into its libc and panic the host. */
 #define INJERR_NO_PROCESS -3           /* linux */
+/*! \brief The shared library to inject, or libc in the target, could not be found or opened. */
 #define INJERR_NO_LIBRARY -4           /* linux */
+/*! \brief The injected code failed inside the target; for example \c dlopen returned NULL. The message carries the target-side reason where one is available. */
 #define INJERR_ERROR_IN_TARGET -5      /* linux */
+/*! \brief A path could not be opened, or was too long to fit the target's data page. */
 #define INJERR_FILE_NOT_FOUND -6       /* linux */
+/*! \brief \c ptrace(2) reported \c EFAULT: the address is not valid in the target's address space. */
 #define INJERR_INVALID_MEMORY_AREA -7  /* linux */
+/*! \brief Not permitted: \c ptrace(2) was denied (\c EPERM/\c EACCES, for example Yama or a missing \c CAP_SYS_PTRACE), or \ref injector_write_mem was called on a handle not attached with \c opts.enable_write_mem set. */
 #define INJERR_PERMISSION -8           /* linux */
+/*! \brief The target's architecture, ABI or libc is not supported by this build. This includes an x32-ABI target (\c EM_X86_64 with \c ELFCLASS32) - this project ships x86_64 LP64 and i386 runtimes only - and \ref injector_uninject / \ref injector_uninject_all against a musl-libc
+ * target, which cannot \c dlclose what was loaded. Nothing else in the API
+ * checks the target's libc: the inject and invoke paths gate on architecture
+ * only, so a musl target injects normally and simply cannot be uninjected. */
 #define INJERR_UNSUPPORTED_TARGET -9   /* linux */
+/*! \brief The ELF file is malformed, truncated, or has fields this library refuses to trust. */
 #define INJERR_INVALID_ELF_FORMAT -10  /* linux */
+/*! \brief The ptrace/waitpid protocol for this handle is out of sync: an earlier remote call timed out and could not leave the target stopped, or this thread's desync table overflowed. Read the message before retrying - it says whether the target can still be repaired. */
 #define INJERR_WAIT_TRACEE -11         /* linux */
+/*! \brief The named symbol was not found in the target, or the name was NULL or too long. */
 #define INJERR_FUNCTION_MISSING -12    /* linux */
+/*! \brief A remote call did not complete within \c opts.call_timeout_ms. What happens to the target next is \c opts.timeout_action. */
 #define INJERR_TIMEOUT -13            /* linux: remote call timed out */
 
-/* Deprecated alias — use INJERR_FUNCTION_MISSING. */
+/*! \brief Deprecated alias for \c INJERR_FUNCTION_MISSING; use that name. */
 #define INJERR_NO_FUNCTION INJERR_FUNCTION_MISSING
 
+/*! \brief ABI version these headers describe. Compare against \ref injector_abi_version()
+ *         at run time to detect a header/library mismatch. */
 #define INJECTOR_ABI_VERSION 1u
+/*! \brief Library version as a string; the same value \ref injector_version_string() returns. */
 #define INJECTOR_VERSION "1.0.0"
+/*! \brief Largest \c argc accepted by \ref injector_invoke. */
 #define INJECTOR_MAX_INVOKE_ARGS 6
 
+/*!
+ * \brief How a remote call is delivered inside the target.
+ */
 typedef enum {
-    INJECTOR_DELIVERY_AUTO = 0,
-    INJECTOR_DELIVERY_NONSTOP = 1,
-    INJECTOR_DELIVERY_PTRACE = 2,
+    INJECTOR_DELIVERY_AUTO = 0,    /*!< Decide from the target's architecture: NONSTOP on
+                                    *   x86_64, PTRACE on every other supported arch. The default. */
+    INJECTOR_DELIVERY_NONSTOP = 1, /*!< Run the payload in a helper task created in the target with
+                                    *   \c clone(CLONE_VM), so the target's own threads are not
+                                    *   hijacked. x86_64 only; another arch fails with
+                                    *   \c INJERR_UNSUPPORTED_TARGET. */
+    INJECTOR_DELIVERY_PTRACE = 2,  /*!< Save the stopped thread's registers, point them at the
+                                    *   payload and restore them afterwards. Any supported arch. */
 } injector_delivery_t;
 
+/*!
+ * \brief What to do with the target when a remote call exceeds \c call_timeout_ms.
+ */
 typedef enum {
-    INJECTOR_TIMEOUT_LEAVE = 0,
-    INJECTOR_TIMEOUT_KILL_THREAD = 1,
+    INJECTOR_TIMEOUT_LEAVE = 0,       /*!< Stop the tracee again with \c SIGSTOP, restore its
+                                       *   original registers and code, and return
+                                       *   \c INJERR_TIMEOUT with the handle still attached and
+                                       *   stopped. A following \ref injector_detach then unwinds
+                                       *   cleanly and the target resumes at its original pc.
+                                       *   The default. */
+    INJECTOR_TIMEOUT_KILL_THREAD = 1, /*!< \c SIGKILL the task stuck running the hijacked code, and
+                                       *   mark the handle desynchronised. Linux has no per-thread
+                                       *   \c SIGKILL, so with \c INJECTOR_DELIVERY_PTRACE - where
+                                       *   that task is a thread OF THE TARGET - this kills the
+                                       *   whole target process. Only \c NONSTOP delivery can kill
+                                       *   the stuck task on its own. */
 } injector_timeout_action_t;
 
+/*!
+ * \brief Options for \ref injector_attach_with_opts.
+ *
+ * Initialise with \ref INJECTOR_OPTS_INIT and then set only the fields you want;
+ * every field's zero value is a working default. \c opts_size is how this library
+ * and your headers agree on the struct's layout, so do not set it by hand - a
+ * caller built against older headers then gets the fields it knows about honoured
+ * and the rest defaulted, instead of the library reading past the end of your
+ * struct. An \c opts_size too small to carry a field it needs is rejected with
+ * \c INJERR_OTHER rather than guessed at.
+ */
 typedef struct {
-    size_t opts_size;
-    injector_delivery_t delivery;
-    unsigned call_timeout_ms;
-    injector_timeout_action_t timeout_action;
-    int enable_write_mem;
+    size_t opts_size;                 /*!< \c sizeof(injector_opts_t) at your compile time. Set by
+                                       *   \ref INJECTOR_OPTS_INIT; leave it alone. */
+    injector_delivery_t delivery;     /*!< Default \c INJECTOR_DELIVERY_AUTO. */
+    unsigned call_timeout_ms;         /*!< Per-remote-call timeout. 0 means 5000 ms. Honoured against
+                                       *   a monotonic deadline, so a small value is not rounded up. */
+    injector_timeout_action_t timeout_action; /*!< Default \c INJECTOR_TIMEOUT_LEAVE. */
+    int enable_write_mem;             /*!< 0 (the default) makes \ref injector_write_mem refuse with
+                                       *   \c INJERR_PERMISSION. Writing into a target is destructive
+                                       *   and is off unless you ask for it. */
 } injector_opts_t;
 
+/*! \brief Default-initialiser for \ref injector_opts_t. It sets \c opts_size and leaves
+ *         every other field at its documented default. */
 #define INJECTOR_OPTS_INIT ((injector_opts_t){ .opts_size = sizeof(injector_opts_t) })
 
+/*!
+ * \brief Return the ABI version the LIBRARY was built with.
+ * \return \c INJECTOR_ABI_VERSION as compiled into the library. Compare it with the
+ *         \c INJECTOR_ABI_VERSION your headers carry before trusting a handle.
+ */
 unsigned injector_abi_version(void);
 
 /*!
@@ -103,8 +167,19 @@ const char *injector_version_string(void);
  * \return zero on success.
  */
 int injector_library_init(void);
+
+/*!
+ * \brief Counterpart to \ref injector_library_init; also idempotent.
+ * \return zero on success.
+ * \remarks Reserved for symmetry with \c init and currently a near-no-op. It does
+ *          NOT detach live handles: destroy those with \ref injector_detach first.
+ */
 int injector_library_deinit(void);
 
+/*! \brief Opaque handle to one attached target process. Created by \ref injector_attach
+ *         or \ref injector_attach_with_opts and destroyed by \ref injector_detach, which
+ *         frees it - so a detached handle must not be used again, not even to read its
+ *         error message. Thread-affine: see \ref injector_thread_affinity. */
 typedef struct injector injector_t;
 
 /*!
@@ -114,14 +189,30 @@ typedef struct injector injector_t;
  * \return               zero on success. Otherwise, error code
  */
 int injector_attach(injector_t **injector, injector_pid_t pid);
+
+/*!
+ * \brief Attach to the specified process with explicit options.
+ * \param[out] out  the address where the newly created injector handle will be
+ *                   stored; set to NULL if the attach fails
+ * \param[in]  pid  the process id to be attached
+ * \param[in]  opts options, or NULL for the defaults. Only the fields your
+ *                   \c opts_size covers are read; see \ref injector_opts_t
+ * \return          zero on success. Otherwise, error code - \c INJERR_OTHER when
+ *                   \c opts_size is too small to carry a field this library needs
+ * \remarks \ref injector_attach is this call with \c opts == NULL. The handle is
+ *          thread-affine: every later operation on it, \ref injector_detach
+ *          included, must come from the thread that attached it. See
+ *          \ref injector_thread_affinity.
+ */
 int injector_attach_with_opts(injector_t **out, pid_t pid, const injector_opts_t *opts);
 
 /*!
- * \brief Thread safety and thread AFFINITY (Linux)
+ * \page injector_thread_affinity Thread safety and thread affinity (Linux)
+ *
  * An \c injector_t handle is not safe for concurrent use from multiple threads.
  * Use a handle from a single thread or serialize access. The per-handle error
  * buffer is read via \ref injector_last_error; the thread-local fallback (read
- * via \ref injector_error) is intended only for the no-handle attach-failure case.
+ * via \c injector_error() is intended only for the no-handle attach-failure case.
  *
  * \par Affinity is stronger than "serialize access"
  * On Linux a handle must be driven by the SAME thread that attached it, not
@@ -166,35 +257,41 @@ int injector_attach_with_opts(injector_t **out, pid_t pid, const injector_opts_t
  *          \c INJERR_OTHER having done nothing to the target - and the handle is
  *          destroyed anyway, leaving the target stopped and traced until the
  *          thread that attached detaches it or exits. See the affinity note at
- *          \ref injector_attach.
+ *          \ref injector_thread_affinity.
  */
 int injector_detach(injector_t *injector);
 
 #if defined(INJECTOR_DOC) || defined(__linux__)
 /*!
+ * \brief What \ref injector_target_info reports about a process (Linux only).
+ *
+ * Every field comes from /proc/PID; the process is never ptrace-attached, so
+ * reading these is safe before you decide whether to inject.
+ */
+typedef struct {
+    pid_t pid;            /**< The process id this describes. */
+    int alive;            /**< 1 if the process exists. */
+    int ptrace_allowed;   /**< Heuristic: 1 if an attach would likely succeed. */
+    const char *arch;     /**< "x86_64"/"aarch64"/"i386"/"arm"/"mips"/"ppc64"/"ppc"/"riscv"/"unknown". */
+    const char *libc;     /**< "glibc"/"musl"/"unknown". */
+    char exe[4096];       /**< /proc/PID/exe. */
+    char cwd[4096];       /**< /proc/PID/cwd. */
+    char root[4096];      /**< /proc/PID/root. */
+    char comm[16];        /**< /proc/PID/comm. */
+} injector_target_info_t;
+
+/*!
  * \brief Non-intrusive target introspection (Linux only).
  *
- * Reads /proc/PID to fill `out`. Does NOT ptrace-attach to the target.
- * Safe to call before deciding whether to inject.
+ * Reads /proc/PID to fill \c out. Does NOT ptrace-attach to the target, so it is
+ * safe to call before deciding whether to inject.
  *
  * \param[in]  pid  the process id to inspect
  * \param[out] out  destination struct (zeroed by the call)
- * \return          zero on success, INJERR_NO_PROCESS if pid absent,
- *                  INJERR_OTHER on read error. Unreadable fields are empty;
- *                  arch/libc are "unknown" when no libc mapping is found.
+ * \return          zero on success, \c INJERR_NO_PROCESS if \c pid is absent,
+ *                  \c INJERR_OTHER on a read error. Unreadable fields are empty;
+ *                  \c arch and \c libc are "unknown" when no libc mapping is found.
  */
-typedef struct {
-    pid_t pid;
-    int alive;            /* 1 if process exists */
-    int ptrace_allowed;   /* heuristic: 1 if attach would likely succeed */
-    const char *arch;     /* "x86_64"/"aarch64"/"i386"/"arm"/"mips"/"ppc64"/"ppc"/"riscv"/"unknown" */
-    const char *libc;     /* "glibc"/"musl"/"unknown" */
-    char exe[4096];       /* /proc/PID/exe */
-    char cwd[4096];       /* /proc/PID/cwd */
-    char root[4096];      /* /proc/PID/root */
-    char comm[16];        /* /proc/PID/comm */
-} injector_target_info_t;
-
 int injector_target_info(pid_t pid, injector_target_info_t *out);
 
 /*!
@@ -246,7 +343,7 @@ int injector_inject(injector_t *injector, const char *path, void **handle);
  * \remarks This fearute isn't supported for musl-libc processes.
  *     See [Functional differences from glibc](https://wiki.musl-libc.org/functional-differences-from-glibc.html#Unloading_libraries).
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_uninject(injector_t *injector, void *handle);
 
@@ -266,7 +363,7 @@ int injector_uninject(injector_t *injector, void *handle);
  *   functions, it may stop the target process or cause unexpected behaviour.
  * \sa injector_remote_func_addr(), injector_remote_call(), injector_remote_vcall()
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_call(injector_t *injector, void *handle, const char* name);
 #endif
@@ -291,6 +388,7 @@ const char *injector_error(void);
 const char *injector_last_error(injector_t *injector);
 
 #if defined(INJECTOR_DOC) || defined(__linux__)
+/*! \brief Feature-test macro: defined when the remote-call API below is available. */
 #define INJECTOR_HAS_REMOTE_CALL_FUNCS 1
 #include <stdarg.h>
 #include <stdint.h>
@@ -325,7 +423,7 @@ const char *injector_last_error(injector_t *injector);
  * printf("The return value of foo_func(1, 2, 3) is %ld.\n", retval);
  * \endcode
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_remote_func_addr(injector_t *injector, void *handle, const char* name, size_t *func_addr_out);
 
@@ -345,7 +443,7 @@ int injector_remote_func_addr(injector_t *injector, void *handle, const char* na
  *   functions, it may stop the target process or cause unexpected behaviour.
  * \sa injector_remote_func_addr(), injector_remote_vcall()
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_addr, ...);
 
@@ -365,48 +463,44 @@ int injector_remote_call(injector_t *injector, intptr_t *retval, size_t func_add
  *   functions, it may stop the target process or cause unexpected behaviour.
  * \sa injector_remote_func_addr(), injector_remote_call()
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_remote_vcall(injector_t *injector, intptr_t *retval, size_t func_addr, va_list ap);
 
 /*!
  * \brief Read a chunk of the target process memory (Linux only)
- * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   inj      the injector handle specifying the target process
  * \param[in]   addr     the remote address to read from
  * \param[out]  buf      buffer in the caller process receiving the bytes
  * \param[in]   len      number of bytes to read
- * 
-eturn               zero on success. Otherwise, error code
- * 
-emarks Uses process_vm_readv with a ptrace single-step fallback.
+ * \return               zero on success. Otherwise, error code
+ * \remarks Uses process_vm_readv with a ptrace single-step fallback.
  * \sa injector_write_mem(), injector_resolve_symbol()
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_read_mem(injector_t *inj, uintptr_t addr, void *buf, size_t len);
 
 /*!
  * \brief Write a chunk of memory into the target process (Linux only)
- * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   inj      the injector handle specifying the target process
  * \param[in]   addr     the remote address to write to
  * \param[in]   buf      bytes to write
  * \param[in]   len      number of bytes to write
- * 
-eturn               zero on success. \c INJERR_PERMISSION when the handle
+ * \return               zero on success. \c INJERR_PERMISSION when the handle
  *                       was not attached with \c opts.enable_write_mem set.
- * 
-emarks Gate: the handle must be attached via \c injector_attach_with_opts
+ * \remarks Gate: the handle must be attached via \c injector_attach_with_opts
  *          with \c opts.enable_write_mem = 1. Uses process_vm_writev with a
  *          ptrace single-step fallback.
  * \sa injector_read_mem(), injector_resolve_symbol()
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_write_mem(injector_t *inj, uintptr_t addr, const void *buf, size_t len);
 
 /*!
  * \brief Resolve a symbol address in the target process (Linux only)
- * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   inj      the injector handle specifying the target process
  * \param[in]   libname  reserved for future use (M1 does not scope by library).
  *                       Pass \c NULL.
  * \param[in]   symbol   the symbol name
@@ -427,7 +521,7 @@ int injector_resolve_symbol(injector_t *inj, const char *libname, const char *sy
  * \brief A loaded shared-library mapping in the target process (Linux only)
  */
 typedef struct {
-    /* .so path as it appears in /proc/PID/maps, NUL-terminated.
+    /** .so path as it appears in /proc/PID/maps, NUL-terminated.
      *
      * NOTE: /proc/PID/maps paths can be up to PATH_MAX long, but this field is
      * 256 bytes and is part of the stable ABI (the Go/Python/Rust bindings
@@ -436,12 +530,12 @@ typedef struct {
      * real path yourself, if you need to distinguish very long paths such as
      * those under /nix/store or a snap/flatpak mount. */
     char name[256];
-    uintptr_t base;        /* load base address (first mapping's start) */
+    uintptr_t base;        /**< Load base address: the first mapping's start. */
 } injector_module_t;
 
 /*!
  * \brief List loaded shared libraries in the target process (Linux only)
- * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   inj      the injector handle specifying the target process
  * \param[out]  out      array of \p cap entries to fill, or \c NULL to only count
  * \param[in]   cap      number of entries in \p out (0 to only count)
  * \return              the number of loaded libraries (always the total count,
@@ -472,14 +566,14 @@ long injector_list_modules(injector_t *inj, injector_module_t *out, size_t cap);
 
 /*!
  * \brief Unload (dlclose) all libraries this handle injected via \c injector_inject (Linux only)
- * \param[in]   injector the injector handle specifying the target process
+ * \param[in]   inj      the injector handle specifying the target process
  * \return              zero if all succeeded, otherwise the first non-zero
  *                      error code (remaining handles are still attempted).
  * \remarks Refuses musl-libc targets (\c INJERR_UNSUPPORTED_TARGET), as
  *          \ref injector_uninject does. Only handles whose out-param the
  *          caller kept (non-NULL \c handle) at inject time are tracked.
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_uninject_all(injector_t *inj);
 
@@ -489,9 +583,13 @@ int injector_uninject_all(injector_t *inj);
  *          (empty on success).
  */
 typedef struct {
-    intptr_t retval;        /* entry method return value */
-    int _reserved;          /* reserved for future use (always 0) */
-    char errmsg[256];       /* failure message; caller-owned, no lifetime issue */
+    intptr_t retval;        /**< What the entry method returned. */
+    int _reserved;          /**< Reserved for future use; always 0. */
+    char errmsg[256];       /**< Failure message, empty on success. Caller-owned
+                             *   storage, so it stays valid after the handle is
+                             *   destroyed. 256 bytes is the whole budget: a long
+                             *   primary message can leave no room for an
+                             *   appended orphaned-helper verdict. */
 } injector_result_t;
 
 /*!
@@ -509,7 +607,7 @@ typedef struct {
  * \remarks Uses the nonstop (clone-based) path on x86_64 when delivery mode
  *          is \c NONSTOP or \c AUTO; falls back to ptrace otherwise.
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_invoke(injector_t *inj, const char *path, const char *symbol,
                     const intptr_t *args, int argc,
@@ -527,7 +625,7 @@ int injector_invoke(injector_t *inj, const char *path, const char *symbol,
  * \param[out] out     destination result, or \c NULL to skip capturing it
  * \return             zero on success.
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_run(pid_t pid, const char *lib, const char *symbol,
                  const intptr_t *args, int argc,
@@ -535,6 +633,7 @@ int injector_run(pid_t pid, const char *lib, const char *symbol,
 #endif
 
 #if defined(INJECTOR_DOC) || (defined(__linux__) && defined(__x86_64__))
+/*! \brief Feature-test macro: defined when \ref injector_inject_in_cloned_thread is available. */
 #define INJECTOR_HAS_INJECT_IN_CLONED_THREAD 1 // feature test macro
 /*!
  * \brief Inject the specified shared library into the target process by the \c clone system call. (Linux x86_64 only)
@@ -547,7 +646,7 @@ int injector_run(pid_t pid, const char *lib, const char *symbol,
  * pitfalls because some resources allocated in \c [pthread_create()](https://man7.org/linux/man-pages/man3/pthread_create.3.html) lack in the \c clone()-ed thread.
  * Use it at your own risk.
  * \remarks Thread affinity: drive this handle from the thread that attached
- *          it; see the affinity note at \ref injector_attach.
+ *          it; see the affinity note at \ref injector_thread_affinity.
  */
 int injector_inject_in_cloned_thread(injector_t *injector, const char *path, void **handle);
 #endif

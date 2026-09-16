@@ -167,8 +167,9 @@ static int prctl(int option, ...) { (void)option; abort(); return -1; }
  * number of cand_put() calls in n_candidates() below. That equality cannot be
  * checked at compile time, so cand_put() re-checks the bound on EVERY write and
  * aborts instead of writing past the end of the array: the two counts drifted
- * apart once already (12 slots declared, 10 emitted) and the next three candidates
- * would have smashed sweep()'s stack frame silently. Bump BOTH together. */
+ * apart once already (12 slots declared, 10 emitted). Two further candidates
+ * would still have fitted in the spare slots; the third after those would have
+ * written past the end of sweep()'s stack frame silently. Bump BOTH together. */
 #define FP_NCAND       10u
 
 /* mode bits (data[0]) */

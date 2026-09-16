@@ -7,5 +7,12 @@ Name: libinjector
 Description: Linux shared-library injector (ptrace-based)
 Version: 1.0.0
 URL: https://github.com/AlanFokCo/injector
+# Libs carries no -ldl and no -lrt, and that is not an oversight. The library
+# calls dlopen/dlsym only inside the target process, through generated shellcode,
+# never in its own code, so `nm -u libinjector.a` reports no dl* symbol among its
+# undefined ones - clock_gettime is the only symbol from that family it needs,
+# and libc provides it. `readelf -d libinjector.so.1.0.0` likewise records
+# DT_NEEDED for libc.so.6 and ld-linux-x86-64.so.2 only. Linking the archive with
+# nothing but libc and running it prints "1.0.0 abi=1".
 Libs: -L${libdir} -linjector
 Cflags: -I${includedir}
